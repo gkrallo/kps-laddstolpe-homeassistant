@@ -1,5 +1,17 @@
 # Ändringslogg
 
+## 0.3.3
+
+**Prickarna är tillbaka.** Å, ä och ö hade fallit bort på flera ställen i
+gränssnittet — mitt slarv, jag skrev ASCII i några redigeringar för att undvika
+teckenproblem och lämnade kvar det. Rättat i hela appen.
+
+**Strömbegränsningen visas i klartext.** Easees kod översätts nu till svenska:
+kod 28 blir *"Begränsad av Equalizern"*. Trettiofyra koder finns med, hämtade
+från Easees officiella uppräkning.
+
+**Driftläge 7 och 8** saknades i tabellen och visades som "okänt".
+
 ## 0.3.2
 
 **Kabeln lästes av fel mot den riktiga laddboxen.** Specifikationen sa att Easee
