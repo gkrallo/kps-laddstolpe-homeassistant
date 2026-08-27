@@ -1041,6 +1041,12 @@ class SimulatedCharger {
 const EASEE = 'https://api.easee.cloud/api';
 const TOKEN_FILE = 'easee-token.json';
 
+// Tidsgränsen var 15 sekunder. Din box har behövt 17 bara på att återuppta en
+// laddning, och ett svar som kommer på artonde sekunden är inte ett haveri.
+const EASEE_TIMEOUT_MS = 25 * 1000;
+const READ_BACKOFF_MAX_MS = 2 * 60 * 1000;    // "inte just nu" — molnfel, tidsgräns
+const HARD_BACKOFF_MAX_MS = 30 * 60 * 1000;   // "sluta fråga" — 429, nekad inloggning
+
 /**
  * Easee Cloud.
  *
@@ -1079,6 +1085,8 @@ class EaseeCharger {
 
     this.backoffUntil = 0;
     this.backoffStep = 0;
+    this.backoffHard = false;
+    this.lastReadMs = null;   // hur länge senaste avläsningen tog
     this.lastLoginAt = 0;
     this.lastError = null;
     this.calls = [];        // tidsstämplar, för anropsräknaren
@@ -1121,14 +1129,30 @@ class EaseeCharger {
     this._saveToken();
   }
 
-  _backoff(reason) {
+  /**
+   * Två backoffar, inte en.
+   *
+   * Den hårda finns för att skydda kontot: svarar Easee 429, eller nekar
+   * inloggningen, är det enda rimliga att sluta fråga en lång stund. Att hamra
+   * vidare är precis så man blir avstängd.
+   *
+   * Den mjuka gäller sådant som bara betyder "inte just nu" — ett 502 från
+   * molnet, eller ett svar som inte hann fram innan tidsgränsen. Att stänga av
+   * avläsningen i en halvtimme för det är fel: det är just avläsningen som
+   * skulle ha visat att felet gått över, och under tiden står gästen framför en
+   * skärm som säger att stolpen inte svarar. Taket är två minuter.
+   */
+  _backoff(reason, { hard = false } = {}) {
     this.backoffStep = Math.min(this.backoffStep + 1, 6);
-    const wait = Math.min(60 * 1000 * Math.pow(2, this.backoffStep - 1), 30 * 60 * 1000);
+    const base = hard ? 60 * 1000 : 15 * 1000;
+    const cap = hard ? HARD_BACKOFF_MAX_MS : READ_BACKOFF_MAX_MS;
+    const wait = Math.min(base * Math.pow(2, this.backoffStep - 1), cap);
     this.backoffUntil = Date.now() + wait;
+    this.backoffHard = hard;
     log.warn(`[Easee] ${reason}. Väntar ${Math.round(wait / 1000)} sekunder innan nästa försök.`);
   }
 
-  _ok() { this.backoffStep = 0; this.backoffUntil = 0; this.lastError = null; }
+  _ok() { this.backoffStep = 0; this.backoffUntil = 0; this.backoffHard = false; this.lastError = null; }
 
   async _login() {
     // Aldrig mer än en inloggning var femte minut, hur illa det än går
@@ -1149,11 +1173,12 @@ class EaseeCharger {
     if (!res.ok) {
       if (res.status === 400 || res.status === 401) {
         this.lastError = 'Fel användarnamn eller lösenord för Easee.';
-        this._backoff('Inloggningen nekades');
+        this._backoff('Inloggningen nekades', { hard: true });
         return { ok: false, error: this.lastError };
       }
       this.lastError = `Inloggningen misslyckades (${res.status}).`;
-      this._backoff(`Inloggningen misslyckades (${res.status})`);
+      // Nätverksfel och molnfel är övergående; 429 är det inte.
+      this._backoff(`Inloggningen misslyckades (${res.status})`, { hard: res.status === 429 });
       return { ok: false, error: this.lastError };
     }
 
@@ -1191,7 +1216,9 @@ class EaseeCharger {
   async _ensureToken() {
     if (Date.now() < this.backoffUntil) {
       const left = Math.round((this.backoffUntil - Date.now()) / 1000);
-      return { ok: false, error: `Väntar ${left} sekunder efter tidigare fel mot Easee.` };
+      // waiting: vi FRÅGADE inte. Det är inte samma sak som att frågan gick
+      // fel, och bakgrundsloopen ska inte räkna det som ett misslyckande.
+      return { ok: false, waiting: true, retryInSeconds: left, error: `Väntar ${left} sekunder efter tidigare fel mot Easee.` };
     }
     if (this.token && Date.now() < this.expiresAt) return { ok: true };
     if (this.token && this.refreshToken) return this._refresh();
@@ -1202,16 +1229,25 @@ class EaseeCharger {
 
   async _fetch(url, opts) {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15000);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, EASEE_TIMEOUT_MS);
     this.calls.push(Date.now());
     if (this.calls.length > 500) this.calls = this.calls.slice(-500);
+    const t0 = Date.now();
     try {
       const r = await fetch(url, { ...opts, signal: ctrl.signal });
       let data = null;
       try { data = await r.json(); } catch (_) { /* tomt svar är i sin ordning */ }
-      return { ok: r.ok, status: r.status, data };
+      return { ok: r.ok, status: r.status, data, ms: Date.now() - t0 };
     } catch (err) {
-      return { ok: false, status: 0, data: null, netError: err.message };
+      return {
+        ok: false,
+        status: 0,
+        data: null,
+        ms: Date.now() - t0,
+        timedOut,
+        netError: timedOut ? `svarade inte inom ${EASEE_TIMEOUT_MS / 1000} sekunder` : err.message,
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -1220,7 +1256,7 @@ class EaseeCharger {
   /** Autentiserat anrop med ett omförsök om token hunnit dö. */
   async _api(path, { method = 'GET', body = null, retry = true } = {}) {
     const auth = await this._ensureToken();
-    if (!auth.ok) return { ok: false, error: auth.error };
+    if (!auth.ok) return { ok: false, error: auth.error, waiting: auth.waiting, retryInSeconds: auth.retryInSeconds };
 
     const res = await this._fetch(`${EASEE}${path}`, {
       method,
@@ -1240,12 +1276,15 @@ class EaseeCharger {
       return this._api(path, { method, body, retry: false });
     }
     if (res.status === 429) {
-      this._backoff('Easee svarade 429, för många anrop');
+      this._backoff('Easee svarade 429, för många anrop', { hard: true });
       return { ok: false, error: 'Easee begränsar antalet anrop just nu.' };
     }
     if (res.status >= 500 || res.status === 0) {
-      this._backoff(res.status === 0 ? `Nätverksfel: ${res.netError}` : `Easee svarade ${res.status}`);
-      return { ok: false, error: 'Ingen kontakt med Easee just nu.' };
+      this._backoff(res.status === 0 ? `Easee ${res.netError}` : `Easee svarade ${res.status}`);
+      return {
+        ok: false,
+        error: res.timedOut ? 'Easee svarade inte i tid.' : 'Ingen kontakt med Easee just nu.',
+      };
     }
 
     this.lastError = `Easee svarade ${res.status} på ${path}`;
@@ -1258,8 +1297,16 @@ class EaseeCharger {
     if (!this.chargerId) {
       return { ok: false, error: 'Laddbox-id saknas i tilläggets konfiguration.' };
     }
+    const t0 = Date.now();
     const res = await this._api(`/chargers/${encodeURIComponent(this.chargerId)}/state`);
-    if (!res.ok) return { ok: false, error: res.error };
+    if (!res.ok) {
+      if (!res.waiting) this.lastReadMs = Date.now() - t0;
+      return { ok: false, error: res.error, waiting: res.waiting, retryInSeconds: res.retryInSeconds };
+    }
+    this.lastReadMs = Date.now() - t0;
+    if (this.lastReadMs > 5000) {
+      log.debug(`[Easee] Avläsningen tog ${(this.lastReadMs / 1000).toFixed(1)} sekunder.`);
+    }
 
     const d = res.data || {};
     const cable = cableFromState(d, this._lastCable);
@@ -1411,6 +1458,9 @@ class EaseeCharger {
       logins: this.logins,
       refreshes: this.refreshes,
       backoffUntil: this.backoffUntil ? new Date(this.backoffUntil).toISOString() : null,
+      backoffSeconds: this.backoffUntil > Date.now() ? Math.round((this.backoffUntil - Date.now()) / 1000) : 0,
+      backoffHard: Boolean(this.backoffHard),
+      lastReadMs: this.lastReadMs,
       lastError: this.lastError,
       commandLog: this.commandLog.slice(-25).reverse(),
     };
@@ -1480,6 +1530,10 @@ function load() {
   if (!Array.isArray(history)) history = [];
   if (active && active.status !== 'CHARGING') active = null;
   if (active) {
+    // En session sparad av en äldre version saknar fälten. Utan detta kraschar
+    // första varvet efter uppdateringen, mitt i någons laddning.
+    if (!Array.isArray(active.unpriced)) active.unpriced = [];
+    if (typeof active.unpricedKwh !== 'number') active.unpricedKwh = 0;
     log.info(`Återupptar pågående session ${active.id} (${active.energyKwh} kWh, ${active.costSek} kr).`);
   }
   log.info(`Historik: ${history.length} avslutade sessioner.`);
@@ -1524,11 +1578,50 @@ function start({ phone, cableEpisode, startEnergyKwh, simulated }) {
     usedEstimatedPrice: false,
     payment: 'UNPAID',      // UNPAID | GUEST_CLAIMS_PAID | CONFIRMED
     samples: [],
+
+    // Energi som mätts upp men ännu inte kunnat prissättas, med tidpunkt, så
+    // att den kan prissättas mot RÄTT kvart när prisdata kommer.
+    unpriced: [],
+    unpricedKwh: 0,
   };
 
   activeWriter.save(active, { immediate: true });
   log.info(`Session ${active.number} startad${phone ? ` för ${maskPhone(phone)}` : ''}.`);
   return { ok: true, session: active };
+}
+
+/** Lägger en uppmätt mängd energi till kostnaden, till ett givet pris. */
+function charge(kwh, price) {
+  active.costEnergySek = round(active.costEnergySek + kwh * price.energySek, 4);
+  active.costServiceSek = round(active.costServiceSek + kwh * price.serviceSek, 4);
+  active.costSek = round(active.costEnergySek + active.costServiceSek, 2);
+  if (price.estimated) active.usedEstimatedPrice = true;
+}
+
+/**
+ * Prissätter energi som mätts upp medan prisdata saknades.
+ *
+ * Varje post bär tidpunkten då energin togs ut, och `prices.currentPrice(ms)`
+ * slår upp den kvart som gällde just då. Kommer priserna tillbaka senare på
+ * dygnet blir kostnaden alltså densamma som om de aldrig varit borta. Går en
+ * post fortfarande inte att prissätta får den ligga kvar och prövas nästa varv.
+ */
+function settleUnpriced() {
+  const kvar = [];
+  let settled = 0;
+
+  for (const chunk of active.unpriced) {
+    const p = prices.currentPrice(chunk.at);
+    if (!p) { kvar.push(chunk); continue; }
+    charge(chunk.kwh, p);
+    settled += chunk.kwh;
+  }
+
+  if (settled > 0) {
+    active.unpriced = kvar;
+    active.unpricedKwh = round(Math.max(0, active.unpricedKwh - settled), 3);
+    log.info(`Prissatte ${round(settled, 3)} kWh i efterhand mot priserna som gällde när energin togs ut.`);
+  }
 }
 
 /**
@@ -1552,13 +1645,31 @@ function accumulate({ sessionEnergyKwh, powerKw, price }) {
 
   const deltaKwh = Math.max(0, total - active.energyKwh);
 
-  if (deltaKwh > 0 && price) {
+  if (deltaKwh > 0) {
+    // Mätvärdet är ett faktum och skrivs alltid fram. Förut skedde det bara om
+    // ett pris fanns, så saknades prisdata stod räknaren stilla — och när
+    // priset kom tillbaka debiterades hela mellanrummet till priset i det
+    // ögonblicket, i stället för till priserna som gällde när strömmen gick.
     active.energyKwh = round(total, 3);
-    active.costEnergySek = round(active.costEnergySek + deltaKwh * price.energySek, 4);
-    active.costServiceSek = round(active.costServiceSek + deltaKwh * price.serviceSek, 4);
-    active.costSek = round(active.costEnergySek + active.costServiceSek, 2);
-    if (price.estimated) active.usedEstimatedPrice = true;
+
+    if (price) {
+      charge(deltaKwh, price);
+    } else {
+      // Spara mängden MED tidpunkt. Prissätts i efterhand mot rätt kvart.
+      active.unpriced.push({ at: Date.now(), kwh: round(deltaKwh, 4) });
+      active.unpricedKwh = round(active.unpricedKwh + deltaKwh, 3);
+      // Ett tak så att filen inte växer om priserna är borta i timmar. Slås
+      // äldsta posterna ihop förloras bara kvartsupplösningen, aldrig energin.
+      if (active.unpriced.length > 400) {
+        const old = active.unpriced.splice(0, 200);
+        const sum = old.reduce((a, c) => a + c.kwh, 0);
+        active.unpriced.unshift({ at: old[0].at, kwh: round(sum, 4) });
+      }
+    }
   }
+
+  // Har priserna kommit tillbaka? Betala av skulden mot rätt kvart.
+  if (price && active.unpriced.length) settleUnpriced();
 
   active.powerKw = Number(powerKw) || 0;
   active.updatedAt = new Date().toISOString();
@@ -1582,6 +1693,15 @@ function accumulate({ sessionEnergyKwh, powerKw, price }) {
 
 function finish(reason) {
   if (!active) return null;
+
+  // Sista chansen att prissätta det som mätts upp utan pris.
+  if (active.unpriced && active.unpriced.length) {
+    settleUnpriced();
+    if (active.unpriced.length) {
+      log.warn(`Session ${active.number}: ${active.unpricedKwh} kWh kunde inte prissättas — `
+        + 'appen har ingen prisdata alls för den perioden. Energin står på kvittot, kostnaden för den gör det inte.');
+    }
+  }
 
   activeWriter.flush();
 
@@ -1640,6 +1760,8 @@ function publicView(s) {
     costServiceSek: round(s.costServiceSek, 2),
     costSek: round(s.costSek, 2),
     usedEstimatedPrice: Boolean(s.usedEstimatedPrice),
+    // Energi som är uppmätt men ännu inte prissatt. Noll i normalfallet.
+    unpricedKwh: round(s.unpricedKwh || 0, 2),
     payment: s.payment,
     simulated: Boolean(s.simulated),
   };
@@ -1716,8 +1838,21 @@ const loop = (function () {
 const TICK_WATCHED_MS = 10 * 1000;   // någon har gästsidan öppen just nu
 const TICK_BUSY_MS = 30 * 1000;      // laddning pågår, ingen tittar
 const TICK_IDLE_MS = 5 * 60 * 1000;  // viloläge — men aldrig helt tyst
+const TICK_WAKE_MS = 700;            // gäst kom till sidan medan loopen sov
 const PRICE_REFRESH_MS = 15 * 60 * 1000;
 const IDLE_FINISH_MS = 20 * 60 * 1000; // färdigladdad och 0 kW så länge -> avsluta
+
+/**
+ * När slutar "senast kända läge" vara ett svar och blir en gissning?
+ *
+ * Tidigare räckte EN misslyckad avläsning för att gästsidan skulle säga "ingen
+ * kontakt med laddstolpen", och det satt kvar tills en avläsning lyckades —
+ * vilket i viloläge var minst fem minuter bort. Nu visas det vi vet, med
+ * åldern utskriven, och larmet kommer först när det verkligen är tyst.
+ */
+const STALE_MS = 90 * 1000;          // äldre än så: visa åldern för gästen
+const OFFLINE_MS = 4 * 60 * 1000;    // äldre än så: säg att kontakten är borta
+const OFFLINE_STRIKES = 4;           // eller så många misslyckade FÖRSÖK i rad
 
 let charger = null;
 let timer = null;
@@ -1729,7 +1864,10 @@ let snapshot = {
   opMode: 0,
   powerKw: 0,
   sessionEnergyKwh: 0,
-  readAt: null,
+  readAt: null,      // när uppgifterna VAR sanna — rörs aldrig av ett misslyckande
+  failStreak: 0,
+  waiting: false,
+  triedAt: null,     // när vi senast försökte
 };
 
 let cableState = { episode: 0, connected: false };
@@ -1741,6 +1879,10 @@ let stopped = false;
 let lastGuestPollAt = 0;
 const WATCHER_WINDOW_MS = 60 * 1000;
 let lastTickAt = null;
+let lastGoodAt = 0;      // millisekunder, för åldersräkning utan Date.parse
+let failStreak = 0;
+let armedAt = 0;
+let armedFor = 0;
 
 function loadCableState() {
   const raw = store.readJson('cable.json', null);
@@ -1766,14 +1908,54 @@ async function tick() {
     lastTickAt = new Date().toISOString();
 
     if (!state.ok) {
-      snapshot = { ...snapshot, ok: false, error: state.error, readAt: lastTickAt };
-      log.warn(`Kunde inte läsa laddboxen: ${state.error}`);
+      // Skilj på "vi frågade och fick fel" och "vi frågade inte, vi väntar".
+      // Det andra är inget misslyckande och ska inte räknas som ett.
+      if (!state.waiting) failStreak += 1;
+
+      // readAt rörs INTE. Den ska fortsätta betyda "när uppgifterna var sanna",
+      // annars ser en fem minuter gammal avläsning färsk ut i diagnostiken.
+      snapshot = {
+        ...snapshot,
+        ok: false,
+        error: state.error,
+        waiting: Boolean(state.waiting),
+        retryInSeconds: state.retryInSeconds || null,
+        failStreak,
+        triedAt: lastTickAt,
+      };
+
+      const age = lastGoodAt ? Math.round((Date.now() - lastGoodAt) / 1000) : null;
+      const tail = age === null ? 'ingen lyckad avläsning ännu' : `senast lyckad för ${age} s sedan`;
+      // Första miss loggas som debug. Blir det två i rad är det värt en varning.
+      if (state.waiting || failStreak < 2) log.debug(`Ingen ny avläsning: ${state.error} (${tail}).`);
+      else log.warn(`Kunde inte läsa laddboxen, ${failStreak} försök i rad: ${state.error} (${tail}).`);
+
       // Sessionen behålls med oförändrade värden. Ett avbrott i molnet får
       // aldrig innebära att en pågående laddning tappas bort.
       return;
     }
 
-    snapshot = { ...state, error: null, readAt: lastTickAt };
+    if (failStreak > 0) log.info(`Kontakten med laddboxen är tillbaka efter ${failStreak} misslyckade försök.`);
+    failStreak = 0;
+    lastGoodAt = Date.now();
+
+    // En rad per förändring, inte en rad per varv. Med debug påslaget blir det
+    // en tidslinje man kan läsa: syns ingen rad när kabeln sätts i har boxen
+    // inte berättat det, och då är det inte appen som sover.
+    if (state.opMode !== snapshot.opMode || state.cableConnected !== snapshot.cableConnected) {
+      log.debug(`Boxen ändrade sig: driftläge ${snapshot.opMode} -> ${state.opMode}, `
+        + `kabel ${snapshot.cableConnected ? 'i' : 'ur'} -> ${state.cableConnected ? 'i' : 'ur'}, `
+        + `${state.powerKw.toFixed(2)} kW.`);
+    }
+    snapshot = {
+      ...state,
+      error: null,
+      waiting: false,
+      retryInSeconds: null,
+      failStreak: 0,
+      readAt: lastTickAt,
+      triedAt: lastTickAt,
+    };
     trackCable(state);
 
     const active = sessions.getActive();
@@ -1783,7 +1965,9 @@ async function tick() {
 
     const price = prices.currentPrice();
     if (!price) {
-      log.warn('Ingen prisdata tillgänglig. Energin loggas men prissätts vid nästa varv.');
+      // Löftet i den här raden var tomt förut: energin skrevs inte fram alls
+      // utan pris. Nu sparas den med tidpunkt och prissätts mot rätt kvart.
+      log.warn('Ingen prisdata tillgänglig. Energin mäts och sparas, och prissätts när priserna kommer.');
     }
     sessions.accumulate({
       sessionEnergyKwh: state.sessionEnergyKwh,
@@ -1903,45 +2087,117 @@ async function refreshPricesIfDue() {
 }
 
 /**
- * Tre takter i stället för två.
+ * Tre takter.
  *
- * Att någon står vid stolpen och tittar på skärmen är den enda situation där
- * en snabbare avläsning gör verklig nytta — det är då man vill se effekten
- * ändras när lastbalanseraren griper in. Resten av tiden finns ingen som ser
- * skillnaden, och då är varje extra anrop mot Easee bortkastat.
+ * Att någon står vid stolpen och tittar på skärmen är den situation där en
+ * snabb avläsning gör verklig nytta. Resten av tiden ser ingen skillnaden, och
+ * då är varje extra anrop mot Easee bortkastat.
  *
- * Gästsidan säger till servern att någon tittar helt enkelt genom att hämta
- * status. Slutar den fråga faller takten tillbaka av sig själv.
+ * Att titta prövas FÖRST, oavsett om en laddning pågår. Förut låg villkoret
+ * inuti "pågår en session?", vilket betydde att den snabba takten aldrig gällde
+ * innan laddningen startat — alltså precis i det ögonblick gästen just satt i
+ * kabeln och väntar på att skärmen ska ändra sig. Det var därför det kunde ta
+ * minuter innan "sätt i kabeln" byttes ut.
+ *
+ * Kabelvillkoret frågar inte längre efter snapshot.ok. En misslyckad avläsning
+ * ska inte sänka takten till fem minuter — det är just då vi vill försöka igen.
  */
 function nextDelay() {
-  const watched = Date.now() - lastGuestPollAt < WATCHER_WINDOW_MS;
-  if (sessions.getActive()) return watched ? TICK_WATCHED_MS : TICK_BUSY_MS;
-  if (snapshot.ok && snapshot.cableConnected) return TICK_BUSY_MS;
+  if (isWatched()) return TICK_WATCHED_MS;
+  if (sessions.getActive()) return TICK_BUSY_MS;
+  if (snapshot.cableConnected) return TICK_BUSY_MS;
+  if (failStreak > 0) return TICK_BUSY_MS;   // tappad kontakt: leta tillbaka den
   return TICK_IDLE_MS;
 }
 
-function noteGuestPoll() { lastGuestPollAt = Date.now(); }
+function isWatched() { return Date.now() - lastGuestPollAt < WATCHER_WINDOW_MS; }
+
+function delayLabel(ms) {
+  if (ms <= TICK_WAKE_MS) return 'gäst kom till sidan';
+  if (ms === TICK_WATCHED_MS) return 'någon tittar';
+  if (ms === TICK_BUSY_MS) return failStreak > 0 ? 'söker kontakt' : 'kabel i eller laddning';
+  return 'viloläge';
+}
+
+/**
+ * Gästen öppnade sidan. Utan det här registrerades bara tidpunkten, medan den
+ * väntan som redan var igång löpte klart — upp till fem minuter. Nu kortas den.
+ *
+ * Bara övergången "ingen tittade" -> "någon tittar" väcker loopen, så en sida
+ * som pollar var femte sekund kan inte framkalla mer än en extra avläsning per
+ * minut, hur många gånger den än laddas om.
+ */
+function noteGuestPoll() {
+  const arriving = !isWatched();
+  lastGuestPollAt = Date.now();
+  if (!arriving || stopped || ticking || !timer) return;
+
+  const age = lastGoodAt ? Date.now() - lastGoodAt : Infinity;
+  const want = age > TICK_WATCHED_MS ? TICK_WAKE_MS : TICK_WATCHED_MS;
+  const left = armedFor - (Date.now() - armedAt);
+  if (left <= want) return;
+
+  log.debug(`Gäst öppnade sidan. Kortar väntan från ${Math.round(left / 1000)} s till ${(want / 1000).toFixed(1)} s.`);
+  arm(want);
+}
 
 function cadence() {
   const ms = nextDelay();
   return {
     ms,
-    label: ms === TICK_WATCHED_MS ? 'någon tittar' : (ms === TICK_BUSY_MS ? 'kabel i eller laddning' : 'viloläge'),
-    watched: Date.now() - lastGuestPollAt < WATCHER_WINDOW_MS,
+    label: delayLabel(ms),
+    watched: isWatched(),
+    failStreak,
+    ageSeconds: lastGoodAt ? Math.round((Date.now() - lastGoodAt) / 1000) : null,
   };
+}
+
+function arm(ms) {
+  if (stopped) return;
+  if (timer) clearTimeout(timer);
+  armedAt = Date.now();
+  armedFor = ms;
+  log.debug(`Nästa avläsning om ${(ms / 1000).toFixed(1)} s — ${delayLabel(ms)}.`);
+  timer = setTimeout(async () => {
+    await tick();
+    schedule();
+  }, ms);
+  if (timer.unref) timer.unref();
 }
 
 function schedule() {
   if (stopped) return;
-  timer = setTimeout(async () => {
-    await tick();
-    schedule();
-  }, nextDelay());
-  if (timer.unref) timer.unref();
+  arm(nextDelay());
+}
+
+/**
+ * Ett gemensamt svar på "hur färsk är den här avläsningen", så att adminfliken
+ * och gästsidan aldrig kan säga olika saker om samma ögonblicksbild. Förut
+ * läste de olika fält ur den: gästen tittade på `ok`, diagnostiken på
+ * `cableConnected`. Därför kunde diagnostiken visa "kabel ansluten" samtidigt
+ * som gästen fick "ingen kontakt med laddstolpen".
+ */
+function contact() {
+  const age = lastGoodAt ? Date.now() - lastGoodAt : null;
+  const ageSeconds = age === null ? null : Math.round(age / 1000);
+
+  if (age === null) {
+    return { state: 'lost', ageSeconds: null, reason: snapshot.error || 'Ingen avläsning ännu.', retryInSeconds: snapshot.retryInSeconds || null };
+  }
+  if (snapshot.ok && age < STALE_MS) {
+    return { state: 'ok', ageSeconds, reason: null, retryInSeconds: null };
+  }
+  // Larmet kräver BÅDE att uppgifterna hunnit bli gamla OCH att vi verkligen
+  // försökt några gånger. Ett par snabba nej i rad från molnet ska inte räcka
+  // — det är sekunder, och gästen märker det bara som en skärm som skriker.
+  if (age > OFFLINE_MS || (failStreak >= OFFLINE_STRIKES && age > STALE_MS)) {
+    return { state: 'lost', ageSeconds, reason: snapshot.error || null, retryInSeconds: snapshot.retryInSeconds || null };
+  }
+  return { state: 'stale', ageSeconds, reason: snapshot.error || null, retryInSeconds: snapshot.retryInSeconds || null };
 }
 
 function start() {
-  if (timer || stopped === false && timer) return;
+  if (timer) return;
   stopped = false;
   tick().then(schedule);
   log.info(`Bakgrundsloopen igång: ${TICK_WATCHED_MS / 1000} s när någon tittar, ${TICK_BUSY_MS / 1000} s under laddning, ${TICK_IDLE_MS / 60000} min i viloläge.`);
@@ -1953,7 +2209,8 @@ function stop() {
 }
 
 return {
-  init, start, stop, tick, noteGuestPoll, cadence,
+  init, start, stop, tick, noteGuestPoll, cadence, contact,
+  STALE_MS,
   getSnapshot: () => snapshot,
   getCableState: () => cableState,
   getLastTickAt: () => lastTickAt,
@@ -2352,6 +2609,9 @@ button.btn + button.btn{margin-top:10px}
   var receipt = null;
   var receivedAt = 0;
   var lagMs = 0;
+  // Telefonen nadde inte servern. Ett HELT annat fel an att servern inte nar
+  // laddboxen, och forut fick bada samma skarm och samma text.
+  var netFail = false;
 
   // Telefonen minns vilken laddning som är dess egen, så att kvittot kan visas
   // när sessionen tagit slut — och hittas igen senare om den är obetald.
@@ -2404,7 +2664,40 @@ button.btn + button.btn{margin-top:10px}
     return '<div class="msg ' + notice.kind + '">' + notice.text + '</div>';
   }
 
+  /** "för 2 minuter sedan", i ord som går att läsa på en telefon i solsken. */
+  function agoText(sec) {
+    if (sec === null || sec === undefined) return 'nyss';
+    if (sec < 90) return 'för ' + Math.max(5, Math.round(sec / 5) * 5) + ' sekunder sedan';
+    var m = Math.round(sec / 60);
+    return 'för ' + m + (m === 1 ? ' minut sedan' : ' minuter sedan');
+  }
+
+  /**
+   * En diskret rad när uppgifterna börjat bli gamla. Förut fanns bara två
+   * lägen: helt aktuellt, eller en varningstriangel. Det mellersta läget —
+   * "vi vet vad som gällde nyss, men inte just nu" — är det vanligaste av dem
+   * alla när molnet krånglar, och det är det som ska stå här.
+   */
+  function staleBlock(s) {
+    if (!s || s.contact !== 'stale') return '';
+    return '<div class="msg info">Uppgifterna är avlästa ' + esc(agoText(s.ageSeconds))
+      + '. Vi försöker igen automatiskt.</div>';
+  }
+
+  function netFailScreen() {
+    el.live.className = 'live off';
+    el.liveText.textContent = 'Ingen anslutning';
+    el.icon.innerHTML = ICONS.warn; el.icon.style.display = '';
+    el.title.textContent = 'Telefonen når inte appen';
+    el.lead.textContent = 'Det ser ut som att mobilen tappat nätet. Laddningen påverkas inte — den fortsätter som den ska. Sidan hittar tillbaka av sig själv.';
+    el.slot.innerHTML = '';
+    el.foot.innerHTML = '';
+  }
+
   function render() {
+    // Att telefonen inte nar servern ar inte samma sak som att servern inte nar
+    // laddboxen, och ska inte se ut som samma sak heller.
+    if (netFail) { lastKey = 'netfail'; return netFailScreen(); }
     if (!state) return;
     var s = state;
     // Energin ingår medvetet INTE i nyckeln. Talen uppdateras av tickSmooth()
@@ -2412,6 +2705,7 @@ button.btn + button.btn{margin-top:10px}
     // hopfällbara avsnitt slår igen medan man läser dem.
     var key = [s.view, s.session && s.session.number, s.price && s.price.totalSek,
                notice && notice.text, busyAction, s.starting,
+               s.contact, s.contact === 'ok' ? 0 : Math.round((s.ageSeconds || 0) / 15),
                receipt && receipt.number].join('|');
 
     // Rör inte DOM:en om inget ändrats — annars tappar man markören i textfältet
@@ -2426,6 +2720,7 @@ button.btn + button.btn{margin-top:10px}
     else if (s.view === 'readonly') { liveClass = 'live busy'; liveText = 'Avläsningsläge'; }
     else if (s.view === 'done') { liveClass = 'live busy'; liveText = 'Klar'; }
     else if (s.view === 'offline') { liveClass = 'live off'; liveText = 'Ingen kontakt'; }
+    if (s.contact === 'stale' && s.view !== 'offline') { liveClass = 'live busy'; }
     el.live.className = liveClass;
     el.liveText.textContent = liveText;
 
@@ -2433,7 +2728,7 @@ button.btn + button.btn{margin-top:10px}
       el.icon.innerHTML = ICONS.plug; el.icon.style.display = '';
       el.title.textContent = 'Sätt i laddkabeln';
       el.lead.textContent = 'Anslut kabeln till bilen och stolpen, så fortsätter det här av sig självt.';
-      el.slot.innerHTML = noticeBlock() + receiptBanner() + priceBlock(s.price, false);
+      el.slot.innerHTML = noticeBlock() + staleBlock(s) + receiptBanner() + priceBlock(s.price, false);
 
     } else if (s.view === 'ready' && verifyToken) {
       el.icon.innerHTML = ICONS.mail; el.icon.style.display = '';
@@ -2470,7 +2765,7 @@ button.btn + button.btn{margin-top:10px}
       el.lead.textContent = s.requireVerification
         ? 'Skriv ditt mobilnummer. Du får en kod via SMS, och kvittot skickas dit efteråt.'
         : 'Skriv ditt mobilnummer, så får du kvittot dit när du är klar.';
-      el.slot.innerHTML = noticeBlock() + receiptBanner() +
+      el.slot.innerHTML = noticeBlock() + staleBlock(s) + receiptBanner() +
         '<div class="field"><label for="tel">Ditt mobilnummer</label>' +
         '<input id="tel" type="tel" inputmode="numeric" autocomplete="tel" placeholder="070 123 45 67"></div>' +
         '<button class="btn" id="startBtn"' + (busyAction ? ' disabled' : '') + '>' +
@@ -2493,7 +2788,7 @@ button.btn + button.btn{margin-top:10px}
       el.lead.textContent = starting
         ? 'Laddstolpen svarar. Det kan ta en halv minut innan bilen börjar dra ström.'
         : 'Du kan låsa mobilen och gå. Laddningen mäts vidare.';
-      el.slot.innerHTML = noticeBlock() +
+      el.slot.innerHTML = noticeBlock() + staleBlock(s) +
         '<div class="runline">' + ICONS.bolt + 'Pågått i <span id="vDur">' + duration(ses.startedAt) + '</span></div>' +
         '<div class="stats">' +
           '<div class="stat wide"><div class="l">Att betala hittills</div><div><span class="v" id="vKr">' + kr(ses.costSek) + '</span><span class="u">kr</span></div></div>' +
@@ -2538,6 +2833,7 @@ button.btn + button.btn{margin-top:10px}
         '<div class="r total"><span>Att betala</span><span>' + kr(d.costSek) + ' kr</span></div>' +
         '</div>' +
         (d.usedEstimatedPrice ? '<div class="msg info">Delar av laddningen prissattes mot senast kända elpris eftersom elbörsen inte svarade.</div>' : '') +
+        (d.unpricedKwh > 0 ? '<div class="msg info">' + num(d.unpricedKwh, 2) + ' kWh är ännu inte prissatta — appen saknar elpris för den perioden. Energin är mätt och står kvar.</div>' : '') +
         '<div class="msg info">Swish och SMS-kvitto kopplas in i fas 5.</div>' +
         '<button class="btn ghost" id="againBtn">Klar</button>';
       var ab = document.getElementById('againBtn');
@@ -2550,8 +2846,23 @@ button.btn + button.btn{margin-top:10px}
     } else {
       el.icon.innerHTML = ICONS.warn; el.icon.style.display = '';
       el.title.textContent = 'Ingen kontakt med laddstolpen';
-      el.lead.textContent = 'Vi försöker igen automatiskt. Ingen laddning kan startas just nu.';
-      el.slot.innerHTML = noticeBlock();
+
+      // Sag vad vi faktiskt vet: nar vi senast fick svar, och nar vi forsoker
+      // igen. "Vi forsoker igen automatiskt" utan siffror ar ett lofte som inte
+      // gar att kontrollera, och gasten star kvar och undrar hur lange.
+      var lead = s.ageSeconds
+        ? 'Appen fick senast svar från stolpen ' + agoText(s.ageSeconds) + '.'
+        : 'Appen har inte fått något svar från stolpen.';
+      if (s.retryInSeconds > 0) {
+        lead += ' Nästa försök om ' + (s.retryInSeconds < 60
+          ? s.retryInSeconds + ' sekunder'
+          : Math.round(s.retryInSeconds / 60) + ' minuter') + '.';
+      } else {
+        lead += ' Vi försöker igen var trettionde sekund.';
+      }
+      lead += ' Ingen laddning kan startas förrän kontakten är tillbaka.';
+      el.lead.textContent = lead;
+      el.slot.innerHTML = noticeBlock() + receiptBanner();
     }
 
     if (s.mode === 'simulering') {
@@ -2571,8 +2882,12 @@ button.btn + button.btn{margin-top:10px}
 
   function poll() {
     fetch('api/status', { cache: 'no-store' })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (!r.ok) throw new Error('status ' + r.status);
+        return r.json();
+      })
       .then(function (data) {
+        netFail = false;
         state = data;
         if (data.startError) notice = { kind: 'err', text: data.startError };
         receivedAt = Date.now();
@@ -2581,10 +2896,15 @@ button.btn + button.btn{margin-top:10px}
           ? Math.max(0, Date.parse(data.serverTime) - Date.parse(data.readAt))
           : 0;
         if (data.session) { receipt = null; render(); tickSmooth(); return; }
-        return checkReceipt().then(render);
+        // Kvittouppslaget har egen felhantering. Forut lag det i samma kedja,
+        // sa en miss dar visade "ingen kontakt med laddstolpen" trots att
+        // statusanropet gatt bra.
+        return checkReceipt()
+          .catch(function () { receipt = null; })
+          .then(render);
       })
       .catch(function () {
-        state = { view: 'offline' };
+        netFail = true;
         render();
       });
   }
@@ -2951,6 +3271,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + row('Session', '#' + ses.number)
         + row('Kabelns löpnummer', '#' + (D.cable.episode||0))
         + (ses.usedEstimatedPrice ? row('Prisdata','<span class="pill p-warn">delvis uppskattad</span>') : '')
+        + (ses.unpricedKwh > 0 ? row('Väntar på pris','<span class="pill p-warn">' + n1(ses.unpricedKwh) + ' kWh</span>') : '')
         + '</div><div class="btns"><button class="b danger" data-act="endsession">Avsluta sessionen</button></div>';
     } else {
       h += '<div class="h">Pågående laddning</div><div class="card"><div class="note" style="margin:0">Ingen laddning pågår.</div></div>';
@@ -3193,7 +3514,20 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     }
     var pc = s.phaseCurrents || {}, eq = s.eqAvailable || {};
 
+    // Adminfliken och gästsidan läser samma bedömning. Förut tittade gästen på
+    // "lyckades senaste anropet" och diagnostiken rakt på värdena, så de kunde
+    // säga olika saker om exakt samma ögonblicksbild.
+    var c = D.contact || { state: 'ok', ageSeconds: null };
+    var cText = c.state === 'ok'
+      ? '<span style="color:#6FD39B">aktuell</span>'
+      : (c.state === 'stale'
+          ? '<strong style="color:#D8B978">inaktuell</strong> — senaste lyckade avläsning för ' + (c.ageSeconds || 0) + ' s sedan'
+          : '<strong style="color:#E08B7A">ingen kontakt</strong>'
+            + (c.ageSeconds === null ? '' : ' — senaste lyckade avläsning för ' + c.ageSeconds + ' s sedan'));
+    if (c.reason) cText += '<br><span style="color:var(--mut)">' + esc(c.reason) + '</span>';
+
     var h = msgHtml() + '<div class="h">Laddning just nu</div><div class="tw"><table><tbody>'
+      + dr('Avläsningen', cText)
       + dr('Driftläge', s.opMode + ' &middot; ' + esc(D.opModeText))
       + dr('Kabel ansluten', s.cableConnected ? 'ja' : 'nej')
       + dr('Stolpen', s.reasonForNoCurrent === 53 || s.enabled === false
@@ -3205,7 +3539,9 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       + dr('Livstidsenergi', v(s.lifetimeEnergyKwh, 'kWh', 2))
       + dr('Spänning', v(s.voltage, 'V', 1))
       + dr('Kabelns löpnummer', '#' + (D.cable.episode||0))
-      + dr('Läst', ts(s.readAt))
+      + dr('Värdena avlästa', ts(s.readAt))
+      + dr('Senaste försök', ts(D.lastTick))
+      + dr('Takt just nu', esc((D.cadence.ms/1000) + ' s — ' + D.cadence.label))
       + '</tbody></table></div>';
 
     h += '<div class="h">Lastbalansering</div><div class="tw"><table><tbody>'
@@ -4285,6 +4621,10 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
       ? '<div class="msg">Delar av laddningen prissattes mot senast kända elpris eftersom elbörsen inte svarade.</div>'
       : ''}
 
+    ${session.unpricedKwh > 0
+      ? `<div class="msg">${kwh(session.unpricedKwh)} kWh av det som laddats är inte prissatt — appen saknar elpris för den perioden helt. Energin står med ovan, men kostnaden för den ingår inte i summan.</div>`
+      : ''}
+
     ${paid ? '' : swishData ? `
     <div class="qrbox">
       <div class="qr">${swishData.svg}</div>
@@ -4354,7 +4694,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -4609,6 +4949,28 @@ async function applyCableLock(locked) {
   return sendCommand(locked ? 'lås kabel' : 'lås upp kabel', () => charger.setLocked(locked), null);
 }
 
+/**
+ * Servern läser laddboxen på nytt innan den startar något — vi litar aldrig på
+ * vad webbläsaren visade, den kan ha stått öppen i en timme.
+ *
+ * Men går den avläsningen inte fram fick gästen förut ett blankt nej, och
+ * kunde inte starta alls förrän Easee svarade igen. Är den senaste lyckade
+ * avläsningen färskare än en och en halv minut duger den: den säger om kabeln
+ * sitter i, och startsekvensen verifierar ändå efteråt att laddningen kom igång.
+ */
+async function readStateForStart() {
+  const live = await charger.readState();
+  if (live.ok) return live;
+
+  const snap = loop.getSnapshot();
+  const c = loop.contact();
+  if (c.state !== 'lost' && snap.readAt) {
+    log.info(`Använder senaste avläsningen (${c.ageSeconds} s gammal) eftersom Easee inte svarade: ${live.error}`);
+    return { ...snap, ok: true, fromSnapshot: true };
+  }
+  return live;
+}
+
 /* ------------------------------------------------------------------ */
 /* Gästroutern                                                         */
 /* ------------------------------------------------------------------ */
@@ -4634,11 +4996,15 @@ guest.get('/api/status', (req, res) => {
   const active = sessions.getActive();
   const price = prices.currentPrice();
 
+  // 'ok' | 'stale' | 'lost'. Ett enda misslyckat anrop släcker inte längre
+  // sidan: vi visar det vi senast visste och skriver ut hur gammalt det är.
+  const contact = loop.contact();
+
   let view = 'idle';
   let session = null;
   let busySince = null;
 
-  if (!snap.ok) {
+  if (contact.state === 'lost') {
     view = 'offline';
   } else if (active) {
     // Gästen som startade sessionen och en förbipasserande ska se olika saker.
@@ -4668,6 +5034,9 @@ guest.get('/api/status', (req, res) => {
     starting: startState.running,
     startError: !active && startState.error ? startState.error : null,
     readAt: snap.readAt,
+    contact: contact.state,
+    ageSeconds: contact.ageSeconds,
+    retryInSeconds: contact.retryInSeconds,
     serverTime: new Date().toISOString(),
     simulated: Boolean(snap.simulated),
     locationName: config.ha().location_name,
@@ -4691,8 +5060,8 @@ guest.post('/api/verify/send', async (req, res, ctx) => {
   const parsed = await readJsonBody(req);
   if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
 
-  const state = await charger.readState();
-  if (!state.ok) return sendJson(res, 503, { error: 'Ingen kontakt med laddstolpen just nu.' });
+  const state = await readStateForStart();
+  if (!state.ok) return sendJson(res, 503, { error: 'Ingen kontakt med laddstolpen just nu. Försök igen om en stund.' });
   if (!state.cableConnected) return sendJson(res, 409, { error: 'Ingen kabel är ansluten till stolpen.' });
 
   const base = publicBaseUrl() || `https://${req.headers.host || 'localhost'}`;
@@ -4763,10 +5132,8 @@ guest.post('/api/start', async (req, res, ctx) => {
       return sendJson(res, 400, { error: 'Mobilnumret måste verifieras först.' });
     }
 
-    // Servern läser laddboxen på nytt. Vi litar aldrig på vad webbläsaren visade
-    // — den kan ha stått öppen i en timme.
-    const state = await charger.readState();
-    if (!state.ok) return sendJson(res, 503, { error: 'Ingen kontakt med laddstolpen just nu.' });
+    const state = await readStateForStart();
+    if (!state.ok) return sendJson(res, 503, { error: 'Ingen kontakt med laddstolpen just nu. Försök igen om en stund.' });
     if (!state.cableConnected) return sendJson(res, 409, { error: 'Ingen kabel är ansluten till stolpen.' });
     if (sessions.getActive()) return sendJson(res, 409, { error: 'Stolpen används just nu.' });
 
@@ -4861,7 +5228,7 @@ guest.get('/s/:key', async (req, res, ctx) => {
   const v = verify.consume(ctx.params.key);
   if (!v.ok) return say('Länken fungerar inte', v.error, false);
 
-  const state = await charger.readState();
+  const state = await readStateForStart();
   if (!state.ok) return say('Ingen kontakt med laddstolpen', 'Försök igen om en stund.', false);
   if (!state.cableConnected) return say('Ingen kabel ansluten', 'Sätt i kabeln och begär en ny kod.', false);
 
@@ -4964,6 +5331,8 @@ admin.get('/api/admin/state', (req, res) => {
     snapshot: snap,
     mode: config.ha().mode,
     cadence: loop.cadence(),
+    contact: loop.contact(),
+    lastTick: loop.getLastTickAt(),
     sms: sms.status(),
     smsLog: sms.recent(30),
     verify: verify.stats(),
