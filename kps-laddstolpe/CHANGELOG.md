@@ -1,5 +1,22 @@
 # Ändringslogg
 
+## 0.4.3
+
+**Avsluta-knappen sa "Avslutar…" medan laddningen startade.** Gästsidan hade en
+enda ja/nej-flagga för "något pågår", så texten på avsluta-knappen ändrades även
+när det var starten som var igång. Nu vet sidan vad som faktiskt sker.
+
+**Och starten väntar inte längre ut gästen.** Sekvensen kan ta uppemot en minut
+— din box behövde 17 sekunder bara på återupptagningen. Att hålla mobilens
+förfrågan öppen så länge är fel: telefonen kan ge upp av sig själv, och under
+tiden vet appen inte vad den ska visa. Servern svarar nu direkt när sessionen är
+skapad och kör sekvensen vidare i bakgrunden.
+
+Under tiden säger skärmen **"Startar laddningen — det kan ta en halv minut innan
+bilen börjar dra ström"**, och avsluta-knappen är avstängd tills laddningen
+verkligen är igång. Misslyckas starten får gästen veta det, i stället för att
+sitta kvar i en laddvy som aldrig börjar räkna.
+
 ## 0.4.2
 
 **Startsekvensen saknades.** Stolpen står avstängd när den inte används — det är
