@@ -1,5 +1,47 @@
 # Ändringslogg
 
+## 0.5.2
+
+**Gästsidan kraschade så fort kabeln satt i.** Två variabler i sidans skript
+saknade deklaration. En tilldelning skapade dem i efterhand, men sidan *läser*
+den ena vid varje avläsning så snart kabeln är ansluten — och en läsning före
+första tilldelningen avbryter hela ritningen. Sidan har alltså aldrig kunnat
+visa "Redo att ladda" sedan fas 5 lades in.
+
+Felet syntes inte som ett fel. Det hamnade i nätverkets felhantering, och därför
+stod det **"Ingen kontakt med laddstolpen"** — medan adminfliken samtidigt visade
+kabeln som ansluten och allt annat såg friskt ut. Det var det du såg.
+
+**Kvittot hämtades i fel format.** Kvittoadressen svarar med JSON bara om
+webbläsaren ber om det, och gästsidan bad inte. Den fick en HTML-sida, försökte
+läsa den som JSON och misslyckades — varje gång, för varje telefon som hade en
+laddning sparad. Också det visades som "Ingen kontakt med laddstolpen". Kvittot
+dyker nu upp av sig självt när du drar ur kabeln, vilket det inte har gjort.
+
+**Och felhanteringen ljuger inte längre.** Tre olika fel hölls ihop i en enda
+hantering, så vilket som helst av dem kunde rapporteras som vilket som helst av
+de andra:
+
+| Vad som gick fel | Vad sidan säger nu |
+|---|---|
+| Telefonen når inte appen | *Telefonen når inte appen* |
+| Appen når inte laddboxen | *Ingen kontakt med laddstolpen* |
+| Fel i appens egen kod | *Något gick fel i appen* |
+
+Det tredje är nytt. En felhanterare som skyller på mobiltäckningen när felet
+sitter i koden får dig att leta på fel ställe — precis vad som hände här.
+
+**Fel i gästens webbläsare hamnar nu i din logg.** Du kommer aldrig att öppna
+webbläsarens konsol på en grannes telefon. Utan det här är ett fel i sidan
+osynligt för dig: gästen ser något konstigt, du ser en logg där allt ser bra ut.
+Högst fem rapporter per timme och avsändare, och ingenting sparas på disk.
+
+**Kontrollen före varje släpp kör nu sidan, inte bara läser den.** En riktig
+webbläsare går igenom nitton vyer och hela gästflödet — kabel i, nummer, kod,
+start, urdragning, kvitto — och underkänner bygget vid minsta fel i konsolen.
+De två felen ovan är båda giltig JavaScript och passerade den gamla kontrollen
+utan ett ljud.
+
 ## 0.5.1
 
 Sex fel i kontakten med laddboxen. Tillsammans förklarar de varför det kunde ta
