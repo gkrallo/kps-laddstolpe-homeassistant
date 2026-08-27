@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.3.0 — fas 3: skarp Easee, endast avläsning.**
+**Version 0.3.1 — fas 3: skarp Easee, endast avläsning.**
 Nu kan tillägget läsa av din riktiga laddbox. Inga kommandon skickas till den —
 det kommer i fas 4.
 
@@ -148,6 +148,17 @@ exponentiellt, upp till en halvtimme. Loopen pollar var 30:e sekund under
 laddning men bara var femte minut i viloläge — glest nog att vara hövlig, tätt
 nog att Easees refresh-token inte ska hinna dö av inaktivitet, vilket den gör
 om ingen rör kontot på en vecka.
+
+**Tre avläsningstakter.** Var tionde sekund när någon har gästsidan öppen, var
+trettionde när en laddning pågår utan publik, var femte minut i viloläge. Att
+någon står vid stolpen och tittar är den enda situation där en snabbare
+avläsning gör verklig nytta — det är då man vill se effekten ändras när
+lastbalanseraren griper in. Aktuell takt syns på adminfliken.
+
+**Siffrorna tickar jämnt.** Mellan två avläsningar räknar webbläsaren vidare
+utifrån effekten, så beloppet stiger mjukt i stället för att stå still och sedan
+hoppa. Det är enbart för ögat: **det som debiteras är alltid de riktiga
+mätvärdena** från laddboxen, aldrig uppskattningen.
 
 **Certifikatet laddas om automatiskt.** Fas 1 läste `/ssl` en enda gång vid
 start, vilket betydde att tillägget hade fortsatt servera det gamla certifikatet
