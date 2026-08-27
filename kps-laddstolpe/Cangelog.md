@@ -1,5 +1,33 @@
 # Ändringslogg
 
+## 0.4.0 — fas 4
+
+Kommandon mot laddboxen. Läget `skarp` gör appen till något som styr hårdvara,
+inte bara läser av den.
+
+**Varje kommando verifieras.** Easee svarar 200 så snart molnet tagit emot
+kommandot — inte när boxen gjort något. Den gamla appen tolkade det som att
+laddningen startat. Nu väntar appen in det observerbara tillståndet: `start`
+räknas som lyckat först när driftläget blivit 3 eller effekt börjat flöda,
+`stopp` först när driftläget lämnat 3.
+
+**Ett stopp som inte biter avslutar inte sessionen.** Går laddningen inte att
+stoppa efter två försök hålls sessionen öppen och fortsätter räknas, och gästen
+får beskedet att dra ur kabeln. Alternativet vore att skriva ett kvitto medan
+strömmen går — gästen laddar gratis och du betalar.
+
+**Kabellåset lämnas i fred.** Boxar med `lockCablePermanently` sköter det själva.
+Måste det slås på finns en brytare i adminfliken, men den är av som standard.
+
+**Kommandologg** i adminfliken: varje kommando med tid, utfall och hur lång tid
+bekräftelsen tog.
+
+**Manuell styrning** i Laddbox-fliken, med bekräftelseruta. Start och stopp är
+avstängda medan en gästladdning pågår — annars blir kvittot fel.
+
+**"Boxen vägrar stanna"** i simuleringsläget härmar det otäckaste felet, som
+inte går att framkalla på riktig hårdvara.
+
 ## 0.3.3
 
 **Prickarna är tillbaka.** Å, ä och ö hade fallit bort på flera ställen i
