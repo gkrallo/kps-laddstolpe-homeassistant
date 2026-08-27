@@ -3045,7 +3045,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       var texts = { start:'Starta laddningen nu?', stop:'Stoppa laddningen nu?',
                     lock:'Låsa kabeln?', unlock:'Låsa upp kabeln?',
                     current:'Skicka maxströmmen till laddboxen?' };
-      if (!window.confirm(texts[what] + '\n\nKommandot går till din riktiga laddbox.')) return;
+      if (!window.confirm(texts[what] + '\\n\\nKommandot går till din riktiga laddbox.')) return;
       b.disabled = true; b.textContent = 'Skickar…';
       api('api/admin/command', { cmd: what }).then(function(r){
         if (!r.ok) return flash('bad', r.body.error || 'Kommandot gick inte fram.');
@@ -3108,7 +3108,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
