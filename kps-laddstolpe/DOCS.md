@@ -2,9 +2,9 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.2.1 — fas 2: backend i simuleringsläge.**
-Ingen kontakt med den riktiga laddboxen ännu. Allt annat är på riktigt:
-prishämtning, kvartsvis kostnadsberäkning, bakgrundsloop och lagring.
+**Version 0.3.0 — fas 3: skarp Easee, endast avläsning.**
+Nu kan tillägget läsa av din riktiga laddbox. Inga kommandon skickas till den —
+det kommer i fas 4.
 
 ## Installation
 
@@ -27,14 +27,63 @@ Två sorters inställningar, medvetet åtskilda.
 | `certfile` / `keyfile` | `fullchain.pem` / `privkey.pem` | Filer i `/ssl`. DuckDNS-tillägget skapar dem. |
 | `location_name` | Gräshagen 4 | Visas på gästsidan. |
 | `price_zone` | SE3 | Elprisområde. |
-| `simulation` | `true` | Virtuell laddbox. **Låt stå kvar på true i fas 2.** |
+| `mode` | `simulering` | Se nedan. |
+| `easee_username` | tomt | E-postadressen till ditt Easee-konto. |
+| `easee_password` | tomt | Lösenordet. Maskeras av Home Assistant. |
+| `easee_charger_id` | tomt | Laddboxens id, till exempel `EMHDRU5N`. |
+| `easee_equalizer_id` | tomt | Frivilligt. Lämna tomt om du saknar Equalizer. |
 | `log_level` | info | Sätt `debug` om något krånglar. |
+
+### De tre lägena
+
+| Läge | Betyder |
+|---|---|
+| `simulering` | Virtuell laddbox. Ingen kontakt med Easee alls. |
+| `avlasning` | Riktig Easee, men **enbart läsning**. Inga kommandon skickas. |
+| `skarp` | Riktig Easee med kommandon. Låses upp i fas 4. |
 
 **I adminfliken** — ändras ofta, slår igenom direkt: avgifter, strömgräns.
 
-## Grinden för fas 2
+## Grinden för fas 3
 
-Fem prov. Alla görs från adminfliken och gästsidan, utan bil och utan laddbox.
+Först: **gör fas 2-proven igen i `simulering`** efter uppdateringen, så att
+ingenting gått sönder. De står längre ner.
+
+Byt sedan `mode` till `avlasning` och fyll i dina Easee-uppgifter. Fyra prov.
+
+**1. Inloggningen fungerar.** Titta i loggen. Där ska stå
+*"[Easee] Inloggad. Token giltig i cirka 24 timmar."* Står det att inloggningen
+nekades är e-post eller lösenord fel.
+
+**2. Värdena stämmer.** Adminfliken → **Diagnostik**. Jämför `cableConnected`,
+`totalPower` och `sessionEnergy` med vad Easee-appen visar i mobilen. De ska vara
+samma. Sitter ingen kabel i ska `chargerOpMode` vara 1.
+
+**3. Inga kommandon slipper igenom.** Gästsidan ska säga *"Avläsningsläge"*
+längst ner, och även med kabeln i ska ingen startknapp visas.
+
+**4. Tokenförnyelsen håller ett dygn.** Det här provet tar tid men är det
+viktigaste. Låt tillägget rulla ett dygn. Gå sedan till adminfliken →
+**Laddbox** och titta på Easee-rutan:
+
+> **Inloggningar ska vara 1.** Tokenförnyelser ska vara 1 eller 2.
+> Anrop senaste timmen ska ligga runt 12 i viloläge.
+
+Stiger inloggningarna med tiden är något fel, och då ska vi stanna och rätta det
+innan vi går vidare. Den gamla molnappen loggade in **2 880 gånger per
+laddningsdygn** — det är precis så man blir IP-spärrad hos Easee, och en spärrad
+IP betyder att stolpen slutar svara helt.
+
+## Om du vill se rådata
+
+Adminfliken → **Diagnostik** → *Rå API-inspektör*. Knapparna visar Easees
+obearbetade svar för laddarstatus, detaljer, konfiguration, Equalizer och listan
+över dina laddboxar. Det är det snabbaste sättet att förstå varför boxen beter
+sig som den gör.
+
+## Grinden för fas 2, som referens
+
+Fem prov i `simulering`. Alla görs utan bil och utan laddbox.
 
 **1. Priset hämtas.** Öppna adminfliken → **Priser**. Där ska stå antal kvartar
 för idag och gärna även morgondagen (släpps av Nord Pool vid 13–14-tiden).
@@ -93,6 +142,13 @@ minut, avslutade skrivs en gång till en separat fil. Allt skrivs till en
 `.tmp`-fil som byter namn på plats, så ett strömavbrott mitt i en skrivning
 aldrig kan förstöra det som redan finns.
 
+**Easee-token hanteras varsamt.** En inloggning, sedan förnyelse med
+`refresh_token` innan den går ut. Vid 429 eller serverfel backar appen av
+exponentiellt, upp till en halvtimme. Loopen pollar var 30:e sekund under
+laddning men bara var femte minut i viloläge — glest nog att vara hövlig, tätt
+nog att Easees refresh-token inte ska hinna dö av inaktivitet, vilket den gör
+om ingen rör kontot på en vecka.
+
 **Certifikatet laddas om automatiskt.** Fas 1 läste `/ssl` en enda gång vid
 start, vilket betydde att tillägget hade fortsatt servera det gamla certifikatet
 efter att DuckDNS förnyat det. Nu kontrolleras filerna varje timme och byts ut i
@@ -117,7 +173,13 @@ fil finns inte före ca kl 13 — det är normalt. Saknas även dagens har Pi:n
 troligen inte kommit ut på internet.
 
 **Gästsidan säger "Ingen kontakt med laddstolpen".** I simuleringsläge ska det
-inte hända. Kontrollera att `simulation` står på `true`.
+inte hända — kontrollera att `mode` står på `simulering`. I avläsningsläge
+betyder det att Easee inte svarar; titta i loggen och i Easee-rutan under
+**Laddbox**.
+
+**"Väntar N sekunder efter tidigare fel mot Easee."** Appen backar av med flit
+efter ett misslyckat anrop. Rätta orsaken, starta om tillägget, så nollställs
+väntetiden.
 
 **Sessionen avslutas direkt när jag startar.** Kontrollera under **Diagnostik**
 att `cableConnected` är `true`.
