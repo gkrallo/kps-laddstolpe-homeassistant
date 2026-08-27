@@ -213,6 +213,9 @@ const SETTINGS_DEFAULTS = {
   // Laddbox
   maxChargerCurrent: 16,
   offlineMaxCurrent: 12,
+  // Av som standard: boxar med permanent kabellås sköter det själva, och då
+  // gör våra kommandon bara skada.
+  lockCableDuringSession: false,
 
   // SMS: simulerat | dryrun | whitelist | live
   smsMode: 'simulerat',
@@ -269,6 +272,11 @@ function updateSettings(patch) {
       return { ok: false, error: `${key} måste vara ett tal som inte är negativt.` };
     }
     next[key] = n;
+  }
+
+  if ('lockCableDuringSession' in patch) {
+    next.lockCableDuringSession = patch.lockCableDuringSession === true
+      || patch.lockCableDuringSession === 'true';
   }
 
   if ('smsMode' in patch) {
@@ -879,9 +887,22 @@ class SimulatedCharger {
 
   async stop() {
     this._advance();
+    // "Boxen hänger sig": kommandot kvitteras men ingenting händer. Det är det
+    // otäckaste felet i hela appen — strömmen går men vi slutar räkna — och det
+    // går inte att framkalla på en riktig box, så simulatorn får göra det.
+    if (this.stuck) {
+      log.warn('[Simulator] Stoppkommandot kvitteras men boxen fortsätter ladda.');
+      return { ok: true };
+    }
     this.charging = false;
     this._persist();
     log.info('[Simulator] Laddning stoppad.');
+    return { ok: true };
+  }
+
+  setStuck(on) {
+    this.stuck = Boolean(on);
+    log.info(`[Simulator] Boxen ${this.stuck ? 'vägrar nu stanna' : 'lyder igen'}.`);
     return { ok: true };
   }
 
@@ -929,6 +950,28 @@ class SimulatedCharger {
     this._persist();
     log.info(`[Simulator] Lastbalanserare ${this.throttled ? 'stryper till 0 kW' : 'släpper på full effekt'}.`);
     return { ok: true };
+  }
+
+  noteCommand(entry) {
+    this.commandLog = this.commandLog || [];
+    this.commandLog.push({ t: new Date().toISOString(), ...entry });
+    if (this.commandLog.length > 100) this.commandLog.shift();
+  }
+
+  stats() {
+    return {
+      chargerId: 'simulerad',
+      equalizerId: null,
+      readOnly: false,
+      hasToken: true,
+      tokenMinutesLeft: null,
+      callsLastHour: 0,
+      logins: 0,
+      refreshes: 0,
+      backoffUntil: null,
+      lastError: null,
+      commandLog: (this.commandLog || []).slice(-25).reverse(),
+    };
   }
 
   /** Snabbspolar tiden så man slipper vänta en timme för att testa en laddning. */
@@ -993,6 +1036,7 @@ class EaseeCharger {
     this.calls = [];        // tidsstämplar, för anropsräknaren
     this.logins = 0;
     this.refreshes = 0;
+    this.commandLog = [];   // varje kommando som skickats, med utfall
 
     this._restoreToken();
   }
@@ -1262,6 +1306,12 @@ class EaseeCharger {
     return { ok: false, error: `Okänt val: ${what}` };
   }
 
+  /** Varje kommando som skickas hamnar här, så du kan granska i efterhand. */
+  noteCommand(entry) {
+    this.commandLog.push({ t: new Date().toISOString(), ...entry });
+    if (this.commandLog.length > 100) this.commandLog.shift();
+  }
+
   stats() {
     const hourAgo = Date.now() - 3600 * 1000;
     return {
@@ -1276,6 +1326,7 @@ class EaseeCharger {
       refreshes: this.refreshes,
       backoffUntil: this.backoffUntil ? new Date(this.backoffUntil).toISOString() : null,
       lastError: this.lastError,
+      commandLog: this.commandLog.slice(-25).reverse(),
     };
   }
 }
@@ -1718,14 +1769,33 @@ async function handleIdleFinish(state) {
  * både ett bortkastat API-anrop och en risk — det andra kan i värsta fall
  * stoppa en laddning som just startat.
  */
-async function endSession(reason) {
+async function endSession(reason, { force = false } = {}) {
   if (!sessions.getActive()) {
     log.debug('endSession anropad utan pågående session. Ignorerar.');
     return null;
   }
-  const stop = await charger.stop();
-  if (!stop.ok) log.warn(`Stoppkommandot misslyckades: ${stop.error}`);
-  await charger.setLocked(false);
+
+  // Kabeln urkopplad? Då finns inget att stoppa — bilen är redan borta.
+  const cableGone = loop.getSnapshot().cableConnected === false;
+
+  if (!cableGone) {
+    let stopped = await sendCommand('stoppa laddning', () => charger.stop(), (st) => st.opMode !== 3);
+
+    if (stopped.ok && stopped.verified === false) {
+      log.warn('Laddboxen laddar fortfarande. Försöker stoppa en gång till.');
+      stopped = await sendCommand('stoppa laddning, andra försöket', () => charger.stop(), (st) => st.opMode !== 3);
+    }
+
+    // Fortfarande igång. Att avsluta sessionen nu vore att sluta räkna medan
+    // strömmen går — gästen skulle ladda gratis och du betala för det. Bättre
+    // att låta sessionen leva och säga som det är.
+    if (!force && stopped.ok && stopped.verified === false) {
+      log.error('Laddningen gick inte att stoppa. Sessionen hålls öppen och fortsätter räknas.');
+      return { stopFailed: true };
+    }
+  }
+
+  await applyCableLock(false);
   return sessions.finish(reason);
 }
 
@@ -2779,10 +2849,39 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<button class="b" data-act="sim" data-cmd="unthrottle">Släpp på effekten</button>'
         + '<button class="b" data-act="sim" data-cmd="ff15">Spola fram 15 min</button>'
         + '<button class="b" data-act="sim" data-cmd="ff60">Spola fram 60 min</button>'
+        + '<button class="b danger" data-act="sim" data-cmd="stuck">Boxen vägrar stanna</button>'
+        + '<button class="b" data-act="sim" data-cmd="unstuck">Boxen lyder igen</button>'
         + '</div>'
-        + '<p class="note">Med de här knapparna testar du hela kedjan utan bil: sätt i kabeln, starta från gästsidan, spola fram tiden och se kostnaden räknas upp mot rätt kvartspris. "Strypa till 0 kW" härmar Equalizern — energin ska då sluta öka utan att sessionen avslutas.</p>';
+        + '<p class="note">Med de här knapparna testar du hela kedjan utan bil: sätt i kabeln, starta från gästsidan, spola fram tiden och se kostnaden räknas upp mot rätt kvartspris. "Strypa till 0 kW" härmar Equalizern — energin ska då sluta öka utan att sessionen avslutas.</p>'
+        + '<p class="note"><strong>"Boxen vägrar stanna"</strong> härmar det otäckaste felet: stoppkommandot kvitteras men strömmen fortsätter gå. Appen ska då <em>vägra</em> avsluta sessionen och fortsätta räkna, i stället för att skriva ett kvitto medan elen rinner. Tryck "Boxen lyder igen" för att släppa loss den.</p>';
     } else if (D.easee) {
       var e = D.easee;
+
+      h += '<div class="h">Kabellås</div><div class="card">'
+        + '<div class="row"><span><span class="lab">Lås kabeln under laddning</span>'
+        + '<div class="hint">' + (D.snapshot.lockedPermanently
+            ? 'Din box håller kabeln permanent låst av sig själv. Appen rör den inte.'
+            : 'Av som standard. Boxar som låser själva mår bäst av att slippa våra kommandon.') + '</div></span>'
+        + '<span><button class="b" data-act="togglelock">' + (D.settings.lockCableDuringSession ? 'På' : 'Av') + '</button></span></div>'
+        + '</div>';
+
+      if (D.mode === 'skarp') {
+        h += '<div class="h">Manuell styrning</div>'
+          + '<div class="btns">'
+          + '<button class="b" data-act="cmd" data-cmd="lock">Lås kabel</button>'
+          + '<button class="b" data-act="cmd" data-cmd="unlock">Lås upp kabel</button>'
+          + '<button class="b" data-act="cmd" data-cmd="current">Skicka maxström</button>'
+          + '<button class="b" data-act="cmd" data-cmd="stop">Stoppa laddning</button>'
+          + '<button class="b gold" data-act="cmd" data-cmd="start">Starta laddning</button>'
+          + '</div>'
+          + '<p class="note">Varje kommando kontrolleras mot laddboxens faktiska tillstånd innan det räknas som lyckat. '
+          + 'Pågår en gästladdning är start och stopp avstängda här — använd <em>Avsluta sessionen</em> på Översikt, annars blir kvittot fel.</p>';
+      } else {
+        h += '<div class="h">Manuell styrning</div><div class="card"><div class="note" style="margin:0">'
+          + 'Avstängd i avläsningsläge. Byt <code>mode</code> till <code>skarp</code> i tilläggets konfiguration.'
+          + '</div></div>';
+      }
+
       h += '<div class="h">Easee</div><div class="card">'
         + row('Läge', D.mode === 'avlasning' ? 'Avläsning — inga kommandon skickas' : 'Skarpt')
         + row('Laddbox-id', esc(e.chargerId || 'saknas'))
@@ -2794,6 +2893,18 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + (e.backoffUntil ? row('Väntar till', ts(e.backoffUntil)) : '')
         + (e.lastError ? row('Senaste fel', esc(e.lastError)) : '')
         + '</div>'
+        + (e.commandLog && e.commandLog.length
+            ? '<div class="h">Skickade kommandon</div><div class="tw"><table><thead><tr><th>Tid</th><th>Kommando</th><th>Utfall</th></tr></thead><tbody>'
+              + e.commandLog.map(function(c){
+                  var pill = !c.ok ? '<span class="pill p-bad">gick inte fram</span>'
+                    : c.verified === true ? '<span class="pill p-ok">bekräftat' + (c.seconds ? ' efter ' + c.seconds + ' s' : '') + '</span>'
+                    : c.verified === false ? '<span class="pill p-warn">ej bekräftat</span>'
+                    : '<span class="pill p-ok">skickat</span>';
+                  return '<tr><td class="mono">' + hhmm(c.t) + '</td><td>' + esc(c.name) + '</td><td>' + pill
+                    + (c.error ? ' <span style="color:var(--mut)">' + esc(c.error) + '</span>' : '') + '</td></tr>';
+                }).join('')
+              + '</tbody></table></div>'
+            : '')
         + '<p class="note">Inloggningar ska vara ett litet tal och tokenförnyelser växa långsamt. Stiger inloggningarna i takt med tiden är något fel — det var precis det mönster som fick den gamla appen att riskera IP-spärr hos Easee.</p>';
     }
     return h;
@@ -2925,6 +3036,24 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       api('api/admin/session/end', {}).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Sessionen avslutad.':(r.body.error||'Misslyckades.')); load();
       });
+    } else if (act === 'togglelock') {
+      api('api/admin/settings', { lockCableDuringSession: !D.settings.lockCableDuringSession }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'cmd') {
+      var what = b.dataset.cmd;
+      var texts = { start:'Starta laddningen nu?', stop:'Stoppa laddningen nu?',
+                    lock:'Låsa kabeln?', unlock:'Låsa upp kabeln?',
+                    current:'Skicka maxströmmen till laddboxen?' };
+      if (!window.confirm(texts[what] + '\n\nKommandot går till din riktiga laddbox.')) return;
+      b.disabled = true; b.textContent = 'Skickar…';
+      api('api/admin/command', { cmd: what }).then(function(r){
+        if (!r.ok) return flash('bad', r.body.error || 'Kommandot gick inte fram.');
+        flash('ok', r.body.verified === false
+          ? 'Kommandot togs emot, men boxen har inte ändrat tillstånd än.'
+          : 'Klart.');
+        load();
+      });
     } else if (act === 'raw') {
       var out = document.getElementById('rawOut');
       if (out) out.textContent = 'Hamtar...';
@@ -2979,7 +3108,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.3.3';
+const VERSION = '0.4.0';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -3015,6 +3144,72 @@ function uptimeText() {
   if (d) return `${d} dygn ${h} tim`;
   if (h) return `${h} tim ${m} min`;
   return `${m} min ${s % 60} s`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Kommandon mot laddboxen                                             */
+/* ------------------------------------------------------------------ */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Skickar ett kommando och kontrollerar sedan att det faktiskt hände.
+ *
+ * Easee svarar 200 så snart kommandot tagits emot av molnet — inte när
+ * laddboxen har gjort något. Den gamla appen tolkade det som att laddningen
+ * startat och gick vidare. Ibland stämde det. Ibland stod bilen still medan
+ * appen räknade en session.
+ *
+ * Här väntar vi in det observerbara tillståndet i stället. Verifieringen
+ * kostar några extra avläsningar, men kommandon är sällsynta och ett felaktigt
+ * antagande här blir ett felaktigt kvitto.
+ */
+async function sendCommand(name, run, verify, { timeoutMs = 25000, pollMs = 4000 } = {}) {
+  const started = Date.now();
+  const res = await run();
+
+  if (!res.ok) {
+    if (charger.noteCommand) charger.noteCommand({ name, ok: false, verified: false, error: res.error });
+    log.warn(`Kommando "${name}" gick inte fram: ${res.error}`);
+    return { ok: false, verified: false, error: res.error };
+  }
+
+  if (!verify) {
+    if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: null });
+    log.info(`Kommando "${name}" skickat.`);
+    return { ok: true, verified: null };
+  }
+
+  while (Date.now() - started < timeoutMs) {
+    await sleep(pollMs);
+    const st = await charger.readState();
+    if (st.ok && verify(st)) {
+      const secs = Math.round((Date.now() - started) / 1000);
+      if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: true, seconds: secs });
+      log.info(`Kommando "${name}" bekräftat av laddboxen efter ${secs} s.`);
+      return { ok: true, verified: true, state: st };
+    }
+  }
+
+  if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: false, error: 'ingen bekräftelse i tid' });
+  log.warn(`Kommando "${name}" togs emot men laddboxen ändrade inte tillstånd inom ${timeoutMs / 1000} s.`);
+  return { ok: true, verified: false, error: 'Laddboxen bekräftade inte kommandot i tid.' };
+}
+
+/**
+ * Kabellåset.
+ *
+ * Din box har `lockCablePermanently` påslaget, vilket betyder att den håller
+ * kabeln låst hela tiden av sig själv. Att då skicka lås- och
+ * upplåsningskommandon är i bästa fall bortkastat och i värsta fall något som
+ * bråkar med boxens egen inställning. Vi rör den alltså inte — om du inte
+ * uttryckligen slår på det, och boxen inte redan sköter det själv.
+ */
+async function applyCableLock(locked) {
+  if (!config.settings().lockCableDuringSession) return { ok: true, skipped: 'avstängt i inställningarna' };
+  const snap = loop.getSnapshot();
+  if (snap.lockedPermanently) return { ok: true, skipped: 'boxen håller kabeln permanent låst' };
+  return sendCommand(locked ? 'lås kabel' : 'lås upp kabel', () => charger.setLocked(locked), null);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3122,17 +3317,35 @@ guest.post('/api/start', async (req, res, ctx) => {
     });
     if (!started.ok) return sendJson(res, 409, { error: started.error });
 
-    const cmd = await charger.start();
+    const cmd = await sendCommand(
+      'starta laddning',
+      () => charger.start(),
+      (st) => st.opMode === 3 || st.powerKw > 0.1,
+    );
+
     if (!cmd.ok) {
-      // Kommandot gick inte fram. Låtsas aldrig att en laddning startat.
+      // Kommandot gick inte fram alls. Låtsas aldrig att en laddning startat.
       sessions.finish('start misslyckades');
       return sendJson(res, 502, { error: `Laddningen kunde inte startas: ${cmd.error}` });
     }
-    await charger.setLocked(true);
+
+    // Kommandot togs emot men bilen har inte börjat dra ström än. Det är
+    // normalt — vissa bilar tar en minut på sig. Sessionen behålls: energin
+    // räknas från faktiska mätvärden, så uteblir laddningen blir kostnaden noll
+    // och sessionen avslutas av sig själv efter tjugo minuter utan effekt.
+    if (cmd.verified === false) {
+      log.info(`Session #${started.session.number}: bilen har inte börjat ladda än.`);
+    }
+
+    await applyCableLock(true);
 
     log.info(`Gäst startade session #${started.session.number} från ${ctx.ip}.`);
     await loop.tick();
-    return sendJson(res, 200, { ok: true, session: sessions.publicView(sessions.getActive()) });
+    return sendJson(res, 200, {
+      ok: true,
+      pending: cmd.verified === false,
+      session: sessions.publicView(sessions.getActive()),
+    });
   } finally {
     startInFlight = false;
   }
@@ -3148,6 +3361,12 @@ guest.post('/api/stop', async (req, res, ctx) => {
 
   await loop.tick();                    // sista avläsningen innan vi summerar
   const done = await loop.endSession('avslutad av gästen');
+
+  if (done && done.stopFailed) {
+    return sendJson(res, 502, {
+      error: 'Laddningen kunde inte stoppas. Dra ur kabeln, så avslutas den automatiskt.',
+    });
+  }
   return sendJson(res, 200, { ok: true, session: sessions.publicView(done) });
 });
 
@@ -3227,7 +3446,12 @@ admin.post('/api/admin/prices/refresh', async (req, res) => {
 admin.post('/api/admin/session/end', async (req, res) => {
   if (!sessions.getActive()) return sendJson(res, 409, { error: 'Ingen laddning pågår.' });
   await loop.tick();
-  const done = await loop.endSession('avslutad från admin');
+  const done = await loop.endSession('avslutad från admin', { force: req.headers['x-force'] === 'ja' });
+  if (done && done.stopFailed) {
+    return sendJson(res, 502, {
+      error: 'Laddboxen svarar men slutar inte ladda. Sessionen hålls öppen och räknas vidare.',
+    });
+  }
   return sendJson(res, 200, { ok: true, session: sessions.publicView(done) });
 });
 
@@ -3237,6 +3461,53 @@ admin.post('/api/admin/session/payment', async (req, res) => {
   const result = sessions.setPayment(parsed.body.id, parsed.body.state);
   if (!result.ok) return sendJson(res, 400, { error: result.error });
   return sendJson(res, 200, { ok: true });
+});
+
+admin.post('/api/admin/command', async (req, res) => {
+  const mode = config.ha().mode;
+  if (mode === 'avlasning') {
+    return sendJson(res, 403, { error: 'Läget är avläsning. Byt till skarpt läge för att skicka kommandon.' });
+  }
+
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+  const cmd = String(parsed.body.cmd || '');
+
+  // Manuella kommandon får inte krocka med en pågående gästladdning
+  if (sessions.getActive() && (cmd === 'start' || cmd === 'stop')) {
+    return sendJson(res, 409, {
+      error: 'En laddning pågår. Använd "Avsluta sessionen" på Översikt i stället, så räknas kvittot rätt.',
+    });
+  }
+
+  let out;
+  switch (cmd) {
+    case 'start':
+      out = await sendCommand('start (manuellt)', () => charger.start(), (st) => st.opMode === 3 || st.powerKw > 0.1);
+      break;
+    case 'stop':
+      out = await sendCommand('stopp (manuellt)', () => charger.stop(), (st) => st.opMode !== 3);
+      break;
+    case 'lock':
+      out = await sendCommand('lås kabel (manuellt)', () => charger.setLocked(true), null);
+      break;
+    case 'unlock':
+      out = await sendCommand('lås upp kabel (manuellt)', () => charger.setLocked(false), null);
+      break;
+    case 'current':
+      out = await sendCommand(
+        `maxström ${config.settings().maxChargerCurrent} A`,
+        () => charger.setMaxCurrent(config.settings().maxChargerCurrent),
+        null,
+      );
+      break;
+    default:
+      return sendJson(res, 400, { error: `Okänt kommando: ${cmd}` });
+  }
+
+  await loop.tick();
+  if (!out.ok) return sendJson(res, 502, { error: out.error });
+  return sendJson(res, 200, { ok: true, verified: out.verified });
 });
 
 admin.post('/api/admin/easee/raw', async (req, res) => {
@@ -3264,6 +3535,8 @@ admin.post('/api/admin/sim', async (req, res) => {
     case 'unplug': out = charger.unplug(); break;
     case 'throttle': out = charger.setThrottled(true); break;
     case 'unthrottle': out = charger.setThrottled(false); break;
+    case 'stuck': out = charger.setStuck(true); break;
+    case 'unstuck': out = charger.setStuck(false); break;
     case 'ff15': out = charger.fastForward(15); sessions.shiftStartBack(15); break;
     case 'ff60': out = charger.fastForward(60); sessions.shiftStartBack(60); break;
     default: return sendJson(res, 400, { error: `Okänt kommando: ${cmd}` });
