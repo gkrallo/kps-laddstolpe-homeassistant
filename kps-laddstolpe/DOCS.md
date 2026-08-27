@@ -2,9 +2,8 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.4.2 — fas 4: kommandon mot laddboxen.**
-Appen kan nu starta och stoppa din riktiga laddbox. Varje kommando kontrolleras
-mot boxens faktiska tillstånd innan det räknas som lyckat.
+**Version 0.5.0 — fas 5: SMS, verifiering, Swish och kvitto.**
+Hela gästflödet är på plats: kod via SMS, laddning, kvitto med Swish-QR.
 
 ## Installation
 
@@ -32,6 +31,12 @@ Två sorters inställningar, medvetet åtskilda.
 | `easee_password` | tomt | Lösenordet. Maskeras av Home Assistant. |
 | `easee_charger_id` | tomt | Laddboxens id, till exempel `EMHDRU5N`. |
 | `easee_equalizer_id` | tomt | Frivilligt. Lämna tomt om du saknar Equalizer. |
+| `sms_username` | tomt | API-användare hos 46elks. |
+| `sms_password` | tomt | API-lösenord. Maskeras av Home Assistant. |
+| `sms_sender` | KPsLadd | Avsändarnamn, max 11 tecken. |
+| `swish_number` | tomt | Ditt Swish-nummer. |
+| `swish_name` | tomt | Frivilligt, visas på kvittot. |
+| `public_host` | tomt | **Viktig.** `https://grashagen4.duckdns.org:8443` — utan den saknas kvittolänken i SMS:et. |
 | `log_level` | info | Sätt `debug` om något krånglar. |
 
 ### De tre lägena
@@ -110,6 +115,43 @@ minut och kvittot dyka upp i mobilen.
 
 > Går något oväntat: byt tillbaka `mode` till `avlasning`. Då slutar appen
 > omedelbart skicka kommandon, utan att du behöver avinstallera något.
+
+## Grinden för fas 5
+
+**Allt går att prova utan att ett enda SMS kostar något.** Låt `smsMode` stå på
+`simulerat` — koden hamnar då i adminfliken i stället för i din telefon.
+
+**1. Kodvägen.** Gästsidan → skriv ditt nummer → *Skicka kod*. Gå till
+adminfliken → **SMS** → Logg → *Visa*. Där står koden. Skriv in den på
+gästsidan. Laddningen ska starta.
+
+**2. Fel kod.** Skriv fyra fel siffror. Det ska stå hur många försök som är kvar,
+och efter fem ska koden spärras.
+
+**3. Länkvägen.** Begär en ny kod, kopiera länken ur SMS-loggen och klistra in
+den i webbläsaren. Laddningen ska starta direkt. Öppnar du samma länk igen ska
+den nekas.
+
+**4. Länken bunden till kabeln.** Begär en kod. Dra ur kabeln och sätt i den
+igen. Tryck sedan på länken. Den ska säga att kabeln kopplats ur och vägra
+starta — det är skyddet mot att starta laddning på fel bil.
+
+**5. Kvittot.** Avsluta en laddning. I SMS-loggen ska ett kvitto-SMS ligga med
+en länk. Öppna den. Kvittosidan ska visa belopp, en QR-kod, en Swish-knapp och
+numret i klartext.
+
+**6. Skanna QR-koden med mobilen.** Det här är det enda jag inte kunnat testa
+själv — det finns ingen QR-avkodare i min miljö, bara mina egna kontroller av
+att kodningen är matematiskt korrekt. Rikta Swish-appen mot skärmen och se att
+mottagare, belopp och meddelande blir rätt. **Betala inte** — kontrollera bara
+att uppgifterna stämmer, och avbryt.
+
+**7. Taken.** Sätt `smsMaxPerDay` till 2 i adminfliken och begär tre koder. Den
+tredje ska nekas. Sätt sedan tillbaka värdet.
+
+Först när allt detta stämmer: byt `smsMode` till **Bara mina nummer**, lägg ditt
+eget nummer i vitlistan, och gör om prov 1 och 5. Då kommer SMS:en på riktigt,
+men bara till dig.
 
 ## Låset på stolpen
 
