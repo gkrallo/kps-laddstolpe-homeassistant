@@ -216,6 +216,9 @@ const SETTINGS_DEFAULTS = {
   // Av som standard: boxar med permanent kabellås sköter det själva, och då
   // gör våra kommandon bara skada.
   lockCableDuringSession: false,
+  // På som standard: stolpen ska stå avstängd när ingen laddar, annars kan vem
+  // som helst koppla in sig utan att gå via appen.
+  disableWhenIdle: true,
 
   // SMS: simulerat | dryrun | whitelist | live
   smsMode: 'simulerat',
@@ -272,6 +275,10 @@ function updateSettings(patch) {
       return { ok: false, error: `${key} måste vara ett tal som inte är negativt.` };
     }
     next[key] = n;
+  }
+
+  if ('disableWhenIdle' in patch) {
+    next.disableWhenIdle = patch.disableWhenIdle === true || patch.disableWhenIdle === 'true';
   }
 
   if ('lockCableDuringSession' in patch) {
@@ -766,6 +773,7 @@ class SimulatedCharger {
     this.cableConnected = false;
     this.charging = false;
     this.locked = false;
+    this.enabled = true;   // laddaren påslagen; false = stolpen låst
     this.maxCurrent = 16;
 
     this.targetKw = 11.0;   // full effekt vid trefas 16 A
@@ -796,6 +804,7 @@ class SimulatedCharger {
     this.cableConnected = Boolean(s.cableConnected);
     this.charging = Boolean(s.charging);
     this.locked = Boolean(s.locked);
+    this.enabled = s.enabled === undefined ? true : Boolean(s.enabled);
     this.throttled = Boolean(s.throttled);
     this.maxCurrent = Number(s.maxCurrent) || 16;
     this.targetKw = Number(s.targetKw) || 11.0;
@@ -812,6 +821,7 @@ class SimulatedCharger {
       cableConnected: this.cableConnected,
       charging: this.charging,
       locked: this.locked,
+      enabled: this.enabled,
       throttled: this.throttled,
       maxCurrent: this.maxCurrent,
       targetKw: this.targetKw,
@@ -865,7 +875,9 @@ class SimulatedCharger {
       eqAvailable: { l1: null, l2: null, l3: null },
       voltage: null,
       deratingActive: this.throttled,
-      reasonForNoCurrent: null,
+      // 53 = "Laddaren är avstängd", samma kod en riktig box skickar
+      reasonForNoCurrent: this.enabled ? null : 53,
+      enabled: this.enabled,
       errorCode: 0,
       online: true,
       cloud: true,
@@ -879,6 +891,11 @@ class SimulatedCharger {
   async start() {
     this._advance();
     if (!this.cableConnected) return { ok: false, error: 'Ingen kabel ansluten.' };
+    if (!this.enabled) {
+      // Precis som en riktig box: kommandot kvitteras, men ingenting händer.
+      log.warn('[Simulator] Laddaren är avstängd. Startkommandot får ingen effekt.');
+      return { ok: true };
+    }
     this.charging = true;
     this._persist();
     log.info('[Simulator] Laddning startad.');
@@ -909,6 +926,24 @@ class SimulatedCharger {
   async setLocked(locked) {
     this.locked = Boolean(locked);
     this._persist();
+    return { ok: true };
+  }
+
+  async setEnabled(enabled) {
+    this._advance();
+    this.enabled = Boolean(enabled);
+    if (!this.enabled) this.charging = false;
+    this._persist();
+    log.info(`[Simulator] Laddaren ${this.enabled ? 'påslagen' : 'avstängd'}.`);
+    return { ok: true };
+  }
+
+  async resume() {
+    this._advance();
+    if (!this.enabled || !this.cableConnected) return { ok: true };
+    this.charging = true;
+    this._persist();
+    log.info('[Simulator] Laddning återupptagen.');
     return { ok: true };
   }
 
@@ -1288,6 +1323,44 @@ class EaseeCharger {
       method: 'POST',
       body: { dynamicChargerCurrent: amps },
     });
+    return r.ok ? { ok: true } : { ok: false, error: r.error };
+  }
+
+  /**
+   * Slår på eller stänger av laddaren.
+   *
+   * Det här är låset på stolpen. Står den avstängd kan ingen ladda, oavsett vad
+   * de kopplar in — och det är hela poängen med en stolpe i ett stugområde.
+   * Easee vill ha både inställningen och kommandot; inställningen är det som
+   * består, kommandot är det som slår igenom direkt.
+   */
+  async setEnabled(enabled) {
+    if (this.readOnly) return this._blocked();
+    const id = encodeURIComponent(this.chargerId);
+
+    const setting = await this._api(`/chargers/${id}/settings`, {
+      method: 'POST',
+      body: { enabled: Boolean(enabled) },
+    });
+
+    const cmd = await this._api(
+      `/chargers/${id}/commands/${enabled ? 'enable_charger' : 'disable_charger'}`,
+      { method: 'POST', body: {} },
+    );
+
+    if (!setting.ok && !cmd.ok) {
+      return { ok: false, error: setting.error || cmd.error };
+    }
+    return { ok: true };
+  }
+
+  /** För en laddning som pausats eller väntar på godkännande. */
+  async resume() {
+    if (this.readOnly) return this._blocked();
+    const r = await this._api(
+      `/chargers/${encodeURIComponent(this.chargerId)}/commands/resume_charging`,
+      { method: 'POST', body: {} },
+    );
     return r.ok ? { ok: true } : { ok: false, error: r.error };
   }
 
@@ -1779,12 +1852,7 @@ async function endSession(reason, { force = false } = {}) {
   const cableGone = loop.getSnapshot().cableConnected === false;
 
   if (!cableGone) {
-    let stopped = await sendCommand('stoppa laddning', () => charger.stop(), (st) => st.opMode !== 3);
-
-    if (stopped.ok && stopped.verified === false) {
-      log.warn('Laddboxen laddar fortfarande. Försöker stoppa en gång till.');
-      stopped = await sendCommand('stoppa laddning, andra försöket', () => charger.stop(), (st) => st.opMode !== 3);
-    }
+    const stopped = await stopChargingSequence();
 
     // Fortfarande igång. Att avsluta sessionen nu vore att sluta räkna medan
     // strömmen går — gästen skulle ladda gratis och du betala för det. Bättre
@@ -1796,7 +1864,16 @@ async function endSession(reason, { force = false } = {}) {
   }
 
   await applyCableLock(false);
-  return sessions.finish(reason);
+
+  // Sista avläsningen innan vi låser, så energin är räknad.
+  await loop.tick();
+  const done = sessions.finish(reason);
+
+  // Och så låset på igen. Stolpen ska stå avstängd mellan laddningarna.
+  await lockPole();
+  await loop.tick();   // så adminfliken visar det låsta läget direkt
+
+  return done;
 }
 
 async function refreshPricesIfDue() {
@@ -2849,6 +2926,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<button class="b" data-act="sim" data-cmd="unthrottle">Släpp på effekten</button>'
         + '<button class="b" data-act="sim" data-cmd="ff15">Spola fram 15 min</button>'
         + '<button class="b" data-act="sim" data-cmd="ff60">Spola fram 60 min</button>'
+        + '<button class="b" data-act="sim" data-cmd="disable">Stäng av stolpen</button>'
         + '<button class="b danger" data-act="sim" data-cmd="stuck">Boxen vägrar stanna</button>'
         + '<button class="b" data-act="sim" data-cmd="unstuck">Boxen lyder igen</button>'
         + '</div>'
@@ -2856,6 +2934,13 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<p class="note"><strong>"Boxen vägrar stanna"</strong> härmar det otäckaste felet: stoppkommandot kvitteras men strömmen fortsätter gå. Appen ska då <em>vägra</em> avsluta sessionen och fortsätta räkna, i stället för att skriva ett kvitto medan elen rinner. Tryck "Boxen lyder igen" för att släppa loss den.</p>';
     } else if (D.easee) {
       var e = D.easee;
+
+      h += '<div class="h">Låset på stolpen</div><div class="card">'
+        + '<div class="row"><span><span class="lab">Stäng av laddaren när ingen laddar</span>'
+        + '<div class="hint">Stolpen står avstängd mellan laddningarna, så ingen kan koppla in sig '
+        + 'utan att gå via appen. Appen slår på den automatiskt när någon startar.</div></span>'
+        + '<span><button class="b" data-act="toggleidle">' + (D.settings.disableWhenIdle ? 'På' : 'Av') + '</button></span></div>'
+        + '</div>';
 
       h += '<div class="h">Kabellås</div><div class="card">'
         + '<div class="row"><span><span class="lab">Lås kabeln under laddning</span>'
@@ -2868,6 +2953,8 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       if (D.mode === 'skarp') {
         h += '<div class="h">Manuell styrning</div>'
           + '<div class="btns">'
+          + '<button class="b" data-act="cmd" data-cmd="disable">Lås stolpen</button>'
+          + '<button class="b" data-act="cmd" data-cmd="enable">Lås upp stolpen</button>'
           + '<button class="b" data-act="cmd" data-cmd="lock">Lås kabel</button>'
           + '<button class="b" data-act="cmd" data-cmd="unlock">Lås upp kabel</button>'
           + '<button class="b" data-act="cmd" data-cmd="current">Skicka maxström</button>'
@@ -2922,6 +3009,9 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     var h = msgHtml() + '<div class="h">Laddning just nu</div><div class="tw"><table><tbody>'
       + dr('Driftläge', s.opMode + ' &middot; ' + esc(D.opModeText))
       + dr('Kabel ansluten', s.cableConnected ? 'ja' : 'nej')
+      + dr('Stolpen', s.reasonForNoCurrent === 53 || s.enabled === false
+            ? '<strong>avstängd — ingen kan ladda</strong>'
+            : 'påslagen')
       + dr('Kabellås', s.locked ? (s.lockedPermanently ? 'låst, permanent låst i boxen' : 'låst') : 'olåst')
       + dr('Effekt', v(s.powerKw, 'kW', 2))
       + dr('Sessionsenergi', v(s.sessionEnergyKwh, 'kWh', 2))
@@ -3036,6 +3126,10 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       api('api/admin/session/end', {}).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Sessionen avslutad.':(r.body.error||'Misslyckades.')); load();
       });
+    } else if (act === 'toggleidle') {
+      api('api/admin/settings', { disableWhenIdle: !D.settings.disableWhenIdle }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Kunde inte spara.')); load();
+      });
     } else if (act === 'togglelock') {
       api('api/admin/settings', { lockCableDuringSession: !D.settings.lockCableDuringSession }).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Kunde inte spara.')); load();
@@ -3043,6 +3137,8 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     } else if (act === 'cmd') {
       var what = b.dataset.cmd;
       var texts = { start:'Starta laddningen nu?', stop:'Stoppa laddningen nu?',
+                    enable:'Låsa upp stolpen? Då kan vem som helst ladda utan att gå via appen.',
+                    disable:'Låsa stolpen? Ingen kan ladda förrän den låses upp.',
                     lock:'Låsa kabeln?', unlock:'Låsa upp kabeln?',
                     current:'Skicka maxströmmen till laddboxen?' };
       if (!window.confirm(texts[what] + '\\n\\nKommandot går till din riktiga laddbox.')) return;
@@ -3108,7 +3204,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.4.1';
+const VERSION = '0.4.2';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -3194,6 +3290,75 @@ async function sendCommand(name, run, verify, { timeoutMs = 25000, pollMs = 4000
   if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: false, error: 'ingen bekräftelse i tid' });
   log.warn(`Kommando "${name}" togs emot men laddboxen ändrade inte tillstånd inom ${timeoutMs / 1000} s.`);
   return { ok: true, verified: false, error: 'Laddboxen bekräftade inte kommandot i tid.' };
+}
+
+/**
+ * Startsekvensen.
+ *
+ * Att starta en laddning är inte ett kommando utan en ordning. Stolpen står
+ * avstängd när den inte används — det är låset som hindrar någon från att bara
+ * koppla in sig och ladda gratis. Skickar man `start_charging` mot en avstängd
+ * laddare kvitterar Easee kommandot och ingenting händer. Easee svarar då med
+ * orsakskod 53, "Laddaren är avstängd".
+ *
+ * Så: slå på först, starta sedan. Och har boxen fastnat i väntläge behövs
+ * dessutom `resume_charging` — en laddning som pausats startar inte om av ett
+ * startkommando.
+ *
+ * Originalappen gjorde rätt sak men skickade alla fyra kommandona på en gång
+ * och räknade det som lyckat om något av dem svarade ok. Här görs stegen i
+ * ordning, och bara de som behövs.
+ */
+async function startChargingSequence() {
+  const isCharging = (st) => st.opMode === 3 || st.powerKw > 0.1;
+
+  // 1. Lås upp stolpen. Alltid — vi vet inte säkert i vilket läge den står,
+  //    och att slå på en redan påslagen laddare är ofarligt.
+  if (charger.setEnabled) {
+    const on = await sendCommand('slå på laddaren', () => charger.setEnabled(true), null);
+    if (!on.ok) return { ok: false, error: `Laddaren kunde inte slås på: ${on.error}` };
+  }
+
+  // 2. Starta.
+  let started = await sendCommand('starta laddning', () => charger.start(), isCharging,
+    { timeoutMs: 20000, pollMs: 4000 });
+  if (!started.ok) return started;
+  if (started.verified) return started;
+
+  // 3. Ingen ström än. Står boxen och väntar behövs ett återupptagningskommando.
+  const st = loop.getSnapshot();
+  if (charger.resume && (st.opMode === 2 || st.opMode === 4 || st.opMode === 6 || st.opMode === 7)) {
+    log.info(`Laddboxen står i läge ${st.opMode}. Skickar återupptagning.`);
+    const resumed = await sendCommand('återuppta laddning', () => charger.resume(), isCharging,
+      { timeoutMs: 20000, pollMs: 4000 });
+    if (resumed.ok && resumed.verified) return resumed;
+  }
+
+  return { ok: true, verified: false, error: 'Laddboxen började inte ladda.' };
+}
+
+/**
+ * Stopp och lås.
+ *
+ * Efter avslutad laddning stängs laddaren av igen, så att nästa person måste
+ * gå via appen. Det är samma lås som originalappen satte, och utan det står
+ * stolpen öppen för vem som helst mellan laddningarna.
+ */
+async function stopChargingSequence() {
+  let stopped = await sendCommand('stoppa laddning', () => charger.stop(), (st) => st.opMode !== 3);
+
+  if (stopped.ok && stopped.verified === false) {
+    log.warn('Laddboxen laddar fortfarande. Försöker stoppa en gång till.');
+    stopped = await sendCommand('stoppa laddning, andra försöket', () => charger.stop(), (st) => st.opMode !== 3);
+  }
+  return stopped;
+}
+
+/** Låser stolpen genom att stänga av laddaren. */
+async function lockPole() {
+  if (!config.settings().disableWhenIdle) return { ok: true, skipped: 'avstängt i inställningarna' };
+  if (!charger.setEnabled) return { ok: true, skipped: 'stöds inte' };
+  return sendCommand('stäng av laddaren', () => charger.setEnabled(false), null);
 }
 
 /**
@@ -3317,11 +3482,7 @@ guest.post('/api/start', async (req, res, ctx) => {
     });
     if (!started.ok) return sendJson(res, 409, { error: started.error });
 
-    const cmd = await sendCommand(
-      'starta laddning',
-      () => charger.start(),
-      (st) => st.opMode === 3 || st.powerKw > 0.1,
-    );
+    const cmd = await startChargingSequence();
 
     if (!cmd.ok) {
       // Kommandot gick inte fram alls. Låtsas aldrig att en laddning startat.
@@ -3483,10 +3644,16 @@ admin.post('/api/admin/command', async (req, res) => {
   let out;
   switch (cmd) {
     case 'start':
-      out = await sendCommand('start (manuellt)', () => charger.start(), (st) => st.opMode === 3 || st.powerKw > 0.1);
+      out = await startChargingSequence();
       break;
     case 'stop':
-      out = await sendCommand('stopp (manuellt)', () => charger.stop(), (st) => st.opMode !== 3);
+      out = await stopChargingSequence();
+      break;
+    case 'enable':
+      out = await sendCommand('lås upp stolpen', () => charger.setEnabled(true), null);
+      break;
+    case 'disable':
+      out = await sendCommand('lås stolpen', () => charger.setEnabled(false), null);
       break;
     case 'lock':
       out = await sendCommand('lås kabel (manuellt)', () => charger.setLocked(true), null);
@@ -3535,6 +3702,7 @@ admin.post('/api/admin/sim', async (req, res) => {
     case 'unplug': out = charger.unplug(); break;
     case 'throttle': out = charger.setThrottled(true); break;
     case 'unthrottle': out = charger.setThrottled(false); break;
+    case 'disable': out = await charger.setEnabled(false); break;
     case 'stuck': out = charger.setStuck(true); break;
     case 'unstuck': out = charger.setStuck(false); break;
     case 'ff15': out = charger.fastForward(15); sessions.shiftStartBack(15); break;
