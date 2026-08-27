@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.2.0 — fas 2: backend i simuleringsläge.**
+**Version 0.2.1 — fas 2: backend i simuleringsläge.**
 Ingen kontakt med den riktiga laddboxen ännu. Allt annat är på riktigt:
 prishämtning, kvartsvis kostnadsberäkning, bakgrundsloop och lagring.
 
@@ -56,8 +56,18 @@ starta det igen. Loggen ska säga *Återupptar pågående session*, och gästsid
 ska visa samma kilowattimmar och kronor som innan. Ingenting får gå förlorat.
 
 **5. Kabeln dras ur.** Tryck *Dra ur kabeln*. Sessionen avslutas — men först
-efter **två** avläsningar i rad, inte den första. Kvittot dyker upp under
-**Sessioner**.
+efter **två** avläsningar i rad, inte den första. På mobilen ska kvittot dyka
+upp av sig självt inom några sekunder, med kilowattimmar, elkostnad, avgift och
+summa. Trycker du *Klar* och laddar om sidan ska en rad högst upp påminna om att
+laddningen är obetald. Kvittot finns också under **Sessioner** i adminfliken.
+
+### Varför två avläsningar och inte en
+
+Det är ingen betänketid för att hinna sätta i kabeln igen — drar man ur är
+laddningen slut. Det är ett filter mot en enda felaktig avläsning från Easees
+moln, som annars skulle avsluta en pågående laddning i onödan. Det kostar
+trettio sekunder och skyddar mot ett fel som är obehagligt att upptäcka i
+efterhand.
 
 ## Vad som byggts
 
