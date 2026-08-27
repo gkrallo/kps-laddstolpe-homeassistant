@@ -671,26 +671,75 @@ const chargerModule = (function () {
 const OP_MODE = {
   0: 'Offline',
   1: 'Urkopplad',
-  2: 'Kabel ansluten, vantar',
+  2: 'Kabel ansluten, väntar',
   3: 'Laddar',
-  4: 'Fardigladdad',
+  4: 'Färdigladdad',
   5: 'Fel',
   6: 'Redo att ladda',
+  7: 'Väntar på godkännande',
+  8: 'Loggar ut',
+};
+
+/**
+ * Easees kod för varför strömmen är begränsad, i klartext.
+ *
+ * Numret säger allt men bara till den som har tabellen framför sig. Din box
+ * rapporterade kod 28 mitt under laddning — det betyder "begränsad av
+ * Equalizern", alltså precis den lastbalansering appen finns för att räkna
+ * rätt på. Det är värt att kunna läsa direkt.
+ *
+ * Källa: developer.easee.com/docs/enumerations
+ */
+const NO_CURRENT_REASON = {
+  0: 'Allt normalt',
+  1: 'Lastbalansering: kretsens ström räcker inte',
+  2: 'Lastbalansering: dynamisk kretsström för låg',
+  3: 'Lastbalansering: reservström vid frånkoppling för låg',
+  4: 'Lastbalansering: kretsens säkring för liten',
+  5: 'Lastbalansering: står i kö för tilldelad effekt',
+  6: 'Lastbalansering: står i kö bland färdigladdade',
+  7: 'Fel: ogiltig nättyp',
+  8: 'Fel: huvudenheten väntar på strömbegäran',
+  9: 'Fel: ingen kontakt med huvudenheten',
+  10: 'Equalizerns ström räcker inte',
+  11: 'Fel: fas inte ansluten',
+  25: 'Begränsad av kretsens säkring',
+  26: 'Begränsad av kretsens maxström',
+  27: 'Begränsad av dynamisk kretsström',
+  28: 'Begränsad av Equalizern',
+  29: 'Begränsad av kretsens lastbalansering',
+  30: 'Begränsad av inställningar för frånkopplat läge',
+  50: 'Lastbalansering: sekundär enhet inaktiv',
+  51: 'Lastbalansering: laddarens ström för låg',
+  52: 'Lastbalansering: dynamisk laddarström för låg',
+  53: 'Laddaren är avstängd',
+  54: 'Väntar på schemalagd laddning',
+  55: 'Väntar på godkännande',
+  56: 'Fel: laddaren i feltillstånd',
+  57: 'Fel: bilen beter sig oväntat',
+  75: 'Begränsad av kabelns märkström',
+  76: 'Begränsad av schema',
+  77: 'Begränsad av laddarens maxström',
+  78: 'Begränsad av dynamisk laddarström',
+  79: 'Bilen laddar inte',
+  80: 'Egen inställd gräns, eller bilen rampar upp',
+  81: 'Begränsad av bilen',
+  100: 'Okänt fel',
 };
 
 /**
  * Sitter kabeln i?
  *
- * Specifikationen sa att Easee returnerar `isCableConnected`. Det gor den inte —
- * atminstone inte for den har boxen och firmware 343. Faltet saknas helt i
- * svaret, och min forsta version laste darfor alltid av "false" mitt under
- * pagaende laddning. I avlasningslage var det bara en felaktig rad i
- * diagnostiken. I skarpt lage hade bakgrundsloopen avslutat varje session efter
- * en minut, eftersom "kabeln urkopplad tva avlasningar i rad" hade varit sant
+ * Specifikationen sa att Easee returnerar `isCableConnected`. Det gör den inte —
+ * åtminstone inte för den här boxen och firmware 343. Fältet saknas helt i
+ * svaret, och min första version läste därför alltid av "false" mitt under
+ * pågående laddning. I avläsningsläge var det bara en felaktig rad i
+ * diagnostiken. I skarpt läge hade bakgrundsloopen avslutat varje session efter
+ * en minut, eftersom "kabeln urkopplad två avläsningar i rad" hade varit sant
  * hela tiden.
  *
- * Driftlaget ar det tillforlitliga svaret. 0 betyder att boxen ar offline och
- * sager ingenting om kabeln — da behaller vi det vi trodde forut hellre an att
+ * Driftläget är det tillförlitliga svaret. 0 betyder att boxen är offline och
+ * säger ingenting om kabeln — då behåller vi det vi trodde förut hellre än att
  * gissa fel.
  */
 function cableFromState(d, previous) {
@@ -1254,7 +1303,7 @@ function create(mode, opts) {
   return new EaseeCharger({ ...opts, readOnly: mode === 'avlasning' });
 }
 
-return { create, OP_MODE, SimulatedCharger, EaseeCharger };
+return { create, OP_MODE, NO_CURRENT_REASON, SimulatedCharger, EaseeCharger };
 })();
 
 /* ========================================================================== */
@@ -1626,10 +1675,10 @@ function trackCable(state) {
 }
 
 async function handleDisconnect(state) {
-  // Enbart faktisk urkoppling raknas. Driftlage 2 gor det inte — det betyder
-  // "kabel ansluten, vantar". Driftlage 0 betyder att boxen tappat kontakten
-  // med molnet och sager ingenting alls om kabeln; att avsluta en laddning pa
-  // den grunden vore att straffa gasten for ett natverksglapp.
+  // Enbart faktisk urkoppling räknas. Driftläge 2 gör det inte — det betyder
+  // "kabel ansluten, väntar". Driftläge 0 betyder att boxen tappat kontakten
+  // med molnet och säger ingenting alls om kabeln; att avsluta en laddning på
+  // den grunden vore att straffa gästen för ett nätverksglapp.
   if (state.opMode === 0) { disconnectStrikes = 0; return false; }
   const looksDisconnected = state.cableConnected === false || state.opMode === 1;
 
@@ -2203,7 +2252,7 @@ button.btn + button.btn{margin-top:10px}
     if (s.view === 'charging') { liveText = 'Laddar'; }
     else if (s.view === 'busy') { liveClass = 'live busy'; liveText = 'Upptagen'; }
     else if (s.view === 'ready') { liveText = 'Kabel ansluten'; }
-    else if (s.view === 'readonly') { liveClass = 'live busy'; liveText = 'Avlasningslage'; }
+    else if (s.view === 'readonly') { liveClass = 'live busy'; liveText = 'Avläsningsläge'; }
     else if (s.view === 'done') { liveClass = 'live busy'; liveText = 'Klar'; }
     else if (s.view === 'offline') { liveClass = 'live off'; liveText = 'Ingen kontakt'; }
     el.live.className = liveClass;
@@ -2253,8 +2302,8 @@ button.btn + button.btn{margin-top:10px}
 
     } else if (s.view === 'readonly') {
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
-      el.title.textContent = 'Kabeln ar ansluten';
-      el.lead.textContent = 'Appen lases av mot laddboxen men skickar inga kommandon an. Starta laddningen i Easee-appen sa lange.';
+      el.title.textContent = 'Kabeln är ansluten';
+      el.lead.textContent = 'Appen läser av laddboxen men skickar inga kommandon än. Starta laddningen i Easee-appen så länge.';
       el.slot.innerHTML = noticeBlock() + receiptBanner() + priceBlock(s.price, false);
 
     } else if (s.view === 'busy') {
@@ -2296,9 +2345,9 @@ button.btn + button.btn{margin-top:10px}
     }
 
     if (s.mode === 'simulering') {
-      el.foot.innerHTML = '<span class="simbadge">Simuleringslage</span><br>Ingen riktig laddbox ar inkopplad.';
+      el.foot.innerHTML = '<span class="simbadge">Simuleringsläge</span><br>Ingen riktig laddbox är inkopplad.';
     } else if (s.mode === 'avlasning') {
-      el.foot.innerHTML = '<span class="simbadge">Avlasningslage</span><br>Appen laser av laddboxen men styr den inte.';
+      el.foot.innerHTML = '<span class="simbadge">Avläsningsläge</span><br>Appen läser av laddboxen men styr den inte.';
     } else {
       el.foot.innerHTML = '';
     }
@@ -2359,13 +2408,13 @@ button.btn + button.btn{margin-top:10px}
   /**
    * Raknar vidare mellan avlasningarna sa siffrorna tickar jamnt.
    *
-   * Laddboxen lases av var tionde sekund nar nagon tittar. Utan detta skulle
-   * beloppet sta stilla och sedan hoppa — vilket bade ser trasigt ut och far
-   * folk att undra om matningen fungerar. Vi vet effekten, sa energin daremellan
-   * gar att rakna fram.
+   * Laddboxen läses av var tionde sekund när någon tittar. Utan detta skulle
+   * beloppet stå stilla och sedan hoppa — vilket både ser trasigt ut och får
+   * folk att undra om mätningen fungerar. Vi vet effekten, så energin däremellan
+   * går att räkna fram.
    *
-   * Det har ar enbart for ogat. Det som debiteras ar alltid de riktiga
-   * matvardena fran laddboxen; den har uppskattningen nar aldrig kvittot.
+   * Det här är enbart för ögat. Det som debiteras är alltid de riktiga
+   * mätvärdena från laddboxen; den här uppskattningen når aldrig kvittot.
    */
   function tickSmooth() {
     if (!state || state.view !== 'charging' || !state.session) return;
@@ -2390,7 +2439,7 @@ button.btn + button.btn{margin-top:10px}
   function receiptBanner() {
     if (!receipt || receipt.status !== 'COMPLETED') return '';
     return '<div class="msg info" style="display:flex;justify-content:space-between;align-items:center;gap:12px">' +
-      '<span>Du har en obetald laddning pa ' + kr(receipt.costSek) + ' kr.</span>' +
+      '<span>Du har en obetald laddning på ' + kr(receipt.costSek) + ' kr.</span>' +
       '<a href="#" id="openReceipt" style="color:#F3D082;white-space:nowrap;font-weight:600">Visa kvitto</a></div>';
   }
 
@@ -2610,12 +2659,12 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     var certOk = c.ok;
 
     var h = msgHtml() + '<div class="h">Mår allt bra just nu?</div><div class="grid g2">';
-    var modeLabel = { simulering:'Simulerad box', avlasning:'Easee, avlasning', skarp:'Easee, skarpt' }[D.mode] || D.mode;
+    var modeLabel = { simulering:'Simulerad box', avlasning:'Easee, avläsning', skarp:'Easee, skarpt' }[D.mode] || D.mode;
     h += hc(chargerOk?'ok':'bad','Laddbox', chargerOk
-        ? esc(modeLabel) + ' &middot; lage ' + s.opMode + ' &middot; ' + esc(D.opModeText)
+        ? esc(modeLabel) + ' &middot; läge ' + s.opMode + ' &middot; ' + esc(D.opModeText)
         : esc(modeLabel) + ' &middot; ' + esc(s.error || 'Ingen kontakt'));
     if (D.cadence) {
-      h += hc('ok', 'Avlasningstakt', 'Var ' + (D.cadence.ms/1000) + ':e sekund &middot; ' + esc(D.cadence.label));
+      h += hc('ok', 'Avläsningstakt', 'Var ' + (D.cadence.ms/1000) + ':e sekund &middot; ' + esc(D.cadence.label));
     }
     if (D.easee) {
       var e = D.easee;
@@ -2735,17 +2784,17 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     } else if (D.easee) {
       var e = D.easee;
       h += '<div class="h">Easee</div><div class="card">'
-        + row('Lage', D.mode === 'avlasning' ? 'Avlasning — inga kommandon skickas' : 'Skarpt')
+        + row('Läge', D.mode === 'avlasning' ? 'Avläsning — inga kommandon skickas' : 'Skarpt')
         + row('Laddbox-id', esc(e.chargerId || 'saknas'))
         + row('Equalizer-id', esc(e.equalizerId || '—'))
         + row('Token', e.hasToken ? e.tokenMinutesLeft + ' min kvar' : 'ingen')
         + row('Inloggningar', String(e.logins))
-        + row('Tokenfornyelser', String(e.refreshes))
+        + row('Tokenförnyelser', String(e.refreshes))
         + row('Anrop senaste timmen', String(e.callsLastHour))
-        + (e.backoffUntil ? row('Vantar till', ts(e.backoffUntil)) : '')
+        + (e.backoffUntil ? row('Väntar till', ts(e.backoffUntil)) : '')
         + (e.lastError ? row('Senaste fel', esc(e.lastError)) : '')
         + '</div>'
-        + '<p class="note">Inloggningar ska vara ett litet tal och tokenfornyelser vaxa langsamt. Stiger inloggningarna i takt med tiden ar nagot fel — det var precis det monster som fick den gamla appen att riskera IP-sparr hos Easee.</p>';
+        + '<p class="note">Inloggningar ska vara ett litet tal och tokenförnyelser växa långsamt. Stiger inloggningarna i takt med tiden är något fel — det var precis det mönster som fick den gamla appen att riskera IP-spärr hos Easee.</p>';
     }
     return h;
   }
@@ -2760,32 +2809,32 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     var pc = s.phaseCurrents || {}, eq = s.eqAvailable || {};
 
     var h = msgHtml() + '<div class="h">Laddning just nu</div><div class="tw"><table><tbody>'
-      + dr('Driftlage', s.opMode + ' &middot; ' + esc(D.opModeText))
+      + dr('Driftläge', s.opMode + ' &middot; ' + esc(D.opModeText))
       + dr('Kabel ansluten', s.cableConnected ? 'ja' : 'nej')
-      + dr('Kabellas', s.locked ? (s.lockedPermanently ? 'last, permanent last i boxen' : 'last') : 'olast')
+      + dr('Kabellås', s.locked ? (s.lockedPermanently ? 'låst, permanent låst i boxen' : 'låst') : 'olåst')
       + dr('Effekt', v(s.powerKw, 'kW', 2))
       + dr('Sessionsenergi', v(s.sessionEnergyKwh, 'kWh', 2))
       + dr('Livstidsenergi', v(s.lifetimeEnergyKwh, 'kWh', 2))
-      + dr('Spanning', v(s.voltage, 'V', 1))
-      + dr('Kabelns lopnummer', '#' + (D.cable.episode||0))
-      + dr('Last', ts(s.readAt))
+      + dr('Spänning', v(s.voltage, 'V', 1))
+      + dr('Kabelns löpnummer', '#' + (D.cable.episode||0))
+      + dr('Läst', ts(s.readAt))
       + '</tbody></table></div>';
 
     h += '<div class="h">Lastbalansering</div><div class="tw"><table><tbody>'
-      + dr('Boxen far dra', v(s.maxCurrent, 'A', 0))
+      + dr('Boxen får dra', v(s.maxCurrent, 'A', 0))
       + dr('Tilldelat just nu', v(s.allocatedCurrent, 'A', 0))
-      + dr('Strom L1 / L2 / L3', v(pc.l1,'',2) + ' / ' + v(pc.l2,'',2) + ' / ' + v(pc.l3,'',2) + ' A')
-      + dr('Strom nolledare', v(pc.n, 'A', 2))
-      + dr('Equalizern tillater', v(eq.l1,'',0) + ' / ' + v(eq.l2,'',0) + ' / ' + v(eq.l3,'',0) + ' A')
+      + dr('Ström L1 / L2 / L3', v(pc.l1,'',2) + ' / ' + v(pc.l2,'',2) + ' / ' + v(pc.l3,'',2) + ' A')
+      + dr('Ström nolledare', v(pc.n, 'A', 2))
+      + dr('Equalizern tillåter', v(eq.l1,'',0) + ' / ' + v(eq.l2,'',0) + ' / ' + v(eq.l3,'',0) + ' A')
       + dr('Nedreglering aktiv', s.deratingActive ? 'ja' : 'nej')
-      + dr('Orsak till utebliven strom', s.reasonForNoCurrent === null || s.reasonForNoCurrent === undefined
+      + dr('Strömbegränsning', s.reasonForNoCurrent === null || s.reasonForNoCurrent === undefined
             ? '<span style="color:var(--mut)">—</span>'
-            : 'kod ' + s.reasonForNoCurrent)
+            : esc(D.noCurrentText) + ' <span style="color:var(--mut)">(kod ' + s.reasonForNoCurrent + ')</span>')
       + '</tbody></table></div>'
-      + '<p class="note">Skillnaden mellan <em>far dra</em> och <em>tilldelat just nu</em> ar lastbalanseringen i en enda siffra. '
-      + 'Ar en fasstrom nara noll laddar bilen pa tva faser, och da bar nolledaren returstrommen — darfor kan den ligga hogt aven nar en fas ar tyst.</p>';
+      + '<p class="note">Skillnaden mellan <em>får dra</em> och <em>tilldelat just nu</em> är lastbalanseringen i en enda siffra. '
+      + 'Är en fasström nära noll laddar bilen på två faser, och då bär nolledaren returströmmen — därför kan den ligga högt även när en fas är tyst.</p>';
 
-    h += '<div class="h">Boxens halsa</div><div class="tw"><table><tbody>'
+    h += '<div class="h">Boxens hälsa</div><div class="tw"><table><tbody>'
       + dr('Online', s.online === null || s.online === undefined ? '<span style="color:var(--mut)">—</span>' : (s.online ? 'ja' : 'nej'))
       + dr('Ansluten till molnet', s.cloud === null || s.cloud === undefined ? '<span style="color:var(--mut)">—</span>' : (s.cloud ? 'ja' : 'nej'))
       + dr('Wi-Fi', v(s.wifiRssi, 'dBm', 0))
@@ -2793,8 +2842,8 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       + dr('Felkod', s.errorCode === null || s.errorCode === undefined ? '<span style="color:var(--mut)">—</span>' : String(s.errorCode))
       + dr('Senaste pulsslag', ts(s.latestPulse))
       + '</tbody></table></div>'
-      + '<p class="note">Alla rader kommer fran ett faktiskt svar. Fanns inget varde star det streck. '
-      + 'Den gamla appen visade 28,4 grader som boxtemperatur — en hardkodad siffra. Easee rapporterar ingen temperatur alls, sa raden finns inte langre.</p>';
+      + '<p class="note">Alla rader kommer från ett faktiskt svar. Fanns inget värde står det streck. '
+      + 'Den gamla appen visade 28,4 grader som boxtemperatur — en hårdkodad siffra. Easee rapporterar ingen temperatur alls, så raden finns inte längre.</p>';
 
     h += '<div class="h">Systemet</div><div class="card">'
       + row('Version', esc(D.version))
@@ -2832,7 +2881,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
   function draw() {
     if (!D) return;
     document.getElementById('subtitle').textContent =
-      D.locationName + ' \u00b7 ' + ({ simulering:'simuleringslage', avlasning:'avlasningslage', skarp:'skarpt lage' }[D.mode] || D.mode) + ' \u00b7 fas 3';
+      D.locationName + ' \u00b7 ' + ({ simulering:'simuleringsläge', avlasning:'avläsningsläge', skarp:'skarpt läge' }[D.mode] || D.mode) + ' \u00b7 fas 3';
     document.getElementById('p-overview').innerHTML = current==='overview' ? overview() : '';
     document.getElementById('p-sessions').innerHTML = current==='sessions' ? sessionsPanel() : '';
     document.getElementById('p-prices').innerHTML   = current==='prices'   ? pricesPanel()   : '';
@@ -2927,10 +2976,10 @@ const https = require('node:https');
 const os = require('node:os');
 
 const chargerFactory = chargerModule;
-const { OP_MODE } = chargerModule;
+const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -3141,6 +3190,9 @@ admin.get('/api/admin/state', (req, res) => {
     cadence: loop.cadence(),
     easee: charger.stats ? charger.stats() : null,
     opModeText: OP_MODE[snap.opMode] || 'okänt',
+    noCurrentText: (snap.reasonForNoCurrent === null || snap.reasonForNoCurrent === undefined)
+      ? null
+      : (NO_CURRENT_REASON[snap.reasonForNoCurrent] || 'okänd kod'),
     cable: loop.getCableState(),
     cert: tls.status(),
     prices: prices.status(),
