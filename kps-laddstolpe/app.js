@@ -196,6 +196,12 @@ const HA_DEFAULTS = {
   easee_password: '',
   easee_charger_id: '',
   easee_equalizer_id: '',
+  sms_username: '',
+  sms_password: '',
+  sms_sender: 'KPsLadd',
+  swish_number: '',
+  swish_name: '',
+  public_host: '',
   log_level: 'info',
 };
 
@@ -219,6 +225,9 @@ const SETTINGS_DEFAULTS = {
   // På som standard: stolpen ska stå avstängd när ingen laddar, annars kan vem
   // som helst koppla in sig utan att gå via appen.
   disableWhenIdle: true,
+
+  // Numret ska vara ett bevis, inte ett textfält. Stäng bara av vid felsökning.
+  requireVerification: true,
 
   // SMS: simulerat | dryrun | whitelist | live
   smsMode: 'simulerat',
@@ -275,6 +284,10 @@ function updateSettings(patch) {
       return { ok: false, error: `${key} måste vara ett tal som inte är negativt.` };
     }
     next[key] = n;
+  }
+
+  if ('requireVerification' in patch) {
+    next.requireVerification = patch.requireVerification === true || patch.requireVerification === 'true';
   }
 
   if ('disableWhenIdle' in patch) {
@@ -1873,6 +1886,12 @@ async function endSession(reason, { force = false } = {}) {
   await lockPole();
   await loop.tick();   // så adminfliken visar det låsta läget direkt
 
+  // Kvitto-SMS. Fastnar det får sessionen ändå sitt kvitto på webben, så vi
+  // låter aldrig ett misslyckat SMS stoppa avslutet.
+  if (done && done.phone) {
+    sendReceiptSms(done).catch((err) => log.error(`Kvitto-SMS misslyckades: ${err.message}`));
+  }
+
   return done;
 }
 
@@ -2309,6 +2328,7 @@ button.btn + button.btn{margin-top:10px}
     check: '<svg viewBox="0 0 24 24" fill="none" stroke="#6FD39B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
     clock: '<svg viewBox="0 0 24 24" fill="none" stroke="#C9A961" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.2 2"/></svg>',
     bolt:  '<svg viewBox="0 0 24 24" fill="#E2B144"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>',
+    mail:  '<svg viewBox="0 0 24 24" fill="none" stroke="#E2B144" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5h18v12H3zM3 7l9 6 9-6"/></svg>',
     warn:  '<svg viewBox="0 0 24 24" fill="none" stroke="#E2786E" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v5M12 16.5v.5M10.3 3.9 2.6 17.4A2 2 0 0 0 4.3 20.4h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>'
   };
 
@@ -2415,19 +2435,55 @@ button.btn + button.btn{margin-top:10px}
       el.lead.textContent = 'Anslut kabeln till bilen och stolpen, så fortsätter det här av sig självt.';
       el.slot.innerHTML = noticeBlock() + receiptBanner() + priceBlock(s.price, false);
 
+    } else if (s.view === 'ready' && verifyToken) {
+      el.icon.innerHTML = ICONS.mail; el.icon.style.display = '';
+      el.title.textContent = 'Skriv koden från SMS:et';
+      el.lead.innerHTML = 'Vi skickade en kod till<span class="tel">' + escTel(verifyPhone) + '</span>'
+        + '<button class="linkish" id="changeTel">Fel nummer? Ändra</button>';
+      el.slot.innerHTML = noticeBlock() +
+        '<div class="field"><label for="code">Fyrsiffrig kod</label>' +
+        '<input id="code" class="code" type="text" inputmode="numeric" maxlength="4" ' +
+        'autocomplete="one-time-code" placeholder="0000"></div>' +
+        '<button class="btn" id="codeBtn"' + (busyAction ? ' disabled' : '') + '>' +
+        (busyAction === 'start' ? 'Startar…' : 'Starta laddning') + '</button>' +
+        '<p style="text-align:center;font-size:14.5px;color:#A9BFB1;margin:16px 0 0;line-height:1.5">' +
+        'Enklast är att trycka på länken i SMS:et — då startar laddningen direkt.</p>' +
+        '<p style="text-align:center;font-size:14.5px;margin:14px 0 0">' +
+        '<button class="linkish" id="resendBtn" style="color:#BFD2C6">Skicka koden igen</button></p>';
+
+      var cb = document.getElementById('codeBtn');
+      if (cb) cb.addEventListener('click', doCheckCode);
+      var ct = document.getElementById('changeTel');
+      if (ct) ct.addEventListener('click', function () {
+        verifyToken = null; verifyPhone = null; lastKey = ''; setNotice(null, null);
+      });
+      var rb = document.getElementById('resendBtn');
+      if (rb) rb.addEventListener('click', function () {
+        var p = verifyPhone; verifyToken = null; doSendCode(p);
+      });
+      var ci = document.getElementById('code');
+      if (ci) ci.focus();
+
     } else if (s.view === 'ready') {
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
       el.title.textContent = 'Redo att ladda';
-      el.lead.textContent = 'Skriv ditt mobilnummer, så får du kvittot dit när du är klar.';
+      el.lead.textContent = s.requireVerification
+        ? 'Skriv ditt mobilnummer. Du får en kod via SMS, och kvittot skickas dit efteråt.'
+        : 'Skriv ditt mobilnummer, så får du kvittot dit när du är klar.';
       el.slot.innerHTML = noticeBlock() + receiptBanner() +
         '<div class="field"><label for="tel">Ditt mobilnummer</label>' +
         '<input id="tel" type="tel" inputmode="numeric" autocomplete="tel" placeholder="070 123 45 67"></div>' +
         '<button class="btn" id="startBtn"' + (busyAction ? ' disabled' : '') + '>' +
-        (busyAction === 'start' ? 'Startar…' : 'Starta laddning') + '</button>' +
+        (busyAction ? 'Skickar…' : (s.requireVerification ? 'Skicka kod' : 'Starta laddning')) + '</button>' +
         priceBlock(s.price, true);
 
       var btn = document.getElementById('startBtn');
-      if (btn) btn.addEventListener('click', doStart);
+      if (btn) btn.addEventListener('click', function () {
+        var input = document.getElementById('tel');
+        var phone = input ? input.value.trim() : '';
+        if (!phone) { setNotice('err', 'Skriv ditt mobilnummer först.'); return; }
+        if (s.requireVerification) doSendCode(phone); else doStart(phone);
+      });
 
     } else if (s.view === 'charging') {
       var ses = s.session || {};
@@ -2598,13 +2654,16 @@ button.btn + button.btn{margin-top:10px}
       '<a href="#" id="openReceipt" style="color:#F3D082;white-space:nowrap;font-weight:600">Visa kvitto</a></div>';
   }
 
-  function doStart() {
-    var input = document.getElementById('tel');
-    var phone = input ? input.value.trim() : '';
-    if (!phone) { setNotice('err', 'Skriv ditt mobilnummer först.'); return; }
+  function escTel(v) {
+    return String(v == null ? '' : v).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
 
-    busyAction = 'start'; setNotice(null, null);
-    fetch('api/start', {
+  /** Steg 1: be servern skicka en kod. */
+  function doSendCode(phone) {
+    busyAction = 'code'; setNotice(null, null); lastKey = ''; render();
+    fetch('api/verify/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phone: phone })
@@ -2612,6 +2671,49 @@ button.btn + button.btn{margin-top:10px}
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
         busyAction = null;
+        if (!res.ok) { setNotice('err', res.body.error || 'Koden kunde inte skickas.'); return; }
+        verifyToken = res.body.token;
+        verifyPhone = res.body.phone;
+        lastKey = '';
+        setNotice(res.body.simulated ? 'info' : null,
+          res.body.simulated ? 'Simuleringsläge: koden står i adminfliken under SMS.' : null);
+      })
+      .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
+  }
+
+  /** Steg 2: skicka in koden och starta. */
+  function doCheckCode() {
+    var input = document.getElementById('code');
+    var code = input ? input.value.trim() : '';
+    if (code.length !== 4) { setNotice('err', 'Skriv de fyra siffrorna från SMS:et.'); return; }
+
+    busyAction = 'start'; setNotice(null, null); lastKey = ''; render();
+    fetch('api/verify/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: verifyToken, code: code })
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        if (!res.ok) { busyAction = null; setNotice('err', res.body.error || 'Fel kod.'); return; }
+        // Koden stämde. Nyckeln är förbrukad, så starten sker med en ny token
+        // som servern redan bundit till numret.
+        return doStart(null, verifyToken);
+      })
+      .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
+  }
+
+  function doStart(phone, token) {
+    busyAction = 'start'; setNotice(null, null);
+    fetch('api/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(token ? { token: token } : { phone: phone })
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        busyAction = null;
+        verifyToken = null; verifyPhone = null;
         if (!res.ok) { setNotice('err', res.body.error || 'Laddningen kunde inte startas.'); return; }
         if (res.body.session && res.body.session.receiptKey) {
           remember({ key: res.body.session.receiptKey, dismissed: false });
@@ -2771,6 +2873,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     <button class="tab" role="tab" aria-selected="true"  data-t="overview">Översikt</button>
     <button class="tab" role="tab" aria-selected="false" data-t="sessions">Sessioner</button>
     <button class="tab" role="tab" aria-selected="false" data-t="prices">Priser</button>
+    <button class="tab" role="tab" aria-selected="false" data-t="sms">SMS</button>
     <button class="tab" role="tab" aria-selected="false" data-t="charger">Laddbox</button>
     <button class="tab" role="tab" aria-selected="false" data-t="diag">Diagnostik</button>
   </div>
@@ -2778,6 +2881,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
   <div class="panel on" data-p="overview" id="p-overview"></div>
   <div class="panel"    data-p="sessions" id="p-sessions"></div>
   <div class="panel"    data-p="prices"   id="p-prices"></div>
+  <div class="panel"    data-p="sms"      id="p-sms"></div>
   <div class="panel"    data-p="charger"  id="p-charger"></div>
   <div class="panel"    data-p="diag"     id="p-diag"></div>
 </div>
@@ -2909,6 +3013,81 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     return '<div class="row"><span><span class="lab">'+esc(label)+'</span>'
       + (hint?'<div class="hint">'+esc(hint)+'</div>':'') + '</span>'
       + '<span><input class="inp" data-set="'+key+'" value="'+String(val).replace('.',',')+'"><span class="unit">'+esc(unit)+'</span></span></div>';
+  }
+
+  /* ---------------- SMS ---------------- */
+  function smsPanel() {
+    var x = D.sms, st = D.settings;
+    var modes = [
+      ['simulerat','Simulerat','Inget skickas. Kod och länk finns i loggen nedan.','0 kr'],
+      ['dryrun','Torrkörning','Anropar 46elks med dryrun. Kontrollerar uppgifter och antal delar.','0 kr'],
+      ['whitelist','Bara mina nummer','Skarpt till vitlistan. Allt annat simuleras.','Bara dina'],
+      ['live','Skarpt','Normal drift. Alla mottagare får riktiga SMS.','Kostar']
+    ];
+
+    var h = msgHtml() + '<div class="h">Läge</div>';
+    modes.forEach(function(m){
+      var sel = x.mode === m[0];
+      h += '<div class="card" style="cursor:pointer;' + (sel ? 'border-color:var(--gold)' : '') + '" data-act="smsmode" data-mode="' + m[0] + '">'
+        + '<div class="row" style="border:0;padding:0"><span><span class="lab">'
+        + (sel ? '● ' : '○ ') + esc(m[1]) + '</span><div class="hint">' + esc(m[2]) + '</div></span>'
+        + '<span class="pill ' + (m[3]==='Kostar'?'p-bad':(m[3]==='Bara dina'?'p-warn':'p-ok')) + '">' + esc(m[3]) + '</span></div></div>';
+    });
+
+    h += '<div class="h">Tak och förbrukning</div><div class="grid g3">'
+      + kpi('I dag', String(x.sentToday), '/ ' + x.maxPerDay)
+      + kpi('Denna månad', String(x.sentMonth), 'st')
+      + kpi('Delar totalt', String(x.partsTotal), 'st', true)
+      + '</div>'
+      + '<div class="card">'
+      + inp('smsMaxPerDay','Tak per dygn','Nås det slutar appen skicka och larmar',st.smsMaxPerDay,'st')
+      + inp('smsMaxPerHourPerNumber','Per nummer och timme','Hindrar att någon spammas',st.smsMaxPerHourPerNumber,'st')
+      + inp('smsMaxPerHourPerIp','Per plats och timme','Kostnadsskydd nu när gästsidan är publik',st.smsMaxPerHourPerIp,'st')
+      + '</div><div class="btns"><button class="b gold" data-act="savesettings">Spara</button></div>';
+
+    h += '<div class="h">Vitlista</div><div class="card">'
+      + '<div class="row"><span><span class="lab">Nummer som får skarpa SMS</span>'
+      + '<div class="hint">Ett per rad. Gäller bara i läget "Bara mina nummer".</div></span></div>'
+      + '<textarea class="ta" id="wl" style="width:100%;min-height:70px;font-family:ui-monospace,Menlo,monospace;'
+      + 'font-size:13px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:5px;padding:8px">'
+      + esc((x.whitelist||[]).join('\\n')) + '</textarea>'
+      + '<div class="btns" style="margin-top:10px"><button class="b" data-act="savewl">Spara vitlista</button></div></div>';
+
+    h += '<div class="h">Verifiering</div><div class="card">'
+      + '<div class="row"><span><span class="lab">Kräv verifiering av mobilnummer</span>'
+      + '<div class="hint">Utan detta är numret bara ett textfält. Stäng bara av vid felsökning.</div></span>'
+      + '<span><button class="b" data-act="toggleverify">' + (st.requireVerification ? 'På' : 'Av') + '</button></span></div>'
+      + row('Väntande koder', String(D.verify.pending))
+      + '</div>';
+
+    h += '<div class="h">Logg</div>';
+    if (!D.smsLog.length) {
+      h += '<div class="card"><div class="note" style="margin:0">Inga SMS ännu.</div></div>';
+    } else {
+      h += '<div class="tw"><table><thead><tr><th>Tid</th><th>Till</th><th>Typ</th><th>Läge</th><th>Delar</th><th></th></tr></thead><tbody>';
+      D.smsLog.forEach(function(m, i){
+        var pill = m.blocked ? '<span class="pill p-bad">stoppat</span>'
+          : m.error ? '<span class="pill p-bad">fel</span>'
+          : m.mode === 'simulerat' ? '<span class="pill p-ok">simulerat</span>'
+          : m.mode === 'dryrun' ? '<span class="pill p-warn">torrkörning</span>'
+          : '<span class="pill p-ok">skickat</span>';
+        h += '<tr><td class="mono">' + hhmm(m.t) + '</td><td class="mono">' + esc(m.to) + '</td>'
+          + '<td>' + esc(m.kind) + '</td><td>' + pill + '</td>'
+          + '<td class="mono">' + (m.parts || '') + '</td>'
+          + '<td>' + (m.text ? '<button class="b" style="padding:3px 8px;font-size:11.5px" data-act="showsms" data-i="' + i + '">Visa</button>' : esc(m.blocked || m.error || '')) + '</td></tr>';
+        h += '<tr id="sms' + i + '" style="display:none"><td colspan="6" class="mono" style="white-space:pre-wrap;background:var(--surf2)">'
+          + esc(m.text || '') + (m.extra && m.extra.link ? '\\n\\nLänk: ' + esc(m.extra.link) : '') + '</td></tr>';
+      });
+      h += '</tbody></table></div>';
+    }
+    h += '<p class="note">Loggen visar även de SMS bakgrundsloopen skickar när du inte tittar — den kedjan gick inte att testa i den gamla appen.</p>';
+
+    h += '<div class="h">Uppgifter</div><div class="card">'
+      + row('46elks inlagt', x.configured ? 'ja' : '<strong>nej — fyll i i tilläggets konfiguration</strong>')
+      + row('Swish-nummer', D.swishConfigured ? 'inlagt' : '<strong>saknas</strong>')
+      + row('Publik adress', esc(D.publicHost || '— sätt public_host, annars saknas kvittolänk i SMS'))
+      + '</div>';
+    return h;
   }
 
   /* ---------------- Laddbox ---------------- */
@@ -3094,6 +3273,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     document.getElementById('p-overview').innerHTML = current==='overview' ? overview() : '';
     document.getElementById('p-sessions').innerHTML = current==='sessions' ? sessionsPanel() : '';
     document.getElementById('p-prices').innerHTML   = current==='prices'   ? pricesPanel()   : '';
+    document.getElementById('p-sms').innerHTML      = current==='sms'      ? smsPanel()      : '';
     document.getElementById('p-charger').innerHTML  = current==='charger'  ? chargerPanel()  : '';
     document.getElementById('p-diag').innerHTML     = current==='diag'     ? diagPanel()     : '';
   }
@@ -3134,6 +3314,23 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       api('api/admin/session/end', {}).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Sessionen avslutad.':(r.body.error||'Misslyckades.')); load();
       });
+    } else if (act === 'smsmode') {
+      api('api/admin/settings', { smsMode: b.dataset.mode }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Läget ändrat.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'savewl') {
+      var t = document.getElementById('wl');
+      var list = t.value.split('\\n').map(function(x){ return x.trim(); }).filter(Boolean);
+      api('api/admin/settings', { smsWhitelist: list }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Vitlistan sparad.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'toggleverify') {
+      api('api/admin/settings', { requireVerification: !D.settings.requireVerification }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'showsms') {
+      var row = document.getElementById('sms' + b.dataset.i);
+      if (row) row.style.display = row.style.display === 'none' ? '' : 'none';
     } else if (act === 'toggleidle') {
       api('api/admin/settings', { disableWhenIdle: !D.settings.disableWhenIdle }).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Kunde inte spara.')); load();
@@ -3188,6 +3385,950 @@ return { render };
 })();
 
 /* ========================================================================== */
+/* 13  SMS                                                                    */
+/* ========================================================================== */
+
+const sms = (function () {
+
+/**
+ * SMS via 46elks, med fyra lägen och tak som gäller i alla.
+ *
+ * Den gamla appen läste läget ur webbläsarens förfrågan. Det betydde att en
+ * klient kunde skicka `virtualSmsMode: false` och tvinga fram skarpa utskick
+ * även när simulering var påslaget i admin. Här läses läget ENBART ur serverns
+ * egen konfiguration.
+ *
+ *   simulerat   inget skickas, allt hamnar i loggen
+ *   dryrun      anropar 46elks med dryrun, validerar utan att skicka
+ *   whitelist   skarpt till dina egna nummer, simulerat till alla andra
+ *   live        normal drift
+ */
+
+const ENDPOINT = 'https://api.46elks.com/a1/sms';
+const LOG_MAX = 200;
+
+let log_ = [];
+let counters = { day: '', sentToday: 0, month: '', sentMonth: 0, parts: 0 };
+const perNumber = new httpModule.RateLimiter();
+const perIp = new httpModule.RateLimiter();
+
+/* ---------------- teckenräkning ---------------- */
+
+// GSM 03.38, grundtabellen. Svenska å ä ö ingår och kostar ingenting extra.
+const GSM_BASIC =
+  '@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?' +
+  '¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà';
+// Tecken som ryms men kostar två platser
+const GSM_EXTENDED = '^{}\\[~]|€';
+
+/**
+ * Hur många SMS blir texten?
+ *
+ * Ett enda tecken utanför GSM-tabellen gör om HELA meddelandet till UCS-2, och
+ * då sjunker gränsen från 160 tecken till 70. Ett typografiskt apostrof eller
+ * ett tankstreck som smugit in i en mall kan alltså tredubbla kostnaden för
+ * varje utskick — vilket är den troligaste förklaringen till att testningen
+ * blev dyr.
+ */
+function measure(text) {
+  const t = String(text || '');
+  let units = 0;
+  let gsm = true;
+
+  for (const ch of t) {
+    if (GSM_BASIC.includes(ch)) { units += 1; continue; }
+    if (GSM_EXTENDED.includes(ch)) { units += 2; continue; }
+    gsm = false;
+    break;
+  }
+
+  if (!gsm) {
+    // UCS-2: räkna kodenheter, inte tecken (emoji tar två)
+    units = 0;
+    for (let i = 0; i < t.length; i++) units += 1;
+    const parts = units <= 70 ? 1 : Math.ceil(units / 67);
+    return { encoding: 'UCS-2', units, parts, limit: units <= 70 ? 70 : 67, offenders: nonGsmChars(t) };
+  }
+
+  const parts = units <= 160 ? 1 : Math.ceil(units / 153);
+  return { encoding: 'GSM-7', units, parts, limit: units <= 160 ? 160 : 153, offenders: [] };
+}
+
+function nonGsmChars(t) {
+  const bad = new Set();
+  for (const ch of t) {
+    if (!GSM_BASIC.includes(ch) && !GSM_EXTENDED.includes(ch)) bad.add(ch);
+  }
+  return Array.from(bad).slice(0, 10);
+}
+
+/* ---------------- räknare ---------------- */
+
+function today() { return prices.localDateKey(Date.now()); }
+function thisMonth() { return today().slice(0, 7); }
+
+function loadCounters() {
+  const raw = store.readJson('sms.json', null);
+  if (raw && typeof raw === 'object') counters = { ...counters, ...raw };
+  rollover();
+}
+
+function rollover() {
+  if (counters.day !== today()) { counters.day = today(); counters.sentToday = 0; }
+  if (counters.month !== thisMonth()) { counters.month = thisMonth(); counters.sentMonth = 0; }
+}
+
+function saveCounters() { store.writeJsonNow('sms.json', counters); }
+
+/* ---------------- logg ---------------- */
+
+function note(entry) {
+  log_.push({ t: new Date().toISOString(), ...entry });
+  if (log_.length > LOG_MAX) log_.shift();
+}
+
+function maskPhone(p) {
+  const s = String(p || '');
+  return s.length > 5 ? `${s.slice(0, 6)}…${s.slice(-2)}` : '…';
+}
+
+/* ---------------- utskick ---------------- */
+
+/**
+ * @param {object} opts
+ *   to      mottagare i E.164
+ *   text    meddelandet
+ *   kind    'verifiering' | 'kvitto' | 'påminnelse' | 'test'
+ *   ip      gästens IP, för takräkningen. Utelämnas för serverns egna utskick.
+ *   extra   sparas i loggen, till exempel kod och länk
+ */
+async function send({ to, text, kind = 'övrigt', ip = null, extra = null }) {
+  rollover();
+
+  const cfg = config.settings();
+  const mode = cfg.smsMode;
+  const m = measure(text);
+
+  /* --- taken gäller i ALLA lägen, även simulerat ---------------------------
+     Skälet är att taken ska vara testade när de behövs. Ett tak som bara
+     finns i skarpt läge är ett tak ingen provat.                          */
+
+  if (counters.sentToday >= cfg.smsMaxPerDay) {
+    const err = `Dygnstaket för SMS är nått (${cfg.smsMaxPerDay}).`;
+    log.error(`[SMS] ${err} Skickar inget mer i dag.`);
+    note({ kind, to: maskPhone(to), mode, blocked: err, parts: m.parts });
+    return { ok: false, error: err, blocked: true };
+  }
+
+  const byNumber = perNumber.hit(`sms:${to}`, cfg.smsMaxPerHourPerNumber, 3600 * 1000);
+  if (!byNumber.allowed) {
+    const err = 'För många SMS till det numret den senaste timmen.';
+    note({ kind, to: maskPhone(to), mode, blocked: err, parts: m.parts });
+    return { ok: false, error: err, blocked: true };
+  }
+
+  if (ip) {
+    const byIp = perIp.hit(`smsip:${ip}`, cfg.smsMaxPerHourPerIp, 3600 * 1000);
+    if (!byIp.allowed) {
+      const err = 'För många försök från samma plats. Vänta en stund.';
+      note({ kind, to: maskPhone(to), mode, blocked: err, parts: m.parts });
+      return { ok: false, error: err, blocked: true };
+    }
+  }
+
+  /* --- vilket läge gäller för just det här numret? ----------------------- */
+
+  const whitelisted = (cfg.smsWhitelist || []).some((w) => normalize(w) === to);
+  let effective = mode;
+  if (mode === 'whitelist') effective = whitelisted ? 'live' : 'simulerat';
+
+  if (effective === 'simulerat') {
+    counters.sentToday += 1; counters.sentMonth += 1; counters.parts += m.parts;
+    saveCounters();
+    note({ kind, to: maskPhone(to), mode: 'simulerat', text, parts: m.parts, encoding: m.encoding, extra, ok: true });
+    log.info(`[SMS] Simulerat ${kind} till ${maskPhone(to)} (${m.parts} del${m.parts > 1 ? 'ar' : ''}).`);
+    return { ok: true, simulated: true, parts: m.parts };
+  }
+
+  /* --- skarpt eller torrkörning ----------------------------------------- */
+
+  const user = (config.ha().sms_username || '').trim();
+  const pass = (config.ha().sms_password || '').trim();
+  const from = (config.ha().sms_sender || 'KPsLadd').trim().slice(0, 11);
+
+  if (!user || !pass) {
+    const err = '46elks-uppgifter saknas i tilläggets konfiguration.';
+    note({ kind, to: maskPhone(to), mode: effective, blocked: err, parts: m.parts });
+    return { ok: false, error: err };
+  }
+
+  const body = new URLSearchParams({ from, to, message: text });
+  if (effective === 'dryrun') body.set('dryrun', 'yes');
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: body.toString(),
+      signal: ctrl.signal,
+    });
+
+    const raw = await res.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch (_) { /* 46elks svarar text vid fel */ }
+
+    if (!res.ok) {
+      const err = `46elks svarade ${res.status}: ${raw.slice(0, 200)}`;
+      log.error(`[SMS] ${err}`);
+      note({ kind, to: maskPhone(to), mode: effective, text, parts: m.parts, encoding: m.encoding, error: err });
+      return { ok: false, error: 'SMS:et kunde inte skickas.' };
+    }
+
+    counters.sentToday += 1; counters.sentMonth += 1; counters.parts += m.parts;
+    saveCounters();
+
+    note({
+      kind, to: maskPhone(to), mode: effective, text,
+      parts: (data && data.parts) || m.parts,
+      encoding: m.encoding,
+      cost: data && (data.cost !== undefined ? data.cost : data.estimated_cost),
+      status: data && data.status,
+      id: data && data.id,
+      extra, ok: true,
+    });
+
+    log.info(`[SMS] ${effective === 'dryrun' ? 'Torrkörning' : 'Skickat'} ${kind} till ${maskPhone(to)} (${m.parts} del${m.parts > 1 ? 'ar' : ''}).`);
+    return { ok: true, dryrun: effective === 'dryrun', parts: m.parts, data };
+  } catch (err) {
+    log.error(`[SMS] Nätverksfel: ${err.message}`);
+    note({ kind, to: maskPhone(to), mode: effective, error: err.message, parts: m.parts });
+    return { ok: false, error: 'Ingen kontakt med SMS-tjänsten.' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalize(raw) {
+  const clean = String(raw || '').replace(/[\s\-()]/g, '');
+  if (/^0[1-9]\d{7,10}$/.test(clean)) return '+46' + clean.slice(1);
+  if (/^\+46[1-9]\d{7,10}$/.test(clean)) return clean;
+  if (/^46[1-9]\d{7,10}$/.test(clean)) return '+' + clean;
+  return null;
+}
+
+function status() {
+  rollover();
+  const cfg = config.settings();
+  return {
+    mode: cfg.smsMode,
+    whitelist: cfg.smsWhitelist || [],
+    sentToday: counters.sentToday,
+    maxPerDay: cfg.smsMaxPerDay,
+    sentMonth: counters.sentMonth,
+    partsTotal: counters.parts,
+    perNumberPerHour: cfg.smsMaxPerHourPerNumber,
+    perIpPerHour: cfg.smsMaxPerHourPerIp,
+    configured: Boolean((config.ha().sms_username || '').trim()),
+  };
+}
+
+return { send, measure, normalize, status, loadCounters, recent: (n = 40) => log_.slice(-n).reverse(), maskPhone };
+
+})();
+
+/* ========================================================================== */
+/* 14  Verifiering av mobilnummer                                             */
+/* ========================================================================== */
+
+const verify = (function () {
+
+/**
+ * Mobilnumret ska vara ett bevis, inte ett textfält.
+ *
+ * Två vägar in, samma sak bakom: en fyrsiffrig kod att skriva, och en länk som
+ * startar laddningen direkt. Länken är den enkla vägen; koden finns för mobiler
+ * som inte gör länkar klickbara, vilket fortfarande händer.
+ *
+ * Länken är bunden till KABELNS LÖPNUMMER, inte bara till tiden. Tänk dig att
+ * Anna begär sin kod vid stolpen, blir avbruten och åker hem. Inom tio minuter
+ * drar hon ur kabeln och Bertil sätter i sin bil. Trycker Anna då på länken
+ * hemma i soffan skulle laddningen starta — på Bertils bil, på Annas räkning.
+ * Stämmer inte löpnumret händer ingenting.
+ */
+
+const TTL_MS = 10 * 60 * 1000;
+const MAX_ATTEMPTS = 5;
+
+const pending = new Map();   // nyckel -> { phone, code, expiresAt, attempts, cableEpisode, used }
+
+function code4() {
+  return String(crypto.randomInt(0, 10000)).padStart(4, '0');
+}
+
+function key() {
+  return crypto.randomBytes(6).toString('base64url');
+}
+
+function sweep() {
+  const now = Date.now();
+  for (const [k, v] of pending) if (v.expiresAt < now) pending.delete(k);
+}
+
+/** Skapar en väntande verifiering och skickar SMS:et. */
+async function begin({ phone, ip, baseUrl }) {
+  sweep();
+
+  const to = sms.normalize(phone);
+  if (!to) return { ok: false, error: 'Kontrollera mobilnumret. Skriv det som 070 123 45 67.' };
+
+  const k = key();
+  const c = code4();
+  const episode = loop.getCableState().episode;
+
+  const link = `${baseUrl}/s/${k}`;
+  const text = `Din kod for ${config.ha().location_name}: ${c}\n\nEller starta direkt:\n${link}`;
+
+  const sent = await sms.send({ to, text, kind: 'verifiering', ip, extra: { code: c, link } });
+  if (!sent.ok) return { ok: false, error: sent.error };
+
+  pending.set(k, {
+    phone: to, code: c, cableEpisode: episode,
+    expiresAt: Date.now() + TTL_MS, attempts: 0, used: false,
+  });
+
+  log.info(`Verifiering skapad för ${sms.maskPhone(to)}, kabelns löpnummer #${episode}.`);
+  return { ok: true, token: k, phone: to, simulated: Boolean(sent.simulated) };
+}
+
+/** Kontrollerar en inskriven kod. */
+function check(token, input) {
+  sweep();
+  const v = pending.get(token);
+  if (!v) return { ok: false, error: 'Koden har gått ut. Begär en ny.' };
+  if (v.used) return { ok: false, error: 'Koden är redan använd.' };
+
+  v.attempts += 1;
+  if (v.attempts > MAX_ATTEMPTS) {
+    pending.delete(token);
+    return { ok: false, error: 'För många försök. Begär en ny kod.' };
+  }
+
+  if (String(input || '').trim() !== v.code) {
+    return { ok: false, error: `Fel kod. ${MAX_ATTEMPTS - v.attempts} försök kvar.` };
+  }
+
+  // Koden stämde — men nyckeln bränns inte här. Den ska lösas in när laddningen
+  // faktiskt startar, annars har vi inget kvar att starta med.
+  v.verified = true;
+  return { ok: true, phone: v.phone };
+}
+
+/** Löser in en verifiering — via kod eller via länken. */
+/**
+ * @param {boolean} needVerified
+ *   true  för startknappen: koden måste ha skrivits in rätt först
+ *   false för den magiska länken: att känna till nyckeln ÄR beviset
+ */
+function consume(token, needVerified = false) {
+  sweep();
+  const v = pending.get(token);
+  if (!v) return { ok: false, error: 'Länken har gått ut. Begär en ny kod.' };
+  if (v.used) return { ok: false, error: 'Länken är redan använd.' };
+  if (needVerified && !v.verified) return { ok: false, error: 'Koden är inte verifierad.' };
+
+  const nowEpisode = loop.getCableState().episode;
+  if (v.cableEpisode !== nowEpisode) {
+    pending.delete(token);
+    return {
+      ok: false,
+      error: 'Kabeln har kopplats ur sedan du begärde koden. Kontrollera att det är din bil som sitter i och begär en ny kod.',
+    };
+  }
+
+  v.used = true;
+  pending.delete(token);
+  return { ok: true, phone: v.phone };
+}
+
+function stats() {
+  sweep();
+  return { pending: pending.size };
+}
+
+return { begin, check, consume, stats, TTL_MS };
+
+})();
+
+/* ========================================================================== */
+/* 15  QR-koder                                                               */
+/* ========================================================================== */
+
+const qr = (function () {
+
+/**
+ * QR-kodare, byte-läge, felrättningsnivå M.
+ *
+ * Den gamla appen lät quickchart.io rita koden. Det innebar att ditt
+ * Swish-nummer och exakta belopp skickades till en främmande webbtjänst varje
+ * gång en gäst öppnade sitt kvitto — och att koden uteblev helt om tjänsten låg
+ * nere. Ingetdera är rimligt för något som ska fungera vid en stolpe i ett
+ * stugområde.
+ *
+ * Det här är tillräckligt av standarden för vårt behov: Swish-nyttolaster är
+ * korta, och version 1 till 10 räcker med god marginal.
+ */
+
+/* ---------------- Galois-fält för Reed-Solomon ---------------- */
+
+const EXP = new Uint8Array(512);
+const LOG = new Uint8Array(256);
+(function initTables() {
+  let x = 1;
+  for (let i = 0; i < 255; i++) {
+    EXP[i] = x;
+    LOG[x] = i;
+    x <<= 1;
+    if (x & 0x100) x ^= 0x11d;
+  }
+  for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+})();
+
+function gfMul(a, b) {
+  if (a === 0 || b === 0) return 0;
+  return EXP[LOG[a] + LOG[b]];
+}
+
+function rsGenerator(degree) {
+  let poly = [1];
+  for (let i = 0; i < degree; i++) {
+    const next = new Array(poly.length + 1).fill(0);
+    for (let j = 0; j < poly.length; j++) {
+      next[j] ^= gfMul(poly[j], 1);
+      next[j + 1] ^= gfMul(poly[j], EXP[i]);
+    }
+    poly = next;
+  }
+  return poly;
+}
+
+function rsEncode(data, ecLen) {
+  const gen = rsGenerator(ecLen);
+  const res = new Array(ecLen).fill(0);
+  for (const byte of data) {
+    const factor = byte ^ res[0];
+    res.shift();
+    res.push(0);
+    for (let i = 0; i < ecLen; i++) res[i] ^= gfMul(gen[i + 1], factor);
+  }
+  return res;
+}
+
+/* ---------------- versionstabeller, nivå M ---------------- */
+
+// [totala databytes, ecc-bytes per block, antal block grupp1, antal block grupp2]
+const VERSIONS_M = {
+  1:  [16,  10, 1, 0],
+  2:  [28,  16, 1, 0],
+  3:  [44,  26, 1, 0],
+  4:  [64,  18, 2, 0],
+  5:  [86,  24, 2, 0],
+  6:  [108, 16, 4, 0],
+  7:  [124, 18, 4, 0],
+  8:  [154, 22, 2, 2],
+  9:  [182, 22, 3, 2],
+  10: [216, 26, 4, 1],
+};
+
+const ALIGN_POS = {
+  1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
+  6: [6, 34], 7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50],
+};
+
+function pickVersion(byteLen) {
+  for (let v = 1; v <= 10; v++) {
+    const [cap] = VERSIONS_M[v];
+    const countBits = v < 10 ? 8 : 16;
+    const needed = Math.ceil((4 + countBits + byteLen * 8) / 8);
+    if (needed <= cap) return v;
+  }
+  return null;
+}
+
+/* ---------------- bitström ---------------- */
+
+function buildData(bytes, version) {
+  const [capacity] = VERSIONS_M[version];
+  const bits = [];
+  const push = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+
+  push(0b0100, 4);                                  // byte-läge
+  push(bytes.length, version < 10 ? 8 : 16);
+  for (const b of bytes) push(b, 8);
+
+  const capBits = capacity * 8;
+  for (let i = 0; i < 4 && bits.length < capBits; i++) bits.push(0);
+  while (bits.length % 8 !== 0) bits.push(0);
+
+  const data = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    data.push(parseInt(bits.slice(i, i + 8).join(''), 2));
+  }
+  const PAD = [0xec, 0x11];
+  let p = 0;
+  while (data.length < capacity) data.push(PAD[p++ % 2]);
+  return data;
+}
+
+function interleave(data, version) {
+  const [capacity, ecLen, g1, g2] = VERSIONS_M[version];
+  const blocks = g1 + g2;
+  const shortLen = Math.floor(capacity / blocks);
+
+  const dataBlocks = [];
+  const ecBlocks = [];
+  let offset = 0;
+  for (let i = 0; i < blocks; i++) {
+    const len = i < g1 ? shortLen : shortLen + 1;
+    const block = data.slice(offset, offset + len);
+    offset += len;
+    dataBlocks.push(block);
+    ecBlocks.push(rsEncode(block, ecLen));
+  }
+
+  const out = [];
+  const maxData = Math.max(...dataBlocks.map((b) => b.length));
+  for (let i = 0; i < maxData; i++) {
+    for (const b of dataBlocks) if (i < b.length) out.push(b[i]);
+  }
+  for (let i = 0; i < ecLen; i++) {
+    for (const b of ecBlocks) out.push(b[i]);
+  }
+  return out;
+}
+
+/* ---------------- matris ---------------- */
+
+function makeMatrix(version) {
+  const size = version * 4 + 17;
+  const m = Array.from({ length: size }, () => new Array(size).fill(null));
+  const reserved = Array.from({ length: size }, () => new Array(size).fill(false));
+
+  const setF = (r, c, v) => { m[r][c] = v; reserved[r][c] = true; };
+
+  // sökmönster i tre hörn
+  const finder = (r0, c0) => {
+    for (let r = -1; r <= 7; r++) {
+      for (let c = -1; c <= 7; c++) {
+        const rr = r0 + r; const cc = c0 + c;
+        if (rr < 0 || cc < 0 || rr >= size || cc >= size) continue;
+        const inner = r >= 0 && r <= 6 && c >= 0 && c <= 6;
+        const dark = inner && (r === 0 || r === 6 || c === 0 || c === 6 ||
+                     (r >= 2 && r <= 4 && c >= 2 && c <= 4));
+        setF(rr, cc, dark ? 1 : 0);
+      }
+    }
+  };
+  finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
+
+  // tidmönster
+  for (let i = 8; i < size - 8; i++) {
+    setF(6, i, i % 2 === 0 ? 1 : 0);
+    setF(i, 6, i % 2 === 0 ? 1 : 0);
+  }
+
+  // riktmönster
+  const pos = ALIGN_POS[version];
+  for (const r of pos) {
+    for (const c of pos) {
+      if ((r <= 8 && c <= 8) || (r <= 8 && c >= size - 9) || (r >= size - 9 && c <= 8)) continue;
+      for (let dr = -2; dr <= 2; dr++) {
+        for (let dc = -2; dc <= 2; dc++) {
+          const dark = Math.max(Math.abs(dr), Math.abs(dc)) !== 1;
+          setF(r + dr, c + dc, dark ? 1 : 0);
+        }
+      }
+    }
+  }
+
+  setF(size - 8, 8, 1);   // alltid mörk
+
+  // plats för formatinformation
+  for (let i = 0; i < 9; i++) {
+    if (m[8][i] === null) { m[8][i] = 0; reserved[8][i] = true; }
+    if (m[i][8] === null) { m[i][8] = 0; reserved[i][8] = true; }
+  }
+  for (let i = 0; i < 8; i++) {
+    if (m[8][size - 1 - i] === null) { m[8][size - 1 - i] = 0; reserved[8][size - 1 - i] = true; }
+    if (m[size - 1 - i][8] === null) { m[size - 1 - i][8] = 0; reserved[size - 1 - i][8] = true; }
+  }
+
+  return { m, reserved, size };
+}
+
+function placeData(m, reserved, size, bytes) {
+  const bits = [];
+  for (const b of bytes) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
+
+  let idx = 0; let up = true;
+  for (let col = size - 1; col > 0; col -= 2) {
+    if (col === 6) col--;              // hoppa över tidmönstrets kolumn
+    for (let i = 0; i < size; i++) {
+      const row = up ? size - 1 - i : i;
+      for (let k = 0; k < 2; k++) {
+        const c = col - k;
+        if (reserved[row][c]) continue;
+        m[row][c] = idx < bits.length ? bits[idx] : 0;
+        idx++;
+      }
+    }
+    up = !up;
+  }
+}
+
+function maskFn(n) {
+  return [
+    (r, c) => (r + c) % 2 === 0,
+    (r) => r % 2 === 0,
+    (r, c) => c % 3 === 0,
+    (r, c) => (r + c) % 3 === 0,
+    (r, c) => (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0,
+    (r, c) => ((r * c) % 2) + ((r * c) % 3) === 0,
+    (r, c) => (((r * c) % 2) + ((r * c) % 3)) % 2 === 0,
+    (r, c) => (((r + c) % 2) + ((r * c) % 3)) % 2 === 0,
+  ][n];
+}
+
+function penalty(m, size) {
+  let score = 0;
+
+  // regel 1: fem eller fler i rad
+  const run = (get) => {
+    for (let a = 0; a < size; a++) {
+      let last = -1; let len = 0;
+      for (let b = 0; b < size; b++) {
+        const v = get(a, b);
+        if (v === last) { len++; } else { if (len >= 5) score += len - 2; last = v; len = 1; }
+      }
+      if (len >= 5) score += len - 2;
+    }
+  };
+  run((r, c) => m[r][c]);
+  run((c, r) => m[r][c]);
+
+  // regel 2: 2x2-block
+  for (let r = 0; r < size - 1; r++) {
+    for (let c = 0; c < size - 1; c++) {
+      const v = m[r][c];
+      if (v === m[r][c + 1] && v === m[r + 1][c] && v === m[r + 1][c + 1]) score += 3;
+    }
+  }
+
+  // regel 3: mönster som liknar sökmönster
+  const PAT1 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+  const PAT2 = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+  const match = (arr, pat) => pat.every((v, i) => arr[i] === v);
+  for (let r = 0; r < size; r++) {
+    for (let c = 0; c <= size - 11; c++) {
+      const row = []; const col = [];
+      for (let i = 0; i < 11; i++) { row.push(m[r][c + i]); col.push(m[c + i][r]); }
+      if (match(row, PAT1) || match(row, PAT2)) score += 40;
+      if (match(col, PAT1) || match(col, PAT2)) score += 40;
+    }
+  }
+
+  // regel 4: obalans mellan mörkt och ljust
+  let dark = 0;
+  for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) if (m[r][c]) dark++;
+  const pct = (dark * 100) / (size * size);
+  score += Math.floor(Math.abs(pct - 50) / 5) * 10;
+
+  return score;
+}
+
+const FORMAT_M = [
+  0x5412, 0x5125, 0x5e7c, 0x5b4b, 0x45f9, 0x40ce, 0x4f97, 0x4aa0,
+];
+
+function placeFormat(m, size, mask) {
+  const bits = FORMAT_M[mask];
+  const get = (i) => (bits >> i) & 1;
+
+  for (let i = 0; i <= 5; i++) m[8][i] = get(14 - i);
+  m[8][7] = get(8); m[8][8] = get(7); m[7][8] = get(6);
+  for (let i = 9; i <= 14; i++) m[14 - i][8] = get(14 - i);
+
+  for (let i = 0; i <= 7; i++) m[size - 1 - i][8] = get(i);
+  for (let i = 8; i <= 14; i++) m[8][size - 15 + i] = get(i);
+
+  m[size - 8][8] = 1;
+}
+
+/* ---------------- publikt ---------------- */
+
+/** @returns {{matrix:number[][], size:number, version:number}} */
+function encode(text) {
+  const bytes = Array.from(Buffer.from(String(text), 'utf8'));
+  const version = pickVersion(bytes.length);
+  if (!version) throw new Error('Texten är för lång för en QR-kod av den här storleken.');
+
+  const data = buildData(bytes, version);
+  const full = interleave(data, version);
+
+  const { m, reserved, size } = makeMatrix(version);
+  placeData(m, reserved, size, full);
+
+  // välj den mask som ger lägst straffpoäng
+  let best = null; let bestScore = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    const cand = m.map((row) => row.slice());
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (!reserved[r][c] && maskFn(mask)(r, c)) cand[r][c] ^= 1;
+      }
+    }
+    placeFormat(cand, size, mask);
+    const sc = penalty(cand, size);
+    if (sc < bestScore) { bestScore = sc; best = cand; }
+  }
+
+  return { matrix: best, size, version };
+}
+
+/** QR-koden som fristående SVG, redo att bäddas in i en sida. */
+function svg(text, { scale = 8, margin = 4, dark = '#0a140f', light = '#ffffff' } = {}) {
+  const { matrix, size } = encode(text);
+  const dim = (size + margin * 2) * scale;
+
+  let path = '';
+  for (let r = 0; r < size; r++) {
+    for (let c = 0; c < size; c++) {
+      if (matrix[r][c]) {
+        path += `M${(c + margin) * scale} ${(r + margin) * scale}h${scale}v${scale}h-${scale}z`;
+      }
+    }
+  }
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${dim} ${dim}" width="${dim}" height="${dim}" shape-rendering="crispEdges" role="img" aria-label="QR-kod för Swish-betalning">`
+    + `<rect width="${dim}" height="${dim}" fill="${light}"/>`
+    + `<path d="${path}" fill="${dark}"/></svg>`;
+}
+
+return { encode, svg };
+
+})();
+/* ========================================================================== */
+/* 16  Swish                                                                  */
+/* ========================================================================== */
+
+const swish = (function () {
+
+/**
+ * Swish-länk och QR-kod.
+ *
+ * Inga pengar passerar appen — den visar bara ett belopp och en väg att betala.
+ * Formatet är hämtat rakt från din nuvarande app, som bevisligen fungerar i
+ * skarp drift. Det finns ingen anledning att experimentera här.
+ *
+ * Djuplänken öppnar Swish-appen på samma telefon. QR-koden finns för när kvittot
+ * öppnas på något annat än telefonen som ska betala — eller när knappen av någon
+ * anledning inte biter, vilket den inte gör om Swish saknas på enheten.
+ */
+
+function payee(number) {
+  let clean = String(number || '').replace(/[\s-]/g, '');
+  if (clean.startsWith('+46')) clean = '0' + clean.slice(3);
+  return clean;
+}
+
+function deepLink({ number, amountSek, message }) {
+  const payload = {
+    version: 1,
+    payee: { value: payee(number), editable: false },
+    amount: { value: Number(Number(amountSek).toFixed(2)), editable: false },
+    message: { value: String(message).slice(0, 50), editable: false },
+  };
+  return `swish://payment?data=${encodeURIComponent(JSON.stringify(payload))}`;
+}
+
+/** Strängformatet Swish-appens egen skanner förstår. */
+function qrPayload({ number, amountSek, message }) {
+  const amount = Number(amountSek).toFixed(2);
+  const msg = String(message).slice(0, 50).replace(/[;\n]/g, ' ');
+  return `C${payee(number)};${amount};${msg};0`;
+}
+
+function qrSvg(data, opts) {
+  return qr.svg(qrPayload(data), opts);
+}
+
+return { payee, deepLink, qrPayload, qrSvg };
+
+})();
+
+/* ========================================================================== */
+/* 17  Kvittosidan                                                            */
+/* ========================================================================== */
+
+const receiptPage = (function () {
+
+function esc(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function kr(n) { return Number(n || 0).toFixed(2).replace('.', ','); }
+function kwh(n) { return Number(n || 0).toFixed(2).replace('.', ','); }
+
+function when(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleString('sv-SE', {
+    timeZone: 'Europe/Stockholm',
+    weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function duration(a, b) {
+  if (!a || !b) return '';
+  const min = Math.round((Date.parse(b) - Date.parse(a)) / 60000);
+  const h = Math.floor(min / 60);
+  return h > 0 ? `${h} tim ${min % 60} min` : `${min} min`;
+}
+
+/**
+ * Kvittot som en egen sida.
+ *
+ * Den här öppnas ofta timmar efter laddningen, från ett SMS, av någon som
+ * kanske inte minns exakt vad den gäller. Därför står tid och plats överst och
+ * beloppet stort — och därför finns Swish-koden kvar även om knappen inte
+ * fungerar. En `swish://`-länk gör ingenting alls på en dator eller i en mobil
+ * utan Swish, och misslyckas dessutom tyst.
+ */
+function render(session, swishData, place) {
+  const paid = session.payment === 'CONFIRMED';
+  const claimed = session.payment === 'GUEST_CLAIMS_PAID';
+
+  return `<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#0a140f">
+<title>Kvitto — ${esc(place)}</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{min-height:100dvh;background:#0a140f;
+ background-image:radial-gradient(130% 60% at 50% 0%,#12241b 0%,#0a140f 66%);
+ color:#EDF3EF;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+ display:flex;align-items:flex-start;justify-content:center;padding:22px 16px 40px}
+.wrap{width:100%;max-width:420px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.place{font-size:15px;font-weight:600;color:#F3D082}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;
+ padding:4px 11px;border-radius:100px;border:1px solid}
+.p-paid{color:#8FE0B4;border-color:rgba(143,224,180,.45);background:rgba(143,224,180,.1)}
+.p-claim{color:#E6C069;border-color:rgba(230,192,105,.45);background:rgba(230,192,105,.1)}
+.p-open{color:#F0A79E;border-color:rgba(240,167,158,.45);background:rgba(240,167,158,.1)}
+.card{background:rgba(18,36,27,.72);border:1px solid rgba(226,177,68,.22);
+ border-radius:18px;padding:26px 22px 24px;backdrop-filter:blur(10px);
+ box-shadow:0 20px 50px rgba(0,0,0,.4)}
+h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02em}
+.sub{font-size:15px;color:#BFD2C6;margin:0 0 22px;line-height:1.45}
+.r{display:flex;justify-content:space-between;gap:12px;padding:9px 0;font-size:16px;
+ color:#C4D6C9;font-variant-numeric:tabular-nums;border-bottom:1px solid rgba(226,177,68,.1)}
+.r.total{border-bottom:0;border-top:1px solid rgba(226,177,68,.28);margin-top:8px;
+ padding-top:15px;font-size:23px;font-weight:700;color:#F3D082}
+.qrbox{margin:22px 0 6px;text-align:center}
+.qr{width:190px;height:190px;margin:0 auto;background:#fff;border-radius:12px;padding:9px}
+.qr svg{width:100%;height:100%;display:block}
+.qrcap{font-size:13px;color:#95AC9E;margin-top:10px;line-height:1.5}
+.btn{display:block;width:100%;text-align:center;font:inherit;font-size:19px;font-weight:600;
+ padding:18px 16px;border-radius:14px;border:0;background:#E2B144;color:#14231A;
+ cursor:pointer;text-decoration:none;margin-top:16px}
+.btn.ghost{background:transparent;color:#E6EFE9;border:1.5px solid rgba(230,239,233,.35)}
+.btn[disabled]{opacity:.5}
+.manual{margin-top:20px;padding-top:18px;border-top:1px solid rgba(226,177,68,.14);
+ font-size:14.5px;color:#AFC5B6;line-height:1.6}
+.manual b{color:#EDF3EF;font-variant-numeric:tabular-nums}
+.note{margin-top:18px;font-size:13px;color:rgba(232,240,234,.45);line-height:1.6;text-align:center}
+.msg{margin-top:14px;padding:12px 14px;border-radius:11px;font-size:14.5px;line-height:1.5;
+ background:rgba(226,177,68,.1);border:1px solid rgba(226,177,68,.35);color:#EBCE93}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <span class="place">${esc(place)}</span>
+    <span class="pill ${paid ? 'p-paid' : claimed ? 'p-claim' : 'p-open'}">
+      ${paid ? 'Betald' : claimed ? 'Du har markerat betald' : 'Obetald'}
+    </span>
+  </div>
+
+  <div class="card">
+    <h1>Kvitto</h1>
+    <p class="sub">Laddning ${esc(when(session.startedAt))}${
+      session.endedAt ? `,<br>pågick i ${esc(duration(session.startedAt, session.endedAt))}` : ''
+    }.</p>
+
+    <div class="r"><span>Laddat</span><span>${kwh(session.energyKwh)} kWh</span></div>
+    <div class="r"><span>Elkostnad</span><span>${kr(session.costEnergySek)} kr</span></div>
+    <div class="r"><span>Avgift laddstolpe</span><span>${kr(session.costServiceSek)} kr</span></div>
+    <div class="r total"><span>Att betala</span><span>${kr(session.costSek)} kr</span></div>
+
+    ${session.usedEstimatedPrice
+      ? '<div class="msg">Delar av laddningen prissattes mot senast kända elpris eftersom elbörsen inte svarade.</div>'
+      : ''}
+
+    ${paid ? '' : swishData ? `
+    <div class="qrbox">
+      <div class="qr">${swishData.svg}</div>
+      <p class="qrcap">Skanna med Swish-appen,<br>eller tryck på knappen nedan.</p>
+    </div>
+
+    <a class="btn" href="${esc(swishData.link)}">Öppna Swish och betala</a>
+    <button class="btn ghost" id="paidBtn">Jag har betalat</button>
+
+    <div class="manual">
+      Fungerar inget av ovanstående — swisha för hand:<br>
+      Nummer <b>${esc(swishData.number)}</b><br>
+      Belopp <b>${kr(swishData.amountSek)} kr</b><br>
+      Meddelande <b>${esc(swishData.message)}</b>
+    </div>` : `
+    <div class="msg">Inget Swish-nummer är inlagt i appen än.</div>`}
+
+    ${paid ? '<p class="note">Tack, betalningen är bekräftad.</p>' : ''}
+  </div>
+
+  <p class="note">Sidan finns kvar — spara SMS:et så hittar du hit igen.</p>
+</div>
+
+<script>
+(function () {
+  var b = document.getElementById('paidBtn');
+  if (!b) return;
+  b.addEventListener('click', function () {
+    b.disabled = true; b.textContent = 'Tack!';
+    fetch(location.pathname + '/betald', { method: 'POST' })
+      .then(function () { setTimeout(function () { location.reload(); }, 900); })
+      .catch(function () { b.disabled = false; b.textContent = 'Jag har betalat'; });
+  });
+})();
+</script>
+</body>
+</html>`;
+}
+
+return { render };
+
+})();
+
+/* ========================================================================== */
 /* 12  Rutter och uppstart                                                  */
 /* ========================================================================== */
 
@@ -3204,6 +4345,7 @@ return { render };
  * dörr att dyrka upp.
  */
 
+const crypto = require('node:crypto');
 const http = require('node:http');
 const https = require('node:https');
 const os = require('node:os');
@@ -3212,7 +4354,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.4.3';
+const VERSION = '0.5.0';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -3381,6 +4523,76 @@ async function lockPole() {
   return sendCommand('stäng av laddaren', () => charger.setEnabled(false), null);
 }
 
+/** Swish-uppgifterna för en session, eller null om inget nummer är satt. */
+function swishFor(session) {
+  const number = (config.ha().swish_number || '').trim();
+  if (!number || !session || !session.costSek) return null;
+  const data = {
+    number,
+    amountSek: Number(session.costSek),
+    message: `Laddning ${config.ha().location_name} ${session.number}`,
+  };
+  return {
+    number: swish.payee(number),
+    name: (config.ha().swish_name || '').trim() || null,
+    amountSek: data.amountSek,
+    message: data.message,
+    link: swish.deepLink(data),
+    svg: swish.qrSvg(data, { scale: 6, margin: 3 }),
+  };
+}
+
+/** Liten besked-sida för länkar som öppnas direkt ur ett SMS. */
+function magicPage(title, body, ok) {
+  const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<!doctype html>
+<html lang="sv"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+${ok ? '<meta http-equiv="refresh" content="1; url=/">' : ''}
+<title>${esc(title)}</title>
+<style>
+body{margin:0;min-height:100dvh;display:flex;align-items:center;justify-content:center;
+ background:#0a140f;background-image:radial-gradient(130% 60% at 50% 0%,#12241b 0%,#0a140f 66%);
+ color:#EDF3EF;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px}
+.c{max-width:400px;text-align:center;background:rgba(18,36,27,.72);
+ border:1px solid rgba(226,177,68,.22);border-radius:18px;padding:32px 24px}
+h1{font-size:23px;font-weight:600;margin:0 0 12px;color:${ok ? '#F3D082' : '#F0A79E'}}
+p{font-size:16px;line-height:1.5;color:#BFD2C6;margin:0 0 20px}
+a{display:block;padding:16px;border-radius:14px;background:#E2B144;color:#14231A;
+ font-size:18px;font-weight:600;text-decoration:none}
+</style></head><body><div class="c">
+<h1>${esc(title)}</h1><p>${esc(body)}</p>
+<a href="/">Till laddstolpen</a>
+</div></body></html>`;
+}
+
+/** Bygger den publika adressen gästen kan nå kvittot på. */
+function publicBaseUrl() {
+  const host = (config.ha().public_host || '').trim();
+  if (!host) return null;
+  return host.replace(/\/+$/, '');
+}
+
+/**
+ * Kvitto-SMS.
+ *
+ * Kort med flit. Ett SMS kostar per del, inte per meddelande, och kvittot är
+ * den mall som skickas oftast — varje avslutad laddning. Ligger den strax under
+ * 160 tecken blir det en del i stället för två, och kostnaden halveras.
+ */
+async function sendReceiptSms(session) {
+  const base = publicBaseUrl();
+  const plats = config.ha().location_name;
+  const belopp = Number(session.costSek).toFixed(2).replace('.', ',');
+  const kwh = Number(session.energyKwh).toFixed(2).replace('.', ',');
+
+  let text = `${plats}: ${kwh} kWh, ${belopp} kr.`;
+  if (base) text += `\nKvitto och betalning:\n${base}/k/${session.receiptKey}`;
+
+  return sms.send({ to: session.phone, text, kind: 'kvitto' });
+}
+
 /**
  * Kabellåset.
  *
@@ -3452,6 +4664,7 @@ guest.get('/api/status', (req, res) => {
     // jämnt i stället för att hoppa var tionde sekund. Det som visas mellan två
     // avläsningar är en uppskattning; det som debiteras är alltid de riktiga
     // mätvärdena.
+    requireVerification: config.settings().requireVerification,
     starting: startState.running,
     startError: !active && startState.error ? startState.error : null,
     readAt: snap.readAt,
@@ -3459,6 +4672,56 @@ guest.get('/api/status', (req, res) => {
     simulated: Boolean(snap.simulated),
     locationName: config.ha().location_name,
   });
+});
+
+/**
+ * Steg 1: gästen skriver sitt nummer och får en kod.
+ *
+ * Här bränns pengar om något går fel, så taken i SMS-modulen är det som
+ * skyddar. De gäller i alla lägen, även simulerat — ett tak som bara finns i
+ * skarpt läge är ett tak ingen provat.
+ */
+guest.post('/api/verify/send', async (req, res, ctx) => {
+  loop.noteGuestPoll();
+
+  if (sessions.getActive()) {
+    return sendJson(res, 409, { error: 'Stolpen används just nu.' });
+  }
+
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+
+  const state = await charger.readState();
+  if (!state.ok) return sendJson(res, 503, { error: 'Ingen kontakt med laddstolpen just nu.' });
+  if (!state.cableConnected) return sendJson(res, 409, { error: 'Ingen kabel är ansluten till stolpen.' });
+
+  const base = publicBaseUrl() || `https://${req.headers.host || 'localhost'}`;
+  const out = await verify.begin({ phone: parsed.body.phone, ip: ctx.ip, baseUrl: base });
+  if (!out.ok) return sendJson(res, 429, { error: out.error });
+
+  return sendJson(res, 200, {
+    ok: true,
+    token: out.token,
+    phone: out.phone,
+    simulated: out.simulated,
+    ttlSeconds: Math.round(verify.TTL_MS / 1000),
+  });
+});
+
+/** Steg 2: gästen skriver koden. */
+guest.post('/api/verify/check', async (req, res, ctx) => {
+  loop.noteGuestPoll();
+
+  const rl = limiter.hit(`verify:${ctx.ip}`, 20, 60 * 60 * 1000);
+  if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök. Vänta en stund.' });
+
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+
+  const out = verify.check(parsed.body.token, parsed.body.code);
+  if (!out.ok) return sendJson(res, 400, { error: out.error });
+
+  return sendJson(res, 200, { ok: true, phone: out.phone });
 });
 
 guest.post('/api/start', async (req, res, ctx) => {
@@ -3486,8 +4749,19 @@ guest.post('/api/start', async (req, res, ctx) => {
     const parsed = await readJsonBody(req);
     if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
 
-    const phone = normalizePhone(parsed.body.phone);
-    if (!phone) return sendJson(res, 400, { error: 'Kontrollera mobilnumret. Skriv det som 070 123 45 67.' });
+    // Numret måste vara verifierat. Utan det är det bara ett textfält, och då
+    // är spårbarheten — ett av två skäl att bygga appen — borta.
+    let phone;
+    if (parsed.body.token) {
+      const v = verify.consume(parsed.body.token, true);
+      if (!v.ok) return sendJson(res, 400, { error: v.error });
+      phone = v.phone;
+    } else if (!config.settings().requireVerification) {
+      phone = normalizePhone(parsed.body.phone);
+      if (!phone) return sendJson(res, 400, { error: 'Kontrollera mobilnumret. Skriv det som 070 123 45 67.' });
+    } else {
+      return sendJson(res, 400, { error: 'Mobilnumret måste verifieras först.' });
+    }
 
     // Servern läser laddboxen på nytt. Vi litar aldrig på vad webbläsaren visade
     // — den kan ha stått öppen i en timme.
@@ -3568,12 +4842,97 @@ guest.post('/api/stop', async (req, res, ctx) => {
   return sendJson(res, 200, { ok: true, session: sessions.publicView(done) });
 });
 
+/**
+ * Den magiska länken från SMS:et. Ett tryck och laddningen är igång.
+ *
+ * Den svarar med en liten sida i stället för JSON, eftersom den öppnas direkt i
+ * mobilens webbläsare. Sidan skickar vidare till startsidan, som då redan har
+ * en laddning på gång.
+ */
+guest.get('/s/:key', async (req, res, ctx) => {
+  loop.noteGuestPoll();
+
+  const say = (title, body, ok) => sendHtml(res, ok ? 200 : 409, magicPage(title, body, ok));
+
+  if (sessions.getActive()) {
+    return say('Stolpen används just nu', 'Någon annan har hunnit före. Försök igen när den blir ledig.', false);
+  }
+
+  const v = verify.consume(ctx.params.key);
+  if (!v.ok) return say('Länken fungerar inte', v.error, false);
+
+  const state = await charger.readState();
+  if (!state.ok) return say('Ingen kontakt med laddstolpen', 'Försök igen om en stund.', false);
+  if (!state.cableConnected) return say('Ingen kabel ansluten', 'Sätt i kabeln och begär en ny kod.', false);
+
+  const started = sessions.start({
+    phone: v.phone,
+    cableEpisode: loop.getCableState().episode,
+    startEnergyKwh: state.sessionEnergyKwh,
+    simulated: Boolean(state.simulated),
+  });
+  if (!started.ok) return say('Kunde inte starta', started.error, false);
+
+  log.info(`Session #${started.session.number} startad via länk från ${ctx.ip}.`);
+  startState = { running: true, error: null, since: Date.now() };
+  (async () => {
+    try {
+      const cmd = await startChargingSequence();
+      if (!cmd.ok) {
+        startState.error = cmd.error || 'Laddningen kunde inte startas.';
+        sessions.finish('start misslyckades');
+        return;
+      }
+      await applyCableLock(true);
+      await loop.tick();
+    } catch (err) {
+      startState.error = 'Något gick fel när laddningen skulle startas.';
+      sessions.finish('start misslyckades');
+    } finally {
+      startState.running = false;
+    }
+  })();
+
+  return say('Laddningen startar', 'Du skickas vidare…', true);
+});
+
+/**
+ * Kvittosidan.
+ *
+ * Egen adress, ingen utgångstid, helt frikopplad från stolpens nuvarande
+ * tillstånd — grannen som öppnar sitt kvitto på eftermiddagen ska se sin egen
+ * laddning, inte "upptagen" för att någon annan laddar just då.
+ *
+ * Svarar med JSON om webbläsaren ber om det (gästsidan hämtar kvittot så), och
+ * annars med en sida man kan öppna direkt från SMS:et.
+ */
 guest.get('/k/:key', (req, res, ctx) => {
-  // Kvittosidan. Egen adress, ingen utgångstid, frikopplad från stolpens
-  // nuvarande tillstånd — grannen ska se sitt kvitto även om någon annan laddar.
+  const s = sessions.byReceiptKey(ctx.params.key);
+  const wantsJson = String(req.headers.accept || '').includes('application/json');
+
+  if (!s) {
+    if (wantsJson) return sendJson(res, 404, { error: 'Kvittot hittades inte.' });
+    return sendHtml(res, 404, magicPage('Kvittot hittades inte',
+      'Kontrollera länken i SMS:et.', false));
+  }
+
+  if (wantsJson) {
+    return sendJson(res, 200, { session: sessions.publicView(s), swish: swishFor(s) });
+  }
+  return sendHtml(res, 200, receiptPage.render(sessions.publicView(s), swishFor(s), config.ha().location_name));
+});
+
+guest.post('/k/:key/betald', async (req, res, ctx) => {
   const s = sessions.byReceiptKey(ctx.params.key);
   if (!s) return sendJson(res, 404, { error: 'Kvittot hittades inte.' });
-  return sendJson(res, 200, { session: sessions.publicView(s) });
+
+  const rl = limiter.hit(`paid:${ctx.ip}`, 20, 3600 * 1000);
+  if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök.' });
+
+  // Gästen SÄGER att den betalat. Det är ett eget tillstånd, skilt från att du
+  // bekräftat det i Swish — appen ska inte låtsas veta något den inte vet.
+  sessions.setPayment(s.id, 'GUEST_CLAIMS_PAID');
+  return sendJson(res, 200, { ok: true });
 });
 
 /* ------------------------------------------------------------------ */
@@ -3605,6 +4964,11 @@ admin.get('/api/admin/state', (req, res) => {
     snapshot: snap,
     mode: config.ha().mode,
     cadence: loop.cadence(),
+    sms: sms.status(),
+    smsLog: sms.recent(30),
+    verify: verify.stats(),
+    swishConfigured: Boolean((config.ha().swish_number || '').trim()),
+    publicHost: publicBaseUrl(),
     easee: charger.stats ? charger.stats() : null,
     opModeText: OP_MODE[snap.opMode] || 'okänt',
     noCurrentText: (snap.reasonForNoCurrent === null || snap.reasonForNoCurrent === undefined)
@@ -3772,6 +5136,7 @@ async function main() {
 
   sessions.load();
   prices.loadCache();
+  sms.loadCounters();
 
   charger = chargerFactory.create(ha.mode, {
     username: ha.easee_username,
