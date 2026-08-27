@@ -2613,6 +2613,16 @@ button.btn + button.btn{margin-top:10px}
   // laddboxen, och forut fick bada samma skarm och samma text.
   var netFail = false;
 
+  // Verifieringen pagar: token och nummer mellan "skicka kod" och "skriv kod".
+  //
+  // De har SAKNADE deklaration i 0.5.0. En tilldelning skapade dem som globala
+  // i efterhand, men render() LASER verifyToken varje varv sa fort kabeln sitter
+  // i — och en lasning fore forsta tilldelningen kastar ReferenceError. Sidan
+  // kraschade alltsa vid varje avlasning med kabeln i, och den gamla breda
+  // felhanteringen ritade om det till "Ingen kontakt med laddstolpen".
+  var verifyToken = null;
+  var verifyPhone = null;
+
   // Telefonen minns vilken laddning som är dess egen, så att kvittot kan visas
   // när sessionen tagit slut — och hittas igen senare om den är obetald.
   // Sparat lokalt i webblasaren; ingenting skickas nagonstans.
@@ -2684,6 +2694,17 @@ button.btn + button.btn{margin-top:10px}
       + '. Vi försöker igen automatiskt.</div>';
   }
 
+  /**
+   * Fanns bara i adminfliken förut. Gästsidan hade escTel men ingen allmän
+   * variant, och staleBlock anropade en esc som inte existerade här — vilket
+   * är precis vad som gick sönder i 0.5.1.
+   */
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
   function netFailScreen() {
     el.live.className = 'live off';
     el.liveText.textContent = 'Ingen anslutning';
@@ -2692,6 +2713,60 @@ button.btn + button.btn{margin-top:10px}
     el.lead.textContent = 'Det ser ut som att mobilen tappat nätet. Laddningen påverkas inte — den fortsätter som den ska. Sidan hittar tillbaka av sig själv.';
     el.slot.innerHTML = '';
     el.foot.innerHTML = '';
+  }
+
+  /**
+   * Går det fel när sidan ritas upp ska det synas som just det.
+   *
+   * I 0.5.1 låg ritningen inne i samma löfteskedja som hämtningen, så ett
+   * programfel i vår egen kod hamnade i nätverkets felhantering och visades som
+   * "Telefonen når inte appen". Då letar man efter fel på mobiltäckningen medan
+   * felet sitter i appen. En felhanterare får aldrig ljuga om vad som gick fel.
+   */
+  function crashScreen(err) {
+    try {
+      el.live.className = 'live off';
+      el.liveText.textContent = 'Fel i appen';
+      el.icon.innerHTML = ICONS.warn; el.icon.style.display = '';
+      el.title.textContent = 'Något gick fel i appen';
+      el.lead.textContent = 'Sidan kunde inte ritas upp. Ladda om sidan. Pågår en laddning fortsätter den — den styrs inte härifrån.';
+      el.slot.innerHTML = '<p style="text-align:center;font-size:13px;color:#93A39B;margin:0;word-break:break-word">'
+        + esc(String(err && err.message ? err.message : err)) + '</p>';
+      el.foot.innerHTML = '';
+    } catch (_) { /* då är det illa nog ändå */ }
+  }
+
+  /** Ritar, och låter ett ritfel bli ett ritfel — inte ett nätverksfel. */
+  function safeRender() {
+    try {
+      render();
+    } catch (err) {
+      if (window.console && console.error) console.error('Fel vid ritning av gästsidan:', err);
+      reportClientError(err);
+      crashScreen(err);
+    }
+  }
+
+  /**
+   * Skickar felet till tillägget så att det hamnar i din logg.
+   *
+   * Du kommer aldrig att öppna webbläsarens konsol på en gästs telefon. Utan
+   * det här är ett fel i sidan osynligt för dig — appen "fungerar bara inte".
+   */
+  var lastReport = 0;
+  function reportClientError(err) {
+    if (Date.now() - lastReport < 60000) return;   // högst ett per minut
+    lastReport = Date.now();
+    try {
+      fetch('api/clienterror', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: String(err && err.message ? err.message : err).slice(0, 300),
+          stack: String((err && err.stack) || '').slice(0, 600)
+        })
+      }).catch(function () { /* det får inte bli fel av att rapportera fel */ });
+    } catch (_) { /* likaså */ }
   }
 
   function render() {
@@ -2877,36 +2952,57 @@ button.btn + button.btn{margin-top:10px}
   function setNotice(kind, text) {
     notice = text ? { kind: kind, text: text } : null;
     lastKey = '';
-    render();
+    safeRender();
   }
 
+  /**
+   * Tre fel som är tre olika saker, och hålls isär:
+   *
+   *   hämtningen  -> telefonen når inte appen
+   *   avläsningen -> appen når inte laddboxen  (kommer via contact i svaret)
+   *   ritningen   -> fel i appen
+   *
+   * Rejektionshanteraren ligger som ANDRA argument till .then, inte som ett
+   * .catch efteråt. Skillnaden är hela poängen: ett .catch sist i kedjan
+   * fångar även det som kastas i framgångsgrenen, och då blir varje programfel
+   * rapporterat som ett nätverksfel.
+   */
   function poll() {
     fetch('api/status', { cache: 'no-store' })
       .then(function (r) {
-        if (!r.ok) throw new Error('status ' + r.status);
+        if (!r.ok) throw new Error('Servern svarade ' + r.status);
         return r.json();
       })
-      .then(function (data) {
-        netFail = false;
-        state = data;
-        if (data.startError) notice = { kind: 'err', text: data.startError };
-        receivedAt = Date.now();
-        // Hur gammal var avläsningen redan när servern svarade?
-        lagMs = (data.readAt && data.serverTime)
-          ? Math.max(0, Date.parse(data.serverTime) - Date.parse(data.readAt))
-          : 0;
-        if (data.session) { receipt = null; render(); tickSmooth(); return; }
-        // Kvittouppslaget har egen felhantering. Forut lag det i samma kedja,
-        // sa en miss dar visade "ingen kontakt med laddstolpen" trots att
-        // statusanropet gatt bra.
-        return checkReceipt()
-          .catch(function () { receipt = null; })
-          .then(render);
-      })
-      .catch(function () {
-        netFail = true;
-        render();
-      });
+      .then(onStatus, onFetchFail);
+  }
+
+  function onFetchFail() {
+    netFail = true;
+    safeRender();
+  }
+
+  function onStatus(data) {
+    try {
+      netFail = false;
+      state = data;
+      if (data.startError) notice = { kind: 'err', text: data.startError };
+      receivedAt = Date.now();
+      // Hur gammal var avläsningen redan när servern svarade?
+      lagMs = (data.readAt && data.serverTime)
+        ? Math.max(0, Date.parse(data.serverTime) - Date.parse(data.readAt))
+        : 0;
+
+      if (data.session) { receipt = null; safeRender(); tickSmooth(); return; }
+
+      // Kvittouppslaget har egen felhantering. Förut låg det i samma kedja, så
+      // en miss där visade "ingen kontakt med laddstolpen" trots att
+      // statusanropet gått bra.
+      checkReceipt().then(safeRender, function () { receipt = null; safeRender(); });
+    } catch (err) {
+      if (window.console && console.error) console.error('Fel vid hantering av status:', err);
+      reportClientError(err);
+      crashScreen(err);
+    }
   }
 
   /**
@@ -2922,7 +3018,14 @@ button.btn + button.btn{margin-top:10px}
     var saved = recall();
     if (!saved || !saved.key) { receipt = null; return Promise.resolve(); }
 
-    return fetch('k/' + encodeURIComponent(saved.key), { cache: 'no-store' })
+    // Accept-huvudet ar inte valfritt har. Adressen svarar med JSON bara om man
+    // ber om det, annars med kvittosidan i HTML — och da kastar r.json().
+    // Utan det har visades kvittot aldrig av sig sjalvt, och i 0.5.0 hamnade
+    // felet dessutom i natverkets felhantering: "Ingen kontakt med laddstolpen".
+    return fetch('k/' + encodeURIComponent(saved.key), {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' }
+    })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (data) {
         if (!data || !data.session) { forget(); receipt = null; return; }
@@ -2982,7 +3085,7 @@ button.btn + button.btn{margin-top:10px}
 
   /** Steg 1: be servern skicka en kod. */
   function doSendCode(phone) {
-    busyAction = 'code'; setNotice(null, null); lastKey = ''; render();
+    busyAction = 'code'; setNotice(null, null); lastKey = ''; safeRender();
     fetch('api/verify/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3007,7 +3110,7 @@ button.btn + button.btn{margin-top:10px}
     var code = input ? input.value.trim() : '';
     if (code.length !== 4) { setNotice('err', 'Skriv de fyra siffrorna från SMS:et.'); return; }
 
-    busyAction = 'start'; setNotice(null, null); lastKey = ''; render();
+    busyAction = 'start'; setNotice(null, null); lastKey = ''; safeRender();
     fetch('api/verify/check', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4694,7 +4797,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.5.1';
+const VERSION = '0.5.2';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -4988,6 +5091,33 @@ guest.get('/healthz', (req, res) => {
 
 guest.get('/', (req, res) => {
   sendHtml(res, 200, guestPage.render({ locationName: config.ha().location_name }));
+});
+
+/**
+ * Gästsidan rapporterar sina egna programfel hit.
+ *
+ * Utan detta är ett fel i sidan osynligt för dig: gästen ser något konstigt,
+ * du ser en logg där allt ser bra ut. Ingen kommer att öppna webbläsarens
+ * konsol på en annans telefon.
+ *
+ * Endpointen tar emot text från internet, så: hårt tak per avsändare, hårt
+ * längdtak, och den skriver bara till loggen. Ingenting sparas på disk.
+ */
+guest.post('/api/clienterror', async (req, res, ctx) => {
+  const rl = limiter.hit(`clienterr:${ctx.ip}`, 5, 60 * 60 * 1000);
+  if (!rl.allowed) return sendJson(res, 429, { ok: false });
+
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { ok: false });
+
+  const clean = (v, max) => String(v == null ? '' : v).replace(/[\r\n\t]+/g, ' ').slice(0, max);
+  const msg = clean(parsed.body.message, 300);
+  const stack = clean(parsed.body.stack, 600);
+  if (!msg) return sendJson(res, 400, { ok: false });
+
+  log.warn(`[Gästsidan] Fel i webbläsaren hos ${ctx.ip}: ${msg}`);
+  if (stack) log.debug(`[Gästsidan] ${stack}`);
+  return sendJson(res, 200, { ok: true });
 });
 
 guest.get('/api/status', (req, res) => {
