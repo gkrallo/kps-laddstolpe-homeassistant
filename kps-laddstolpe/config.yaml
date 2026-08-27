@@ -1,5 +1,5 @@
 name: KPs Laddstolpe
-version: "0.3.0"
+version: "0.3.1"
 slug: kps_laddstolpe
 description: Laddstolpe med spotprisdebitering. Fas 3 - skarp Easee, avlasning.
 url: https://github.com/gkrallo/kps-laddstolpe-homeassistant
