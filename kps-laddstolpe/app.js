@@ -191,7 +191,11 @@ const HA_DEFAULTS = {
   keyfile: 'privkey.pem',
   location_name: 'Laddstolpen',
   price_zone: 'SE3',
-  simulation: true,
+  mode: 'simulering',        // simulering | avlasning | skarp
+  easee_username: '',
+  easee_password: '',
+  easee_charger_id: '',
+  easee_equalizer_id: '',
   log_level: 'info',
 };
 
@@ -856,15 +860,310 @@ class SimulatedCharger {
 /* Easee, fas 3                                                        */
 /* ------------------------------------------------------------------ */
 
+const EASEE = 'https://api.easee.cloud/api';
+const TOKEN_FILE = 'easee-token.json';
+
+/**
+ * Easee Cloud.
+ *
+ * Den gamla molnappen loggade in på nytt i varje varv av bakgrundsloopen —
+ * 2 880 inloggningar per laddningsdygn. Det är exakt det anropsmönster som får
+ * Easee att blockera en IP-adress, och en blockerad IP betyder att stolpen
+ * slutar svara helt. Fyra regler följer av det:
+ *
+ *  1. EN TOKEN. Hämtas en gång och förnyas med refresh_token innan den går ut,
+ *     aldrig genom att posta lösenordet igen. Token sparas på disk och överlever
+ *     omstart, så en uppdatering av tillägget inte innebär en ny inloggning.
+ *
+ *  2. FÖRNYA I TID, MEN OCKSÅ REGELBUNDET. Easees refresh-token dör av
+ *     inaktivitet — laddar ingen på en vecka hinner både access- och
+ *     refresh-token gå ut, och då krävs full inloggning igen. Därför pollar
+ *     loopen även i viloläge, om än glest.
+ *
+ *  3. BACKA AV VID FEL. 429 och 5xx ger exponentiell väntetid upp till en
+ *     halvtimme. Att fortsätta hamra på en tjänst som säger nej är precis så
+ *     man blir avstängd.
+ *
+ *  4. INGA SKRIVNINGAR I AVLÄSNINGSLÄGE. I fas 3 kan klienten bara läsa. Alla
+ *     kommandon vägrar med ett tydligt besked tills läget ändras till skarpt.
+ */
 class EaseeCharger {
-  get kind() { return 'easee'; }
-  async readState() {
-    return { ok: false, error: 'Easee-klienten byggs i fas 3.' };
+  constructor(opts) {
+    this.username = (opts.username || '').trim();
+    this.password = (opts.password || '').trim();
+    this.chargerId = (opts.chargerId || '').trim();
+    this.equalizerId = (opts.equalizerId || '').trim();
+    this.readOnly = Boolean(opts.readOnly);
+
+    this.token = null;
+    this.refreshToken = null;
+    this.expiresAt = 0;
+
+    this.backoffUntil = 0;
+    this.backoffStep = 0;
+    this.lastLoginAt = 0;
+    this.lastError = null;
+    this.calls = [];        // tidsstämplar, för anropsräknaren
+    this.logins = 0;
+    this.refreshes = 0;
+
+    this._restoreToken();
   }
-  async start() { return { ok: false, error: 'Easee-klienten byggs i fas 3.' }; }
-  async stop() { return { ok: false, error: 'Easee-klienten byggs i fas 3.' }; }
-  async setLocked() { return { ok: false, error: 'Easee-klienten byggs i fas 3.' }; }
-  async setMaxCurrent() { return { ok: false, error: 'Easee-klienten byggs i fas 3.' }; }
+
+  get kind() { return this.readOnly ? 'easee-avläsning' : 'easee'; }
+
+  /* ---------------- token ---------------- */
+
+  _restoreToken() {
+    const t = store.readJson(TOKEN_FILE, null);
+    if (!t || !t.token) return;
+    this.token = t.token;
+    this.refreshToken = t.refreshToken || null;
+    this.expiresAt = Number(t.expiresAt) || 0;
+    const left = Math.round((this.expiresAt - Date.now()) / 60000);
+    log.info(`[Easee] Token återläst från disk, ${left > 0 ? left + ' minuter kvar' : 'utgången'}.`);
+  }
+
+  _saveToken() {
+    store.writeJsonNow(TOKEN_FILE, {
+      token: this.token,
+      refreshToken: this.refreshToken,
+      expiresAt: this.expiresAt,
+      savedAt: new Date().toISOString(),
+    });
+  }
+
+  _setToken(data) {
+    this.token = data.accessToken;
+    this.refreshToken = data.refreshToken || this.refreshToken;
+    // Förnya en kvart innan utgång, så vi aldrig kör på en token som just dött
+    const ttl = (Number(data.expiresIn) || 86400) * 1000;
+    this.expiresAt = Date.now() + ttl - 15 * 60 * 1000;
+    this._saveToken();
+  }
+
+  _backoff(reason) {
+    this.backoffStep = Math.min(this.backoffStep + 1, 6);
+    const wait = Math.min(60 * 1000 * Math.pow(2, this.backoffStep - 1), 30 * 60 * 1000);
+    this.backoffUntil = Date.now() + wait;
+    log.warn(`[Easee] ${reason}. Väntar ${Math.round(wait / 1000)} sekunder innan nästa försök.`);
+  }
+
+  _ok() { this.backoffStep = 0; this.backoffUntil = 0; this.lastError = null; }
+
+  async _login() {
+    // Aldrig mer än en inloggning var femte minut, hur illa det än går
+    if (Date.now() - this.lastLoginAt < 5 * 60 * 1000) {
+      return { ok: false, error: 'Väntar innan nästa inloggningsförsök.' };
+    }
+    if (!this.username || !this.password) {
+      return { ok: false, error: 'Easee-uppgifter saknas i tilläggets konfiguration.' };
+    }
+
+    this.lastLoginAt = Date.now();
+    const res = await this._fetch(`${EASEE}/accounts/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ userName: this.username, password: this.password }),
+    });
+
+    if (!res.ok) {
+      if (res.status === 400 || res.status === 401) {
+        this.lastError = 'Fel användarnamn eller lösenord för Easee.';
+        this._backoff('Inloggningen nekades');
+        return { ok: false, error: this.lastError };
+      }
+      this.lastError = `Inloggningen misslyckades (${res.status}).`;
+      this._backoff(`Inloggningen misslyckades (${res.status})`);
+      return { ok: false, error: this.lastError };
+    }
+
+    this.logins += 1;
+    this._setToken(res.data);
+    this._ok();
+    log.info('[Easee] Inloggad. Token giltig i cirka 24 timmar.');
+    return { ok: true };
+  }
+
+  async _refresh() {
+    if (!this.token || !this.refreshToken) return { ok: false, error: 'Ingen token att förnya.' };
+
+    const res = await this._fetch(`${EASEE}/accounts/refresh_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ accessToken: this.token, refreshToken: this.refreshToken }),
+    });
+
+    if (!res.ok) {
+      log.info(`[Easee] Kunde inte förnya token (${res.status}). Loggar in på nytt.`);
+      this.token = null;
+      this.refreshToken = null;
+      return this._login();
+    }
+
+    this.refreshes += 1;
+    this._setToken(res.data);
+    this._ok();
+    log.info('[Easee] Token förnyad utan ny inloggning.');
+    return { ok: true };
+  }
+
+  /** Ser till att vi har en giltig token. */
+  async _ensureToken() {
+    if (Date.now() < this.backoffUntil) {
+      const left = Math.round((this.backoffUntil - Date.now()) / 1000);
+      return { ok: false, error: `Väntar ${left} sekunder efter tidigare fel mot Easee.` };
+    }
+    if (this.token && Date.now() < this.expiresAt) return { ok: true };
+    if (this.token && this.refreshToken) return this._refresh();
+    return this._login();
+  }
+
+  /* ---------------- anrop ---------------- */
+
+  async _fetch(url, opts) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    this.calls.push(Date.now());
+    if (this.calls.length > 500) this.calls = this.calls.slice(-500);
+    try {
+      const r = await fetch(url, { ...opts, signal: ctrl.signal });
+      let data = null;
+      try { data = await r.json(); } catch (_) { /* tomt svar är i sin ordning */ }
+      return { ok: r.ok, status: r.status, data };
+    } catch (err) {
+      return { ok: false, status: 0, data: null, netError: err.message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Autentiserat anrop med ett omförsök om token hunnit dö. */
+  async _api(path, { method = 'GET', body = null, retry = true } = {}) {
+    const auth = await this._ensureToken();
+    if (!auth.ok) return { ok: false, error: auth.error };
+
+    const res = await this._fetch(`${EASEE}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        Accept: 'application/json',
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+
+    if (res.ok) { this._ok(); return { ok: true, data: res.data }; }
+
+    if (res.status === 401 && retry) {
+      log.info('[Easee] Token underkänd. Förnyar och försöker igen.');
+      this.expiresAt = 0;
+      return this._api(path, { method, body, retry: false });
+    }
+    if (res.status === 429) {
+      this._backoff('Easee svarade 429, för många anrop');
+      return { ok: false, error: 'Easee begränsar antalet anrop just nu.' };
+    }
+    if (res.status >= 500 || res.status === 0) {
+      this._backoff(res.status === 0 ? `Nätverksfel: ${res.netError}` : `Easee svarade ${res.status}`);
+      return { ok: false, error: 'Ingen kontakt med Easee just nu.' };
+    }
+
+    this.lastError = `Easee svarade ${res.status} på ${path}`;
+    return { ok: false, error: this.lastError };
+  }
+
+  /* ---------------- gränssnittet ---------------- */
+
+  async readState() {
+    if (!this.chargerId) {
+      return { ok: false, error: 'Laddbox-id saknas i tilläggets konfiguration.' };
+    }
+    const res = await this._api(`/chargers/${encodeURIComponent(this.chargerId)}/state`);
+    if (!res.ok) return { ok: false, error: res.error };
+
+    const d = res.data || {};
+    return {
+      ok: true,
+      cableConnected: d.cableLocked !== undefined || d.isCableConnected !== undefined
+        ? Boolean(d.isCableConnected)
+        : Number(d.chargerOpMode) > 1,
+      opMode: Number(d.chargerOpMode) || 0,
+      powerKw: Number(d.totalPower) || 0,
+      sessionEnergyKwh: Number(d.sessionEnergy) || 0,
+      lifetimeEnergyKwh: Number(d.lifetimeEnergy) || 0,
+      locked: Boolean(d.isCableLocked),
+      maxCurrent: Number(d.dynamicChargerCurrent) || Number(d.outputCurrent) || 0,
+      simulated: false,
+      raw: d,
+    };
+  }
+
+  _blocked() {
+    return {
+      ok: false,
+      error: 'Läget är avläsning. Inga kommandon skickas till laddboxen förrän du byter till skarpt läge.',
+    };
+  }
+
+  async start() {
+    if (this.readOnly) return this._blocked();
+    const r = await this._api(`/chargers/${encodeURIComponent(this.chargerId)}/commands/start_charging`, { method: 'POST', body: {} });
+    return r.ok ? { ok: true } : { ok: false, error: r.error };
+  }
+
+  async stop() {
+    if (this.readOnly) return this._blocked();
+    const r = await this._api(`/chargers/${encodeURIComponent(this.chargerId)}/commands/stop_charging`, { method: 'POST', body: {} });
+    return r.ok ? { ok: true } : { ok: false, error: r.error };
+  }
+
+  async setLocked(locked) {
+    if (this.readOnly) return this._blocked();
+    const r = await this._api(`/chargers/${encodeURIComponent(this.chargerId)}/commands/lock_state`, { method: 'POST', body: { state: Boolean(locked) } });
+    return r.ok ? { ok: true } : { ok: false, error: r.error };
+  }
+
+  async setMaxCurrent(amps) {
+    if (this.readOnly) return this._blocked();
+    const r = await this._api(`/chargers/${encodeURIComponent(this.chargerId)}/settings`, {
+      method: 'POST',
+      body: { dynamicChargerCurrent: amps },
+    });
+    return r.ok ? { ok: true } : { ok: false, error: r.error };
+  }
+
+  /** För rå API-inspektören i adminfliken. */
+  async raw(what) {
+    const id = encodeURIComponent(this.chargerId);
+    const eq = encodeURIComponent(this.equalizerId);
+    if (what === 'state') return this._api(`/chargers/${id}/state`);
+    if (what === 'details') return this._api(`/chargers/${id}/details`);
+    if (what === 'config') return this._api(`/chargers/${id}/config`);
+    if (what === 'chargers') return this._api('/accounts/chargers');
+    if (what === 'equalizer') {
+      if (!this.equalizerId) return { ok: false, error: 'Inget equalizer-id angivet.' };
+      return this._api(`/equalizers/${eq}/state`);
+    }
+    return { ok: false, error: `Okänt val: ${what}` };
+  }
+
+  stats() {
+    const hourAgo = Date.now() - 3600 * 1000;
+    return {
+      chargerId: this.chargerId || null,
+      equalizerId: this.equalizerId || null,
+      readOnly: this.readOnly,
+      hasToken: Boolean(this.token),
+      tokenExpiresAt: this.expiresAt ? new Date(this.expiresAt).toISOString() : null,
+      tokenMinutesLeft: this.expiresAt ? Math.round((this.expiresAt - Date.now()) / 60000) : null,
+      callsLastHour: this.calls.filter((t) => t > hourAgo).length,
+      logins: this.logins,
+      refreshes: this.refreshes,
+      backoffUntil: this.backoffUntil ? new Date(this.backoffUntil).toISOString() : null,
+      lastError: this.lastError,
+    };
+  }
 }
 
 function round(n, d) {
@@ -872,8 +1171,15 @@ function round(n, d) {
   return Math.round(n * f) / f;
 }
 
-function create(simulated) {
-  return simulated ? new SimulatedCharger() : new EaseeCharger();
+/**
+ * Tre lägen:
+ *   simulering  virtuell laddbox, ingen kontakt med Easee
+ *   avlasning   riktig Easee, men enbart läsning. Inga kommandon skickas.
+ *   skarp       riktig Easee med kommandon
+ */
+function create(mode, opts) {
+  if (mode === 'simulering') return new SimulatedCharger();
+  return new EaseeCharger({ ...opts, readOnly: mode === 'avlasning' });
 }
 
 return { create, OP_MODE, SimulatedCharger, EaseeCharger };
@@ -1144,7 +1450,13 @@ const loop = (function () {
  *  starta laddning på fel bil.
  */
 
-const TICK_MS = 30 * 1000;
+/**
+ * Två takter. Under laddning behövs 30 sekunder för att kostnaden ska följa
+ * kvartarna. I viloläge räcker fem minuter — men vi slutar ALDRIG helt, för
+ * Easees refresh-token dör av inaktivitet och då krävs full inloggning igen.
+ */
+const TICK_BUSY_MS = 30 * 1000;
+const TICK_IDLE_MS = 5 * 60 * 1000;
 const PRICE_REFRESH_MS = 15 * 60 * 1000;
 const IDLE_FINISH_MS = 20 * 60 * 1000; // färdigladdad och 0 kW så länge -> avsluta
 
@@ -1166,6 +1478,7 @@ let disconnectStrikes = 0;
 let zeroPowerSince = null;
 let lastPriceRefresh = 0;
 let ticking = false;
+let stopped = false;
 let lastTickAt = null;
 
 function loadCableState() {
@@ -1282,16 +1595,31 @@ async function refreshPricesIfDue() {
   await prices.refresh();
 }
 
-function start() {
-  if (timer) return;
-  timer = setInterval(tick, TICK_MS);
+function nextDelay() {
+  if (sessions.getActive()) return TICK_BUSY_MS;
+  if (snapshot.ok && snapshot.cableConnected) return TICK_BUSY_MS;
+  return TICK_IDLE_MS;
+}
+
+function schedule() {
+  if (stopped) return;
+  timer = setTimeout(async () => {
+    await tick();
+    schedule();
+  }, nextDelay());
   if (timer.unref) timer.unref();
-  tick();
-  log.info(`Bakgrundsloopen igång, var ${TICK_MS / 1000}:e sekund.`);
+}
+
+function start() {
+  if (timer || stopped === false && timer) return;
+  stopped = false;
+  tick().then(schedule);
+  log.info(`Bakgrundsloopen igång: ${TICK_BUSY_MS / 1000} s under laddning, ${TICK_IDLE_MS / 60000} min i viloläge.`);
 }
 
 function stop() {
-  if (timer) { clearInterval(timer); timer = null; }
+  stopped = true;
+  if (timer) { clearTimeout(timer); timer = null; }
 }
 
 return {
@@ -1756,6 +2084,7 @@ button.btn + button.btn{margin-top:10px}
     if (s.view === 'charging') { liveText = 'Laddar'; }
     else if (s.view === 'busy') { liveClass = 'live busy'; liveText = 'Upptagen'; }
     else if (s.view === 'ready') { liveText = 'Kabel ansluten'; }
+    else if (s.view === 'readonly') { liveClass = 'live busy'; liveText = 'Avlasningslage'; }
     else if (s.view === 'done') { liveClass = 'live busy'; liveText = 'Klar'; }
     else if (s.view === 'offline') { liveClass = 'live off'; liveText = 'Ingen kontakt'; }
     el.live.className = liveClass;
@@ -1803,6 +2132,12 @@ button.btn + button.btn{margin-top:10px}
       var sb = document.getElementById('stopBtn');
       if (sb) sb.addEventListener('click', doStop);
 
+    } else if (s.view === 'readonly') {
+      el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
+      el.title.textContent = 'Kabeln ar ansluten';
+      el.lead.textContent = 'Appen lases av mot laddboxen men skickar inga kommandon an. Starta laddningen i Easee-appen sa lange.';
+      el.slot.innerHTML = noticeBlock() + receiptBanner() + priceBlock(s.price, false);
+
     } else if (s.view === 'busy') {
       el.icon.innerHTML = ICONS.clock; el.icon.style.display = '';
       el.title.textContent = 'Stolpen används just nu';
@@ -1841,9 +2176,13 @@ button.btn + button.btn{margin-top:10px}
       el.slot.innerHTML = noticeBlock();
     }
 
-    el.foot.innerHTML = s.simulated
-      ? '<span class="simbadge">Simuleringsläge</span><br>Ingen riktig laddbox är inkopplad.'
-      : '';
+    if (s.mode === 'simulering') {
+      el.foot.innerHTML = '<span class="simbadge">Simuleringslage</span><br>Ingen riktig laddbox ar inkopplad.';
+    } else if (s.mode === 'avlasning') {
+      el.foot.innerHTML = '<span class="simbadge">Avlasningslage</span><br>Appen laser av laddboxen men styr den inte.';
+    } else {
+      el.foot.innerHTML = '';
+    }
   }
 
   function setNotice(kind, text) {
@@ -2115,9 +2454,17 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     var certOk = c.ok;
 
     var h = msgHtml() + '<div class="h">Mår allt bra just nu?</div><div class="grid g2">';
+    var modeLabel = { simulering:'Simulerad box', avlasning:'Easee, avlasning', skarp:'Easee, skarpt' }[D.mode] || D.mode;
     h += hc(chargerOk?'ok':'bad','Laddbox', chargerOk
-        ? (D.simulated?'Simulerad box. ':'') + 'Läge ' + s.opMode + ' · ' + esc(D.opModeText)
-        : esc(s.error || 'Ingen kontakt'));
+        ? esc(modeLabel) + ' &middot; lage ' + s.opMode + ' &middot; ' + esc(D.opModeText)
+        : esc(modeLabel) + ' &middot; ' + esc(s.error || 'Ingen kontakt'));
+    if (D.easee) {
+      var e = D.easee;
+      var tokState = !e.hasToken ? 'bad' : (e.tokenMinutesLeft < 60 ? 'warn' : 'ok');
+      h += hc(tokState, 'Easee-token', e.hasToken
+        ? e.tokenMinutesLeft + ' min kvar &middot; ' + e.callsLastHour + ' anrop senaste timmen'
+        : esc(e.lastError || 'Ingen token'));
+    }
     h += hc(priceOk?'ok':'warn','Elpriser', priceOk
         ? (p.slotsToday + ' kvartar idag' + (p.haveTomorrow?', imorgon hämtad':', imorgon ej släppt än'))
         : 'Inga priser hämtade');
@@ -2226,8 +2573,20 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<button class="b" data-act="sim" data-cmd="ff60">Spola fram 60 min</button>'
         + '</div>'
         + '<p class="note">Med de här knapparna testar du hela kedjan utan bil: sätt i kabeln, starta från gästsidan, spola fram tiden och se kostnaden räknas upp mot rätt kvartspris. "Strypa till 0 kW" härmar Equalizern — energin ska då sluta öka utan att sessionen avslutas.</p>';
-    } else {
-      h += '<div class="h">Easee</div><div class="card"><div class="note" style="margin:0">Easee-klienten byggs i fas 3. Slå på <code>simulation</code> i tilläggets konfiguration så länge.</div></div>';
+    } else if (D.easee) {
+      var e = D.easee;
+      h += '<div class="h">Easee</div><div class="card">'
+        + row('Lage', D.mode === 'avlasning' ? 'Avlasning — inga kommandon skickas' : 'Skarpt')
+        + row('Laddbox-id', esc(e.chargerId || 'saknas'))
+        + row('Equalizer-id', esc(e.equalizerId || '—'))
+        + row('Token', e.hasToken ? e.tokenMinutesLeft + ' min kvar' : 'ingen')
+        + row('Inloggningar', String(e.logins))
+        + row('Tokenfornyelser', String(e.refreshes))
+        + row('Anrop senaste timmen', String(e.callsLastHour))
+        + (e.backoffUntil ? row('Vantar till', ts(e.backoffUntil)) : '')
+        + (e.lastError ? row('Senaste fel', esc(e.lastError)) : '')
+        + '</div>'
+        + '<p class="note">Inloggningar ska vara ett litet tal och tokenfornyelser vaxa langsamt. Stiger inloggningarna i takt med tiden ar nagot fel — det var precis det monster som fick den gamla appen att riskera IP-sparr hos Easee.</p>';
     }
     return h;
   }
@@ -2260,6 +2619,16 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       + esc(D.guestRoutes.join('\\n')) + '</div></div>'
       + '<p class="note">Hela listan över vad den publika servern kan svara på. Ingen adminväg finns med — det är inte ett lösenord som skyddar dem, de existerar helt enkelt inte här.</p>';
 
+    if (D.easee) {
+      h += '<div class="h">Ra API-inspektor</div><div class="btns">'
+        + '<button class="b" data-act="raw" data-what="state">Laddarstatus</button>'
+        + '<button class="b" data-act="raw" data-what="details">Detaljer</button>'
+        + '<button class="b" data-act="raw" data-what="config">Konfiguration</button>'
+        + '<button class="b" data-act="raw" data-what="equalizer">Equalizer</button>'
+        + '<button class="b" data-act="raw" data-what="chargers">Mina laddboxar</button>'
+        + '</div><pre class="log" id="rawOut">Valj vad du vill se. Svaret visas har, orort.</pre>';
+    }
+
     h += '<div class="h">Logg</div><pre class="log">' + esc(D.log.map(function(l){
       return l.ts.replace('T',' ').slice(0,19) + '  ' + l.level.toUpperCase().padEnd(7) + l.message;
     }).join('\\n')) + '</pre>';
@@ -2272,7 +2641,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
   function draw() {
     if (!D) return;
     document.getElementById('subtitle').textContent =
-      D.locationName + ' · ' + (D.simulated ? 'simuleringsläge' : 'skarpt läge') + ' · fas 2';
+      D.locationName + ' \u00b7 ' + ({ simulering:'simuleringslage', avlasning:'avlasningslage', skarp:'skarpt lage' }[D.mode] || D.mode) + ' \u00b7 fas 3';
     document.getElementById('p-overview').innerHTML = current==='overview' ? overview() : '';
     document.getElementById('p-sessions').innerHTML = current==='sessions' ? sessionsPanel() : '';
     document.getElementById('p-prices').innerHTML   = current==='prices'   ? pricesPanel()   : '';
@@ -2316,6 +2685,12 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       api('api/admin/session/end', {}).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Sessionen avslutad.':(r.body.error||'Misslyckades.')); load();
       });
+    } else if (act === 'raw') {
+      var out = document.getElementById('rawOut');
+      if (out) out.textContent = 'Hamtar...';
+      api('api/admin/easee/raw', { what: b.dataset.what }).then(function(r){
+        if (out) out.textContent = r.ok ? JSON.stringify(r.body.data, null, 2) : (r.body.error || 'Misslyckades.');
+      });
     } else if (act === 'paid') {
       api('api/admin/session/payment', { id: b.dataset.id, state: 'CONFIRMED' }).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Markerad som betald.':(r.body.error||'Misslyckades.')); load();
@@ -2326,7 +2701,9 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
   load();
   setInterval(function(){
     var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
-    if (!typing) load();
+    var inspecting = current === 'diag' && document.getElementById('rawOut')
+      && document.getElementById('rawOut').textContent.indexOf('{') === 0;
+    if (!typing && !inspecting) load();
   }, 5000);
 })();
 </script>
@@ -2362,7 +2739,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.2.1';
+const VERSION = '0.3.0';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -2441,11 +2818,15 @@ guest.get('/api/status', (req, res) => {
     view = 'ready';
   }
 
+  const mode = config.ha().mode;
+  if (mode === 'avlasning' && view === 'ready') view = 'readonly';
+
   sendJson(res, 200, {
     view,
     session,
     busySince,
     price,
+    mode,
     simulated: Boolean(snap.simulated),
     locationName: config.ha().location_name,
   });
@@ -2458,6 +2839,11 @@ guest.post('/api/start', async (req, res, ctx) => {
   }
   if (sessions.getActive()) {
     return sendJson(res, 409, { error: 'Stolpen används just nu.' });
+  }
+  if (config.ha().mode === 'avlasning') {
+    return sendJson(res, 503, {
+      error: 'Laddstolpen är i avläsningsläge och kan inte startas härifrån än.',
+    });
   }
   startInFlight = true;
 
@@ -2551,6 +2937,8 @@ admin.get('/api/admin/state', (req, res) => {
     hostname: os.hostname(),
 
     snapshot: snap,
+    mode: config.ha().mode,
+    easee: charger.stats ? charger.stats() : null,
     opModeText: OP_MODE[snap.opMode] || 'okänt',
     cable: loop.getCableState(),
     cert: tls.status(),
@@ -2598,6 +2986,17 @@ admin.post('/api/admin/session/payment', async (req, res) => {
   return sendJson(res, 200, { ok: true });
 });
 
+admin.post('/api/admin/easee/raw', async (req, res) => {
+  if (!charger.raw) {
+    return sendJson(res, 400, { error: 'Inspektören fungerar bara när en riktig Easee är inkopplad.' });
+  }
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+  const out = await charger.raw(String(parsed.body.what || 'state'));
+  if (!out.ok) return sendJson(res, 502, { error: out.error });
+  return sendJson(res, 200, { ok: true, data: out.data });
+});
+
 admin.post('/api/admin/sim', async (req, res) => {
   if (charger.kind !== 'simulerad') {
     return sendJson(res, 400, { error: 'Simulatorknapparna fungerar bara i simuleringsläge.' });
@@ -2631,13 +3030,28 @@ async function main() {
 
   const ha = config.loadHaOptions();
   config.loadSettings();
-  log.info(`Plats: ${ha.location_name} · Prisområde: ${ha.price_zone} · ${ha.simulation ? 'SIMULERINGSLÄGE' : 'skarpt läge'}`);
+
+  const MODE_TEXT = {
+    simulering: 'SIMULERINGSLÄGE — virtuell laddbox',
+    avlasning: 'AVLÄSNINGSLÄGE — riktig Easee, men inga kommandon skickas',
+    skarp: 'SKARPT LÄGE — riktig Easee med kommandon',
+  };
+  log.info(`Plats: ${ha.location_name} · Prisområde: ${ha.price_zone}`);
+  log.info(MODE_TEXT[ha.mode] || `Okänt läge: ${ha.mode}`);
 
   sessions.load();
   prices.loadCache();
 
-  charger = chargerFactory.create(ha.simulation !== false);
-  await charger.setMaxCurrent(config.settings().maxChargerCurrent);
+  charger = chargerFactory.create(ha.mode, {
+    username: ha.easee_username,
+    password: ha.easee_password,
+    chargerId: ha.easee_charger_id,
+    equalizerId: ha.easee_equalizer_id,
+  });
+  // Strömgränsen skickas bara i lägen där vi faktiskt får skriva
+  if (ha.mode !== 'avlasning') {
+    await charger.setMaxCurrent(config.settings().maxChargerCurrent);
+  }
   loop.init(charger);
 
   await prices.refresh({ force: true });
