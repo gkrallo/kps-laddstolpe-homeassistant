@@ -2,9 +2,9 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.3.3 — fas 3: skarp Easee, endast avläsning.**
-Nu kan tillägget läsa av din riktiga laddbox. Inga kommandon skickas till den —
-det kommer i fas 4.
+**Version 0.4.0 — fas 4: kommandon mot laddboxen.**
+Appen kan nu starta och stoppa din riktiga laddbox. Varje kommando kontrolleras
+mot boxens faktiska tillstånd innan det räknas som lyckat.
 
 ## Installation
 
@@ -40,7 +40,7 @@ Två sorters inställningar, medvetet åtskilda.
 |---|---|
 | `simulering` | Virtuell laddbox. Ingen kontakt med Easee alls. |
 | `avlasning` | Riktig Easee, men **enbart läsning**. Inga kommandon skickas. |
-| `skarp` | Riktig Easee med kommandon. Låses upp i fas 4. |
+| `skarp` | Riktig Easee med kommandon. |
 
 **I adminfliken** — ändras ofta, slår igenom direkt: avgifter, strömgräns.
 
@@ -73,6 +73,38 @@ Stiger inloggningarna med tiden är något fel, och då ska vi stanna och rätta
 innan vi går vidare. Den gamla molnappen loggade in **2 880 gånger per
 laddningsdygn** — det är precis så man blir IP-spärrad hos Easee, och en spärrad
 IP betyder att stolpen slutar svara helt.
+
+## Grinden för fas 4
+
+Gör proven i den här ordningen. Varje steg är farligare än det före, och
+poängen är att upptäcka fel medan konsekvensen fortfarande är liten.
+
+**Först i `simulering`:** tryck *Boxen vägrar stanna* på Laddbox-fliken under en
+pågående laddning, och försök sedan avsluta från mobilen. Appen ska **neka** och
+säga att kabeln behöver dras ur — sessionen ska leva vidare och fortsätta räkna.
+Tryck sedan *Boxen lyder igen* och avsluta som vanligt.
+
+Byt därefter `mode` till `skarp`. Ha bilen och dig själv på plats.
+
+**1. Ofarligast först: maxström.** Laddbox-fliken → *Skicka maxström*. Ingen
+laddning pågår. Kontrollera i Easee-appen att värdet ändrats.
+
+**2. Stopp utan att något laddar.** Tryck *Stoppa laddning*. Ingenting ska hända
+och kommandot ska bekräftas. Titta i kommandologgen.
+
+**3. Start med din egen bil.** Sätt i kabeln, tryck *Starta laddning* i
+adminfliken. Bilen ska börja ladda inom en halvminut, och loggen ska säga
+*"bekräftat av laddboxen efter N s"*. Stoppa sedan från admin.
+
+**4. Hela gästflödet.** Sätt i kabeln, gå till gästsidan i mobilen, skriv ditt
+nummer och tryck *Starta laddning*. Låt den gå några minuter och titta på att
+kronorna stiger. Tryck *Avsluta laddning* och kontrollera kvittot.
+
+**5. Kabeln dras ur under pågående laddning.** Sessionen ska avslutas inom en
+minut och kvittot dyka upp i mobilen.
+
+> Går något oväntat: byt tillbaka `mode` till `avlasning`. Då slutar appen
+> omedelbart skicka kommandon, utan att du behöver avinstallera något.
 
 ## Att läsa lastbalanseringen
 
