@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.4.0 — fas 4: kommandon mot laddboxen.**
+**Version 0.4.2 — fas 4: kommandon mot laddboxen.**
 Appen kan nu starta och stoppa din riktiga laddbox. Varje kommando kontrolleras
 mot boxens faktiska tillstånd innan det räknas som lyckat.
 
@@ -86,6 +86,11 @@ Tryck sedan *Boxen lyder igen* och avsluta som vanligt.
 
 Byt därefter `mode` till `skarp`. Ha bilen och dig själv på plats.
 
+**0. Öva på låset i `simulering` först.** Laddbox-fliken → *Stäng av stolpen*.
+Sätt sedan i kabeln och starta från gästsidan. Loggen ska visa
+*"slå på laddaren"* före *"starta laddning"*. Avsluta laddningen och kontrollera
+under Diagnostik att raden **Stolpen** säger *avstängd* igen.
+
 **1. Ofarligast först: maxström.** Laddbox-fliken → *Skicka maxström*. Ingen
 laddning pågår. Kontrollera i Easee-appen att värdet ändrats.
 
@@ -105,6 +110,20 @@ minut och kvittot dyka upp i mobilen.
 
 > Går något oväntat: byt tillbaka `mode` till `avlasning`. Då slutar appen
 > omedelbart skicka kommandon, utan att du behöver avinstallera något.
+
+## Låset på stolpen
+
+Stolpen står avstängd när ingen laddar. Det är det som hindrar någon från att
+koppla in sig utan att gå via appen — Easee vägrar helt enkelt ge ström.
+
+Appen sköter det åt dig: den slår på laddaren när någon startar och stänger av
+den igen när laddningen är slut. Brytaren finns i adminfliken under **Laddbox →
+Låset på stolpen** och är påslagen som standard.
+
+Vill du ladda din egen bil utan att gå via appen: tryck *Lås upp stolpen* i
+adminfliken, ladda som vanligt via Easee-appen, och tryck *Lås stolpen* efteråt.
+
+Under **Diagnostik** visar raden *Stolpen* om den är avstängd just nu.
 
 ## Att läsa lastbalanseringen
 
