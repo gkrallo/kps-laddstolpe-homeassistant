@@ -1093,8 +1093,28 @@ function round(n, d) {
 
 function flush() { activeWriter.flush(); }
 
+/**
+ * Endast för simuleringsläget.
+ *
+ * "Spola fram 60 minuter" flyttar simulatorns egen klocka, men inte
+ * väggklockan — så tidräknaren i gästvyn visade de två verkliga minuter som
+ * gått medan energin visade en timmes laddning. Genom att flytta sessionens
+ * starttid lika långt bakåt hänger de ihop igen, och kvittots varaktighet blir
+ * rimlig i testerna i stället för missvisande.
+ */
+function shiftStartBack(minutes) {
+  if (!active) return;
+  const ms = minutes * 60 * 1000;
+  active.startedAt = new Date(Date.parse(active.startedAt) - ms).toISOString();
+  active.samples = active.samples.map((s) => ({
+    ...s,
+    t: new Date(Date.parse(s.t) - ms).toISOString(),
+  }));
+  activeWriter.save(active, { immediate: true });
+}
+
 return {
-  load, start, accumulate, finish, flush,
+  load, start, accumulate, finish, flush, shiftStartBack,
   getActive, getHistory, byReceiptKey, unpaid, setPayment,
   publicView, maskPhone,
 };
@@ -1667,6 +1687,15 @@ button.btn + button.btn{margin-top:10px}
   var busyAction = false;
   var notice = null;
   var lastKey = '';
+  var receipt = null;
+
+  // Telefonen minns vilken laddning som är dess egen, så att kvittot kan visas
+  // när sessionen tagit slut — och hittas igen senare om den är obetald.
+  // Sparat lokalt i webblasaren; ingenting skickas nagonstans.
+  var STORE = 'kps.receipt';
+  function remember(v) { try { localStorage.setItem(STORE, JSON.stringify(v)); } catch (e) {} }
+  function recall() { try { return JSON.parse(localStorage.getItem(STORE) || 'null'); } catch (e) { return null; } }
+  function forget() { try { localStorage.removeItem(STORE); } catch (e) {} }
 
   function kr(n) { return Number(n).toFixed(2).replace('.', ','); }
   function num(n, d) { return Number(n).toFixed(d === undefined ? 1 : d).replace('.', ','); }
@@ -1715,7 +1744,8 @@ button.btn + button.btn{margin-top:10px}
     if (!state) return;
     var s = state;
     var key = [s.view, s.session && s.session.number, s.price && s.price.totalSek,
-               s.session && s.session.energyKwh, notice && notice.text, busyAction].join('|');
+               s.session && s.session.energyKwh, notice && notice.text, busyAction,
+               receipt && receipt.number].join('|');
 
     // Rör inte DOM:en om inget ändrats — annars tappar man markören i textfältet
     var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
@@ -1735,13 +1765,13 @@ button.btn + button.btn{margin-top:10px}
       el.icon.innerHTML = ICONS.plug; el.icon.style.display = '';
       el.title.textContent = 'Sätt i laddkabeln';
       el.lead.textContent = 'Anslut kabeln till bilen och stolpen, så fortsätter det här av sig självt.';
-      el.slot.innerHTML = noticeBlock() + priceBlock(s.price, false);
+      el.slot.innerHTML = noticeBlock() + receiptBanner() + priceBlock(s.price, false);
 
     } else if (s.view === 'ready') {
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
       el.title.textContent = 'Redo att ladda';
       el.lead.textContent = 'Skriv ditt mobilnummer, så får du kvittot dit när du är klar.';
-      el.slot.innerHTML = noticeBlock() +
+      el.slot.innerHTML = noticeBlock() + receiptBanner() +
         '<div class="field"><label for="tel">Ditt mobilnummer</label>' +
         '<input id="tel" type="tel" inputmode="numeric" autocomplete="tel" placeholder="070 123 45 67"></div>' +
         '<button class="btn" id="startBtn"' + (busyAction ? ' disabled' : '') + '>' +
@@ -1796,9 +1826,13 @@ button.btn + button.btn{margin-top:10px}
         '</div>' +
         (d.usedEstimatedPrice ? '<div class="msg info">Delar av laddningen prissattes mot senast kända elpris eftersom elbörsen inte svarade.</div>' : '') +
         '<div class="msg info">Swish och SMS-kvitto kopplas in i fas 5.</div>' +
-        '<button class="btn ghost" id="againBtn">Tillbaka</button>';
+        '<button class="btn ghost" id="againBtn">Klar</button>';
       var ab = document.getElementById('againBtn');
-      if (ab) ab.addEventListener('click', function () { location.href = '/'; });
+      if (ab) ab.addEventListener('click', function () {
+        var saved = recall();
+        if (saved) remember({ key: saved.key, dismissed: true });
+        lastKey = ''; poll();
+      });
 
     } else {
       el.icon.innerHTML = ICONS.warn; el.icon.style.display = '';
@@ -1821,11 +1855,49 @@ button.btn + button.btn{margin-top:10px}
   function poll() {
     fetch('api/status', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
-      .then(function (data) { state = data; render(); })
+      .then(function (data) {
+        state = data;
+        if (data.session) { receipt = null; render(); return; }
+        return checkReceipt().then(render);
+      })
       .catch(function () {
         state = { view: 'offline' };
         render();
       });
+  }
+
+  /**
+   * Ingen laddning pagar. Har den har telefonen en egen session sparad hamtar
+   * vi kvittot for den — sa att den som just dragit ur kabeln mots av sitt
+   * kvitto i stallet for "Satt i laddkabeln".
+   *
+   * Kvittot ligger pa en egen adress med slumpad nyckel och har ingen
+   * utgangstid. Det ar en obetald rakning; den ska finnas kvar tills den ar
+   * betald, och den bryr sig inte om vad stolpen gor just nu.
+   */
+  function checkReceipt() {
+    var saved = recall();
+    if (!saved || !saved.key) { receipt = null; return Promise.resolve(); }
+
+    return fetch('k/' + encodeURIComponent(saved.key), { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data || !data.session) { forget(); receipt = null; return; }
+        if (data.session.payment === 'CONFIRMED') { forget(); receipt = null; return; }
+        receipt = data.session;
+        if (!saved.dismissed && receipt.status === 'COMPLETED') {
+          state.view = 'done';
+          state.session = receipt;
+        }
+      })
+      .catch(function () { receipt = null; });
+  }
+
+  function receiptBanner() {
+    if (!receipt || receipt.status !== 'COMPLETED') return '';
+    return '<div class="msg info" style="display:flex;justify-content:space-between;align-items:center;gap:12px">' +
+      '<span>Du har en obetald laddning pa ' + kr(receipt.costSek) + ' kr.</span>' +
+      '<a href="#" id="openReceipt" style="color:#F3D082;white-space:nowrap;font-weight:600">Visa kvitto</a></div>';
   }
 
   function doStart() {
@@ -1843,6 +1915,9 @@ button.btn + button.btn{margin-top:10px}
       .then(function (res) {
         busyAction = false;
         if (!res.ok) { setNotice('err', res.body.error || 'Laddningen kunde inte startas.'); return; }
+        if (res.body.session && res.body.session.receiptKey) {
+          remember({ key: res.body.session.receiptKey, dismissed: false });
+        }
         poll();
       })
       .catch(function () { busyAction = false; setNotice('err', 'Ingen kontakt med servern.'); });
@@ -1859,6 +1934,15 @@ button.btn + button.btn{margin-top:10px}
       })
       .catch(function () { busyAction = false; setNotice('err', 'Ingen kontakt med servern.'); });
   }
+
+  el.slot.addEventListener('click', function (e) {
+    if (e.target && e.target.id === 'openReceipt') {
+      e.preventDefault();
+      var saved = recall();
+      if (saved) remember({ key: saved.key, dismissed: false });
+      lastKey = ''; poll();
+    }
+  });
 
   poll();
   setInterval(poll, 5000);
@@ -2278,7 +2362,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -2528,8 +2612,8 @@ admin.post('/api/admin/sim', async (req, res) => {
     case 'unplug': out = charger.unplug(); break;
     case 'throttle': out = charger.setThrottled(true); break;
     case 'unthrottle': out = charger.setThrottled(false); break;
-    case 'ff15': out = charger.fastForward(15); break;
-    case 'ff60': out = charger.fastForward(60); break;
+    case 'ff15': out = charger.fastForward(15); sessions.shiftStartBack(15); break;
+    case 'ff60': out = charger.fastForward(60); sessions.shiftStartBack(60); break;
     default: return sendJson(res, 400, { error: `Okänt kommando: ${cmd}` });
   }
   if (!out.ok) return sendJson(res, 409, { error: out.error });
