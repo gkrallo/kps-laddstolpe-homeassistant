@@ -3,7 +3,7 @@
 /* ============================================================================
  *
  *  KPs Laddstolpe — Home Assistant-tillägg
- *  Fas 2: backend i simuleringsläge
+ *  Fas 3: skarp Easee, endast avläsning
  *
  *  Hela tillägget ligger i den här enda filen. Det är ett medvetet val: du
  *  uppdaterar den genom att öppna filen på GitHub, markera allt, klistra in den
@@ -1455,8 +1455,9 @@ const loop = (function () {
  * kvartarna. I viloläge räcker fem minuter — men vi slutar ALDRIG helt, för
  * Easees refresh-token dör av inaktivitet och då krävs full inloggning igen.
  */
-const TICK_BUSY_MS = 30 * 1000;
-const TICK_IDLE_MS = 5 * 60 * 1000;
+const TICK_WATCHED_MS = 10 * 1000;   // någon har gästsidan öppen just nu
+const TICK_BUSY_MS = 30 * 1000;      // laddning pågår, ingen tittar
+const TICK_IDLE_MS = 5 * 60 * 1000;  // viloläge — men aldrig helt tyst
 const PRICE_REFRESH_MS = 15 * 60 * 1000;
 const IDLE_FINISH_MS = 20 * 60 * 1000; // färdigladdad och 0 kW så länge -> avsluta
 
@@ -1479,6 +1480,8 @@ let zeroPowerSince = null;
 let lastPriceRefresh = 0;
 let ticking = false;
 let stopped = false;
+let lastGuestPollAt = 0;
+const WATCHER_WINDOW_MS = 60 * 1000;
 let lastTickAt = null;
 
 function loadCableState() {
@@ -1581,7 +1584,20 @@ async function handleIdleFinish(state) {
   }
 }
 
+/**
+ * Avslutar den pågående sessionen. Idempotent: anropas den när ingen session
+ * finns händer ingenting.
+ *
+ * I simuleringsläge var ett extra stoppkommando ofarligt. Från fas 4 går det
+ * till den riktiga laddboxen, och då är ett kommando som skickas två gånger
+ * både ett bortkastat API-anrop och en risk — det andra kan i värsta fall
+ * stoppa en laddning som just startat.
+ */
 async function endSession(reason) {
+  if (!sessions.getActive()) {
+    log.debug('endSession anropad utan pågående session. Ignorerar.');
+    return null;
+  }
   const stop = await charger.stop();
   if (!stop.ok) log.warn(`Stoppkommandot misslyckades: ${stop.error}`);
   await charger.setLocked(false);
@@ -1595,10 +1611,33 @@ async function refreshPricesIfDue() {
   await prices.refresh();
 }
 
+/**
+ * Tre takter i stället för två.
+ *
+ * Att någon står vid stolpen och tittar på skärmen är den enda situation där
+ * en snabbare avläsning gör verklig nytta — det är då man vill se effekten
+ * ändras när lastbalanseraren griper in. Resten av tiden finns ingen som ser
+ * skillnaden, och då är varje extra anrop mot Easee bortkastat.
+ *
+ * Gästsidan säger till servern att någon tittar helt enkelt genom att hämta
+ * status. Slutar den fråga faller takten tillbaka av sig själv.
+ */
 function nextDelay() {
-  if (sessions.getActive()) return TICK_BUSY_MS;
+  const watched = Date.now() - lastGuestPollAt < WATCHER_WINDOW_MS;
+  if (sessions.getActive()) return watched ? TICK_WATCHED_MS : TICK_BUSY_MS;
   if (snapshot.ok && snapshot.cableConnected) return TICK_BUSY_MS;
   return TICK_IDLE_MS;
+}
+
+function noteGuestPoll() { lastGuestPollAt = Date.now(); }
+
+function cadence() {
+  const ms = nextDelay();
+  return {
+    ms,
+    label: ms === TICK_WATCHED_MS ? 'någon tittar' : (ms === TICK_BUSY_MS ? 'kabel i eller laddning' : 'viloläge'),
+    watched: Date.now() - lastGuestPollAt < WATCHER_WINDOW_MS,
+  };
 }
 
 function schedule() {
@@ -1614,7 +1653,7 @@ function start() {
   if (timer || stopped === false && timer) return;
   stopped = false;
   tick().then(schedule);
-  log.info(`Bakgrundsloopen igång: ${TICK_BUSY_MS / 1000} s under laddning, ${TICK_IDLE_MS / 60000} min i viloläge.`);
+  log.info(`Bakgrundsloopen igång: ${TICK_WATCHED_MS / 1000} s när någon tittar, ${TICK_BUSY_MS / 1000} s under laddning, ${TICK_IDLE_MS / 60000} min i viloläge.`);
 }
 
 function stop() {
@@ -1623,7 +1662,7 @@ function stop() {
 }
 
 return {
-  init, start, stop, tick,
+  init, start, stop, tick, noteGuestPoll, cadence,
   getSnapshot: () => snapshot,
   getCableState: () => cableState,
   getLastTickAt: () => lastTickAt,
@@ -2016,6 +2055,8 @@ button.btn + button.btn{margin-top:10px}
   var notice = null;
   var lastKey = '';
   var receipt = null;
+  var receivedAt = 0;
+  var lagMs = 0;
 
   // Telefonen minns vilken laddning som är dess egen, så att kvittot kan visas
   // när sessionen tagit slut — och hittas igen senare om den är obetald.
@@ -2071,9 +2112,11 @@ button.btn + button.btn{margin-top:10px}
   function render() {
     if (!state) return;
     var s = state;
+    // Energin ingår medvetet INTE i nyckeln. Talen uppdateras av tickSmooth()
+    // fyra gånger i sekunden; ritas hela vyn om i samma takt blinkar den och
+    // hopfällbara avsnitt slår igen medan man läser dem.
     var key = [s.view, s.session && s.session.number, s.price && s.price.totalSek,
-               s.session && s.session.energyKwh, notice && notice.text, busyAction,
-               receipt && receipt.number].join('|');
+               notice && notice.text, busyAction, receipt && receipt.number].join('|');
 
     // Rör inte DOM:en om inget ändrats — annars tappar man markören i textfältet
     var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
@@ -2116,11 +2159,11 @@ button.btn + button.btn{margin-top:10px}
       el.title.textContent = 'Laddar';
       el.lead.textContent = 'Du kan låsa mobilen och gå. Laddningen mäts vidare.';
       el.slot.innerHTML = noticeBlock() +
-        '<div class="runline">' + ICONS.bolt + 'Pågått i ' + duration(ses.startedAt) + '</div>' +
+        '<div class="runline">' + ICONS.bolt + 'Pågått i <span id="vDur">' + duration(ses.startedAt) + '</span></div>' +
         '<div class="stats">' +
-          '<div class="stat wide"><div class="l">Att betala hittills</div><div><span class="v">' + kr(ses.costSek) + '</span><span class="u">kr</span></div></div>' +
-          '<div class="stat"><div class="l">Laddat</div><div><span class="v">' + num(ses.energyKwh) + '</span><span class="u">kWh</span></div></div>' +
-          '<div class="stat"><div class="l">Effekt</div><div><span class="v">' + num(ses.powerKw) + '</span><span class="u">kW</span></div></div>' +
+          '<div class="stat wide"><div class="l">Att betala hittills</div><div><span class="v" id="vKr">' + kr(ses.costSek) + '</span><span class="u">kr</span></div></div>' +
+          '<div class="stat"><div class="l">Laddat</div><div><span class="v" id="vKwh">' + num(ses.energyKwh, 2) + '</span><span class="u">kWh</span></div></div>' +
+          '<div class="stat"><div class="l">Effekt</div><div><span class="v" id="vKw">' + num(ses.powerKw) + '</span><span class="u">kW</span></div></div>' +
         '</div>' +
         (s.price ? '<details><summary>Vad kostar det just nu?</summary><div class="dbody">' +
           '<div class="drow"><span>Priset denna kvart</span><span>' + kr(s.price.totalSek) + ' kr/kWh</span></div>' +
@@ -2196,7 +2239,12 @@ button.btn + button.btn{margin-top:10px}
       .then(function (r) { return r.json(); })
       .then(function (data) {
         state = data;
-        if (data.session) { receipt = null; render(); return; }
+        receivedAt = Date.now();
+        // Hur gammal var avläsningen redan när servern svarade?
+        lagMs = (data.readAt && data.serverTime)
+          ? Math.max(0, Date.parse(data.serverTime) - Date.parse(data.readAt))
+          : 0;
+        if (data.session) { receipt = null; render(); tickSmooth(); return; }
         return checkReceipt().then(render);
       })
       .catch(function () {
@@ -2230,6 +2278,37 @@ button.btn + button.btn{margin-top:10px}
         }
       })
       .catch(function () { receipt = null; });
+  }
+
+  /**
+   * Raknar vidare mellan avlasningarna sa siffrorna tickar jamnt.
+   *
+   * Laddboxen lases av var tionde sekund nar nagon tittar. Utan detta skulle
+   * beloppet sta stilla och sedan hoppa — vilket bade ser trasigt ut och far
+   * folk att undra om matningen fungerar. Vi vet effekten, sa energin daremellan
+   * gar att rakna fram.
+   *
+   * Det har ar enbart for ogat. Det som debiteras ar alltid de riktiga
+   * matvardena fran laddboxen; den har uppskattningen nar aldrig kvittot.
+   */
+  function tickSmooth() {
+    if (!state || state.view !== 'charging' || !state.session) return;
+    var ses = state.session;
+    var kwEl = document.getElementById('vKw');
+    if (!kwEl) return;
+
+    var sinceMeasureMs = lagMs + (Date.now() - receivedAt);
+    var extraKwh = (Number(ses.powerKw) || 0) * (sinceMeasureMs / 3600000);
+    var estKwh = Number(ses.energyKwh) + extraKwh;
+    var estKr = Number(ses.costSek) + (state.price ? extraKwh * state.price.totalSek : 0);
+
+    var krEl = document.getElementById('vKr');
+    var kwhEl = document.getElementById('vKwh');
+    var durEl = document.getElementById('vDur');
+    if (krEl) krEl.textContent = kr(estKr);
+    if (kwhEl) kwhEl.textContent = num(estKwh, 2);
+    kwEl.textContent = num(ses.powerKw);
+    if (durEl) durEl.textContent = duration(ses.startedAt);
   }
 
   function receiptBanner() {
@@ -2285,6 +2364,7 @@ button.btn + button.btn{margin-top:10px}
 
   poll();
   setInterval(poll, 5000);
+  setInterval(tickSmooth, 250);
 })();
 </script>
 </body>
@@ -2458,6 +2538,9 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     h += hc(chargerOk?'ok':'bad','Laddbox', chargerOk
         ? esc(modeLabel) + ' &middot; lage ' + s.opMode + ' &middot; ' + esc(D.opModeText)
         : esc(modeLabel) + ' &middot; ' + esc(s.error || 'Ingen kontakt'));
+    if (D.cadence) {
+      h += hc('ok', 'Avlasningstakt', 'Var ' + (D.cadence.ms/1000) + ':e sekund &middot; ' + esc(D.cadence.label));
+    }
     if (D.easee) {
       var e = D.easee;
       var tokState = !e.hasToken ? 'bad' : (e.tokenMinutesLeft < 60 ? 'warn' : 'ok');
@@ -2739,7 +2822,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -2797,6 +2880,7 @@ guest.get('/', (req, res) => {
 });
 
 guest.get('/api/status', (req, res) => {
+  loop.noteGuestPoll();
   const snap = loop.getSnapshot();
   const active = sessions.getActive();
   const price = prices.currentPrice();
@@ -2827,12 +2911,19 @@ guest.get('/api/status', (req, res) => {
     busySince,
     price,
     mode,
+    // Underlag för att räkna vidare mellan avläsningarna, så siffrorna tickar
+    // jämnt i stället för att hoppa var tionde sekund. Det som visas mellan två
+    // avläsningar är en uppskattning; det som debiteras är alltid de riktiga
+    // mätvärdena.
+    readAt: snap.readAt,
+    serverTime: new Date().toISOString(),
     simulated: Boolean(snap.simulated),
     locationName: config.ha().location_name,
   });
 });
 
 guest.post('/api/start', async (req, res, ctx) => {
+  loop.noteGuestPoll();
   // Spärren sätts först av allt, före varje await
   if (startInFlight) {
     return sendJson(res, 409, { error: 'En laddning håller på att startas. Försök igen om en stund.' });
@@ -2891,6 +2982,7 @@ guest.post('/api/start', async (req, res, ctx) => {
 });
 
 guest.post('/api/stop', async (req, res, ctx) => {
+  loop.noteGuestPoll();
   const active = sessions.getActive();
   if (!active) return sendJson(res, 409, { error: 'Ingen laddning pågår.' });
 
@@ -2938,6 +3030,7 @@ admin.get('/api/admin/state', (req, res) => {
 
     snapshot: snap,
     mode: config.ha().mode,
+    cadence: loop.cadence(),
     easee: charger.stats ? charger.stats() : null,
     opModeText: OP_MODE[snap.opMode] || 'okänt',
     cable: loop.getCableState(),
