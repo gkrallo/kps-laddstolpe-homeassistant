@@ -1,5 +1,74 @@
 # Ändringslogg
 
+## 0.5.1
+
+Sex fel i kontakten med laddboxen. Tillsammans förklarar de varför det kunde ta
+minuter innan skärmen märkte att kabeln satts i, och varför gästsidan kunde stå
+kvar på *"Ingen kontakt med laddstolpen"* medan diagnostiken redan visade
+kabeln som ansluten.
+
+**Den som står vid stolpen räknas nu som tittare.** Villkoret "någon tittar på
+sidan" prövades bara inuti "pågår en laddning?". Alltså gällde den snabba
+takten aldrig *innan* laddningen startat — precis i det ögonblick gästen satt i
+kabeln och väntade på att skärmen skulle ändra sig. Då gällde vilolägets fem
+minuter. Nu prövas det först.
+
+**Och en påbörjad väntan kan avbrytas.** Att gästen öppnade sidan noterades,
+men den femminutersväntan som redan var igång löpte klart ändå. Nu kortas den:
+är avläsningen äldre än tio sekunder görs en ny nästan direkt. Bara övergången
+från "ingen tittade" till "någon tittar" väcker loopen, så en sida som pollar
+var femte sekund kan inte framkalla mer än en extra avläsning per minut.
+
+**Ett enda uteblivet svar släcker inte längre gästsidan.** Förut räckte ett
+misslyckat anrop för att sidan skulle säga att kontakten var borta, och det satt
+kvar tills en avläsning lyckades — i viloläge minst fem minuter bort. Nu visas
+det vi senast visste, med åldern utskriven: *"Uppgifterna är avlästa för 40
+sekunder sedan."* Larmet kommer först när uppgifterna både hunnit bli gamla och
+flera försök i rad misslyckats.
+
+Adminfliken och gästsidan gör numera samma bedömning. Förut läste de olika fält
+ur samma ögonblicksbild — gästen tittade på om senaste anropet lyckats,
+diagnostiken rakt på värdena — och kunde därför säga emot varandra. Raden
+*Läst* har blivit *Värdena avlästa* och *Senaste försök*, som är två skilda
+saker, plus takten just nu.
+
+**Väntetiden efter fel är inte längre densamma för allt.** Att Easee svarar 429
+betyder "sluta fråga" och ger fortfarande upp till en halvtimme. Att molnet
+svarar 502, eller inte hinner svara alls, betyder bara "inte just nu" — taket
+för det är två minuter. Förut delade de på halvtimmen, vilket stängde av just
+den avläsning som skulle ha visat att felet gått över. Tidsgränsen för ett svar
+höjs samtidigt från 15 till 25 sekunder; din box har behövt 17 bara på att
+återuppta en laddning, och ett svar på artonde sekunden är inte ett haveri.
+
+**Går avläsningen inte fram vid start används den senaste i stället**, om den är
+färskare än halvannan minut. Förut kunde gästen inte starta alls förrän Easee
+svarade igen. Startsekvensen kontrollerar ändå efteråt att laddningen kom igång.
+
+**"Ingen kontakt" betyder två olika saker, och sägs nu på två olika sätt.** Att
+appen inte når laddboxen, och att telefonen inte når appen, fick samma skärm och
+samma text. Den andra säger nu *"Telefonen når inte appen"* och att laddningen
+inte påverkas. Ett fel i kvittouppslaget kunde dessutom visa "ingen kontakt med
+laddstolpen" trots att statusanropet gått bra; det har egen felhantering nu.
+
+**Energin räknas även när elbörsen är tyst.** Villkoret för att skriva fram
+mätvärdet krävde att ett pris fanns. Saknades prisdata stod räknaren stilla,
+trots att loggraden lovade motsatsen — och när priserna kom tillbaka
+debiterades hela mellanrummet till priset i det ögonblicket i stället för till
+priserna som gällde när strömmen faktiskt gick. Nu skrivs mätvärdet alltid
+fram, och energi som inte kan prissättas sparas **med tidpunkt** och prissätts i
+efterhand mot sin egen kvart. Kostnaden blir densamma som om priserna aldrig
+varit borta.
+
+Slår bara till när appen saknar prisdata helt — vanligast strax efter en
+nyinstallation, innan första hämtningen lyckats. Går det ändå inte att
+prissätta står mängden kvar på kvittot som *inte prissatt*, och summan säger
+inte emot sig själv.
+
+**Med `debug` påslaget blir loggen en tidslinje.** Vald takt inför varje varv,
+avläsningar som tog mer än fem sekunder, och en rad varje gång boxen faktiskt
+ändrar sig. Syns ingen rad när kabeln sätts i har boxen inte berättat det — och
+då är det inte appen som sover.
+
 ## 0.5.0 — fas 5
 
 SMS, verifiering, Swish och kvittosidan.
