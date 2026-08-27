@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.3.1 — fas 3: skarp Easee, endast avläsning.**
+**Version 0.3.2 — fas 3: skarp Easee, endast avläsning.**
 Nu kan tillägget läsa av din riktiga laddbox. Inga kommandon skickas till den —
 det kommer i fas 4.
 
