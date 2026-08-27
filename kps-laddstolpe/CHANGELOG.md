@@ -1,5 +1,47 @@
 # Ändringslogg
 
+## 0.5.0 — fas 5
+
+SMS, verifiering, Swish och kvittosidan.
+
+**Mobilnumret är ett bevis igen.** Gästen får en fyrsiffrig kod via SMS, plus en
+länk som startar laddningen direkt. Länken är bunden till **kabelns löpnummer**,
+inte bara till tiden: har kabeln kopplats ur och i igen sedan koden begärdes
+händer ingenting. Annars skulle en länk som trycks hemma i soffan kunna starta
+laddning på någon annans bil, på fel persons räkning.
+
+**Fyra SMS-lägen**, och läget läses **enbart** ur serverns konfiguration. Den
+gamla appen tog emot det från webbläsaren, så en klient kunde tvinga fram
+skarpa utskick trots att simulering var påslaget.
+
+| Läge | Skickar | Kostar |
+|---|---|---|
+| Simulerat | Nej — kod och länk finns i loggen | 0 kr |
+| Torrkörning | Nej, men anropar 46elks med `dryrun` | 0 kr |
+| Bara mina nummer | Skarpt till vitlistan, simulerat till övriga | Bara dina |
+| Skarpt | Ja | Ja |
+
+**Taken gäller i alla lägen, även simulerat.** Ett tak som bara finns i skarpt
+läge är ett tak ingen provat. Tak per dygn, per nummer och timme, och per plats
+och timme — det sista är kostnadsskyddet nu när gästsidan är publik.
+
+**Teckenräknaren** visar antal delar och varnar för tecken utanför GSM-7. Ett
+typografiskt apostrof sänker gränsen från 160 tecken till 70 och tredubblar
+kostnaden. Båda mallarna ligger på en del.
+
+**QR-koden genereras i tillägget.** Den gamla appen lät quickchart.io rita den,
+vilket innebar att ditt Swish-nummer och exakta belopp skickades till en
+främmande webbtjänst varje gång ett kvitto öppnades — och att koden uteblev om
+tjänsten låg nere. Nu lämnar ingenting din Pi.
+
+**Kvittosidan** på `/k/<slumpad nyckel>`. Ingen utgångstid, frikopplad från vad
+stolpen gör just nu, och den visar Swish-nummer och belopp i klartext som
+reserv. En `swish://`-länk gör ingenting alls på en dator eller i en mobil utan
+Swish, och misslyckas dessutom tyst.
+
+**"Jag har betalat"** är ett eget tillstånd, skilt från att du bekräftat
+betalningen. Appen låtsas inte veta något den inte vet.
+
 ## 0.4.3
 
 **Avsluta-knappen sa "Avslutar…" medan laddningen startade.** Gästsidan hade en
