@@ -1,5 +1,37 @@
 # Ändringslogg
 
+## 0.4.2
+
+**Startsekvensen saknades.** Stolpen står avstängd när den inte används — det är
+låset som hindrar någon från att bara koppla in sig och ladda gratis. Ett
+`start_charging` mot en avstängd laddare kvitteras av Easee utan att något
+händer, och boxen svarar med orsakskod 53, *"Laddaren är avstängd"*. Appen
+skickade bara startkommandot och undrade varför bilen stod still.
+
+Nu är start en ordning i stället för ett kommando: **slå på laddaren, starta,
+och om boxen står och väntar — återuppta.** Bara de steg som behövs, vart och
+ett verifierat.
+
+**Och låset sätts tillbaka.** När en laddning avslutas stängs laddaren av igen,
+så nästa person måste gå via appen. Brytare i adminfliken under *Låset på
+stolpen*, påslagen som standard.
+
+**Manuellt lås.** Knapparna *Lås stolpen* och *Lås upp stolpen* i Laddbox-fliken.
+
+**Diagnostiken visar om stolpen är avstängd**, och simuleringsläget har en knapp
+för att stänga av den — så hela startsekvensen går att öva på utan bil.
+
+## 0.4.1
+
+**Adminfliken startade inte i 0.4.0.** Bekräftelserutans radbrytning tolkades en
+gång för tidigt: sidan byggs av en textmall, så `\n` blev en verklig radbrytning
+mitt i en sträng i webbläsaren i stället för att nå fram som ett tecken. Hela
+sidans skript stannade på första raden.
+
+Felet syntes inte i mina kontroller, eftersom `node --check` bara granskar
+`app.js` och aldrig den JavaScript som bakas in i sidorna. Kontrollen omfattar
+nu båda.
+
 ## 0.4.0 — fas 4
 
 Kommandon mot laddboxen. Läget `skarp` gör appen till något som styr hårdvara,
