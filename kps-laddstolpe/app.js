@@ -2323,7 +2323,10 @@ button.btn + button.btn{margin-top:10px}
   };
 
   var state = null;
-  var busyAction = false;
+  // Vad som pagar just nu: null, 'start' eller 'stop'. Var tidigare en enkel
+  // ja/nej-flagga, vilket gjorde att avsluta-knappen sa "Avslutar..." medan
+  // laddningen fortfarande holl pa att starta.
+  var busyAction = null;
   var notice = null;
   var lastKey = '';
   var receipt = null;
@@ -2388,7 +2391,8 @@ button.btn + button.btn{margin-top:10px}
     // fyra gånger i sekunden; ritas hela vyn om i samma takt blinkar den och
     // hopfällbara avsnitt slår igen medan man läser dem.
     var key = [s.view, s.session && s.session.number, s.price && s.price.totalSek,
-               notice && notice.text, busyAction, receipt && receipt.number].join('|');
+               notice && notice.text, busyAction, s.starting,
+               receipt && receipt.number].join('|');
 
     // Rör inte DOM:en om inget ändrats — annars tappar man markören i textfältet
     var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
@@ -2419,7 +2423,7 @@ button.btn + button.btn{margin-top:10px}
         '<div class="field"><label for="tel">Ditt mobilnummer</label>' +
         '<input id="tel" type="tel" inputmode="numeric" autocomplete="tel" placeholder="070 123 45 67"></div>' +
         '<button class="btn" id="startBtn"' + (busyAction ? ' disabled' : '') + '>' +
-        (busyAction ? 'Startar…' : 'Starta laddning') + '</button>' +
+        (busyAction === 'start' ? 'Startar…' : 'Starta laddning') + '</button>' +
         priceBlock(s.price, true);
 
       var btn = document.getElementById('startBtn');
@@ -2427,9 +2431,12 @@ button.btn + button.btn{margin-top:10px}
 
     } else if (s.view === 'charging') {
       var ses = s.session || {};
+      var starting = s.starting || busyAction === 'start';
       el.icon.style.display = 'none';
-      el.title.textContent = 'Laddar';
-      el.lead.textContent = 'Du kan låsa mobilen och gå. Laddningen mäts vidare.';
+      el.title.textContent = starting ? 'Startar laddningen' : 'Laddar';
+      el.lead.textContent = starting
+        ? 'Laddstolpen svarar. Det kan ta en halv minut innan bilen börjar dra ström.'
+        : 'Du kan låsa mobilen och gå. Laddningen mäts vidare.';
       el.slot.innerHTML = noticeBlock() +
         '<div class="runline">' + ICONS.bolt + 'Pågått i <span id="vDur">' + duration(ses.startedAt) + '</span></div>' +
         '<div class="stats">' +
@@ -2441,8 +2448,8 @@ button.btn + button.btn{margin-top:10px}
           '<div class="drow"><span>Priset denna kvart</span><span>' + kr(s.price.totalSek) + ' kr/kWh</span></div>' +
           '<div class="drow"><span>Varav elbörsen</span><span>' + kr(s.price.spotSek) + ' kr</span></div>' +
           '</div></details>' : '') +
-        '<button class="btn stop" id="stopBtn" style="margin-top:14px"' + (busyAction ? ' disabled' : '') + '>' +
-        (busyAction ? 'Avslutar…' : 'Avsluta laddning') + '</button>';
+        '<button class="btn stop" id="stopBtn" style="margin-top:14px"' + (busyAction || starting ? ' disabled' : '') + '>' +
+        (busyAction === 'stop' ? 'Avslutar…' : (starting ? 'Väntar på laddboxen…' : 'Avsluta laddning')) + '</button>';
 
       var sb = document.getElementById('stopBtn');
       if (sb) sb.addEventListener('click', doStop);
@@ -2511,6 +2518,7 @@ button.btn + button.btn{margin-top:10px}
       .then(function (r) { return r.json(); })
       .then(function (data) {
         state = data;
+        if (data.startError) notice = { kind: 'err', text: data.startError };
         receivedAt = Date.now();
         // Hur gammal var avläsningen redan när servern svarade?
         lagMs = (data.readAt && data.serverTime)
@@ -2595,7 +2603,7 @@ button.btn + button.btn{margin-top:10px}
     var phone = input ? input.value.trim() : '';
     if (!phone) { setNotice('err', 'Skriv ditt mobilnummer först.'); return; }
 
-    busyAction = true; setNotice(null, null);
+    busyAction = 'start'; setNotice(null, null);
     fetch('api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2603,26 +2611,26 @@ button.btn + button.btn{margin-top:10px}
     })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
-        busyAction = false;
+        busyAction = null;
         if (!res.ok) { setNotice('err', res.body.error || 'Laddningen kunde inte startas.'); return; }
         if (res.body.session && res.body.session.receiptKey) {
           remember({ key: res.body.session.receiptKey, dismissed: false });
         }
         poll();
       })
-      .catch(function () { busyAction = false; setNotice('err', 'Ingen kontakt med servern.'); });
+      .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
   }
 
   function doStop() {
-    busyAction = true; setNotice(null, null);
+    busyAction = 'stop'; setNotice(null, null);
     fetch('api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
-        busyAction = false;
+        busyAction = null;
         if (!res.ok) { setNotice('err', res.body.error || 'Laddningen kunde inte avslutas.'); return; }
         poll();
       })
-      .catch(function () { busyAction = false; setNotice('err', 'Ingen kontakt med servern.'); });
+      .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
   }
 
   el.slot.addEventListener('click', function (e) {
@@ -3204,7 +3212,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.4.2';
+const VERSION = '0.4.3';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -3219,6 +3227,18 @@ let charger = null;
  * före första await, inte efter.
  */
 let startInFlight = false;
+
+/**
+ * Startsekvensen kan ta uppemot en minut. Din box behövde 17 sekunder bara på
+ * återupptagningen, och tre kommandon med verifiering däremellan blir lätt
+ * längre än så.
+ *
+ * Att hålla gästens förfrågan öppen så länge är fel på två sätt: mobilen kan ge
+ * upp av sig själv, och under tiden vet appen inte vad den ska visa. Därför
+ * svarar servern direkt när sessionen är skapad och kör sekvensen vidare i
+ * bakgrunden. Gästsidan frågar ändå var femte sekund.
+ */
+let startState = { running: false, error: null, since: 0 };
 
 /* ------------------------------------------------------------------ */
 /* Hjälpare                                                            */
@@ -3432,6 +3452,8 @@ guest.get('/api/status', (req, res) => {
     // jämnt i stället för att hoppa var tionde sekund. Det som visas mellan två
     // avläsningar är en uppskattning; det som debiteras är alltid de riktiga
     // mätvärdena.
+    starting: startState.running,
+    startError: !active && startState.error ? startState.error : null,
     readAt: snap.readAt,
     serverTime: new Date().toISOString(),
     simulated: Boolean(snap.simulated),
@@ -3442,7 +3464,7 @@ guest.get('/api/status', (req, res) => {
 guest.post('/api/start', async (req, res, ctx) => {
   loop.noteGuestPoll();
   // Spärren sätts först av allt, före varje await
-  if (startInFlight) {
+  if (startInFlight || startState.running) {
     return sendJson(res, 409, { error: 'En laddning håller på att startas. Försök igen om en stund.' });
   }
   if (sessions.getActive()) {
@@ -3482,29 +3504,44 @@ guest.post('/api/start', async (req, res, ctx) => {
     });
     if (!started.ok) return sendJson(res, 409, { error: started.error });
 
-    const cmd = await startChargingSequence();
-
-    if (!cmd.ok) {
-      // Kommandot gick inte fram alls. Låtsas aldrig att en laddning startat.
-      sessions.finish('start misslyckades');
-      return sendJson(res, 502, { error: `Laddningen kunde inte startas: ${cmd.error}` });
-    }
-
-    // Kommandot togs emot men bilen har inte börjat dra ström än. Det är
-    // normalt — vissa bilar tar en minut på sig. Sessionen behålls: energin
-    // räknas från faktiska mätvärden, så uteblir laddningen blir kostnaden noll
-    // och sessionen avslutas av sig själv efter tjugo minuter utan effekt.
-    if (cmd.verified === false) {
-      log.info(`Session #${started.session.number}: bilen har inte börjat ladda än.`);
-    }
-
-    await applyCableLock(true);
-
     log.info(`Gäst startade session #${started.session.number} från ${ctx.ip}.`);
-    await loop.tick();
+    startState = { running: true, error: null, since: Date.now() };
+
+    // Körs vidare utan att gästen får vänta. Medvetet inget await.
+    (async () => {
+      try {
+        const cmd = await startChargingSequence();
+
+        if (!cmd.ok) {
+          // Kommandot gick inte fram alls. Låtsas aldrig att en laddning startat.
+          log.error(`Session #${started.session.number} kunde inte startas: ${cmd.error}`);
+          startState.error = cmd.error || 'Laddningen kunde inte startas.';
+          sessions.finish('start misslyckades');
+          return;
+        }
+
+        // Kommandot togs emot men bilen har inte börjat dra ström än. Det är
+        // normalt — vissa bilar tar en stund. Sessionen behålls: energin räknas
+        // från faktiska mätvärden, så uteblir laddningen blir kostnaden noll och
+        // sessionen avslutas av sig själv efter tjugo minuter utan effekt.
+        if (cmd.verified === false) {
+          log.info(`Session #${started.session.number}: bilen har inte börjat ladda än.`);
+        }
+
+        await applyCableLock(true);
+        await loop.tick();
+      } catch (err) {
+        log.error(`Fel i startsekvensen: ${err.stack || err.message}`);
+        startState.error = 'Något gick fel när laddningen skulle startas.';
+        sessions.finish('start misslyckades');
+      } finally {
+        startState.running = false;
+      }
+    })();
+
     return sendJson(res, 200, {
       ok: true,
-      pending: cmd.verified === false,
+      starting: true,
       session: sessions.publicView(sessions.getActive()),
     });
   } finally {
