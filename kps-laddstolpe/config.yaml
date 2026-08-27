@@ -1,29 +1,34 @@
 name: KPs Laddstolpe
-version: "0.2.1"
+version: "0.3.0"
 slug: kps_laddstolpe
-description: Laddstolpe med spotprisdebitering. Fas 2 - backend i simuleringslage.
+description: Laddstolpe med spotprisdebitering. Fas 3 - skarp Easee, avlasning.
 url: https://github.com/gkrallo/kps-laddstolpe-homeassistant
 arch:
   - aarch64
   - amd64
 
+# Vi använder ingen s6-init, servern startas direkt
 init: false
 startup: application
 boot: auto
 
+# Gästsidan. Denna port vidarebefordras i routern.
 ports:
   "8443/tcp": 8443
 ports_description:
-  "8443/tcp": Publik gastsida - vidarebefordra denna port i routern
+  "8443/tcp": Publik gästsida - vidarebefordra denna port i routern
 
+# Adminfliken. Nås BARA inifrån Home Assistant, aldrig utifrån.
 ingress: true
 ingress_port: 8099
 panel_icon: mdi:ev-station
 panel_title: Laddstolpe
 panel_admin: true
 
+# Supervisor startar om tillägget om porten slutar svara
 watchdog: "tcp://[HOST]:[PORT:8443]"
 
+# Läsrätt till certifikaten som DuckDNS-tillägget skapar
 map:
   - ssl
 
@@ -33,7 +38,11 @@ options:
   keyfile: privkey.pem
   location_name: Gräshagen 4
   price_zone: SE3
-  simulation: true
+  mode: simulering
+  easee_username: ""
+  easee_password: ""
+  easee_charger_id: ""
+  easee_equalizer_id: ""
   log_level: info
 
 schema:
@@ -42,5 +51,9 @@ schema:
   keyfile: str
   location_name: str
   price_zone: list(SE1|SE2|SE3|SE4)
-  simulation: bool
+  mode: list(simulering|avlasning|skarp)
+  easee_username: str?
+  easee_password: password?
+  easee_charger_id: str?
+  easee_equalizer_id: str?
   log_level: list(debug|info|warning|error)
