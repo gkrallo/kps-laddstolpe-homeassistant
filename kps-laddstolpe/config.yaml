@@ -1,7 +1,7 @@
 name: KPs Laddstolpe
-version: "0.4.3"
+version: "0.5.0"
 slug: kps_laddstolpe
-description: Laddstolpe med spotprisdebitering. Fas 3 - skarp Easee, avlasning.
+description: Laddstolpe med spotprisdebitering, SMS-kvitto och Swish.
 url: https://github.com/gkrallo/kps-laddstolpe-homeassistant
 arch:
   - aarch64
@@ -43,6 +43,12 @@ options:
   easee_password: ""
   easee_charger_id: ""
   easee_equalizer_id: ""
+  sms_username: ""
+  sms_password: ""
+  sms_sender: KPsLadd
+  swish_number: ""
+  swish_name: ""
+  public_host: ""
   log_level: info
 
 schema:
@@ -56,4 +62,10 @@ schema:
   easee_password: password?
   easee_charger_id: str?
   easee_equalizer_id: str?
+  sms_username: str?
+  sms_password: password?
+  sms_sender: str?
+  swish_number: str?
+  swish_name: str?
+  public_host: str?
   log_level: list(debug|info|warning|error)
