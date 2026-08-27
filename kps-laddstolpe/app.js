@@ -669,11 +669,36 @@ const chargerModule = (function () {
  */
 
 const OP_MODE = {
+  0: 'Offline',
   1: 'Urkopplad',
-  2: 'Kabel ansluten, väntar',
+  2: 'Kabel ansluten, vantar',
   3: 'Laddar',
-  4: 'Färdig eller pausad',
+  4: 'Fardigladdad',
+  5: 'Fel',
+  6: 'Redo att ladda',
 };
+
+/**
+ * Sitter kabeln i?
+ *
+ * Specifikationen sa att Easee returnerar `isCableConnected`. Det gor den inte —
+ * atminstone inte for den har boxen och firmware 343. Faltet saknas helt i
+ * svaret, och min forsta version laste darfor alltid av "false" mitt under
+ * pagaende laddning. I avlasningslage var det bara en felaktig rad i
+ * diagnostiken. I skarpt lage hade bakgrundsloopen avslutat varje session efter
+ * en minut, eftersom "kabeln urkopplad tva avlasningar i rad" hade varit sant
+ * hela tiden.
+ *
+ * Driftlaget ar det tillforlitliga svaret. 0 betyder att boxen ar offline och
+ * sager ingenting om kabeln — da behaller vi det vi trodde forut hellre an att
+ * gissa fel.
+ */
+function cableFromState(d, previous) {
+  if (typeof d.isCableConnected === 'boolean') return d.isCableConnected;
+  const op = Number(d.chargerOpMode);
+  if (op === 0) return previous === undefined ? false : previous;
+  return op >= 2;
+}
 
 /* ------------------------------------------------------------------ */
 /* Simulerad laddbox                                                   */
@@ -776,7 +801,20 @@ class SimulatedCharger {
       sessionEnergyKwh: round(this.sessionEnergyKwh, 3),
       lifetimeEnergyKwh: round(this.lifetimeEnergyKwh, 2),
       locked: this.locked,
+      lockedPermanently: false,
       maxCurrent: this.maxCurrent,
+      allocatedCurrent: this.throttled ? 0 : this.maxCurrent,
+      phaseCurrents: { l1: null, l2: null, l3: null, n: null },
+      eqAvailable: { l1: null, l2: null, l3: null },
+      voltage: null,
+      deratingActive: this.throttled,
+      reasonForNoCurrent: null,
+      errorCode: 0,
+      online: true,
+      cloud: true,
+      wifiRssi: null,
+      firmware: null,
+      latestPulse: new Date().toISOString(),
       simulated: true,
     };
   }
@@ -1083,19 +1121,46 @@ class EaseeCharger {
     if (!res.ok) return { ok: false, error: res.error };
 
     const d = res.data || {};
+    const cable = cableFromState(d, this._lastCable);
+    this._lastCable = cable;
+
     return {
       ok: true,
-      cableConnected: d.cableLocked !== undefined || d.isCableConnected !== undefined
-        ? Boolean(d.isCableConnected)
-        : Number(d.chargerOpMode) > 1,
+      cableConnected: cable,
       opMode: Number(d.chargerOpMode) || 0,
       powerKw: Number(d.totalPower) || 0,
       sessionEnergyKwh: Number(d.sessionEnergy) || 0,
       lifetimeEnergyKwh: Number(d.lifetimeEnergy) || 0,
-      locked: Boolean(d.isCableLocked),
-      maxCurrent: Number(d.dynamicChargerCurrent) || Number(d.outputCurrent) || 0,
+      locked: Boolean(d.cableLocked),
+      lockedPermanently: Boolean(d.lockCablePermanently),
+
+      // Vad boxen FAR dra kontra vad den faktiskt tilldelats just nu.
+      // Skillnaden mellan de tva ar lastbalanseringen i en enda siffra.
+      maxCurrent: Number(d.dynamicChargerCurrent) || 0,
+      allocatedCurrent: Number(d.outputCurrent) || 0,
+
+      phaseCurrents: {
+        l1: numOrNull(d.circuitTotalPhaseConductorCurrentL1),
+        l2: numOrNull(d.circuitTotalPhaseConductorCurrentL2),
+        l3: numOrNull(d.circuitTotalPhaseConductorCurrentL3),
+        n: numOrNull(d.inCurrentT2),
+      },
+      eqAvailable: {
+        l1: numOrNull(d.eqAvailableCurrentP1),
+        l2: numOrNull(d.eqAvailableCurrentP2),
+        l3: numOrNull(d.eqAvailableCurrentP3),
+      },
+      voltage: numOrNull(d.voltage),
+      deratingActive: Boolean(d.deratingActive),
+      reasonForNoCurrent: numOrNull(d.reasonForNoCurrent),
+      errorCode: numOrNull(d.errorCode),
+      online: d.isOnline !== undefined ? Boolean(d.isOnline) : null,
+      cloud: d.connectedToCloud !== undefined ? Boolean(d.connectedToCloud) : null,
+      wifiRssi: numOrNull(d.wiFiRSSI),
+      firmware: numOrNull(d.chargerFirmware),
+      latestPulse: d.latestPulse || null,
+
       simulated: false,
-      raw: d,
     };
   }
 
@@ -1177,6 +1242,13 @@ function round(n, d) {
  *   avlasning   riktig Easee, men enbart läsning. Inga kommandon skickas.
  *   skarp       riktig Easee med kommandon
  */
+/** Skiljer ett verkligt nollvarde fran ett falt som saknas. */
+function numOrNull(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function create(mode, opts) {
   if (mode === 'simulering') return new SimulatedCharger();
   return new EaseeCharger({ ...opts, readOnly: mode === 'avlasning' });
@@ -1554,7 +1626,11 @@ function trackCable(state) {
 }
 
 async function handleDisconnect(state) {
-  // Enbart faktisk urkoppling räknas. Driftläge 2 gör det inte.
+  // Enbart faktisk urkoppling raknas. Driftlage 2 gor det inte — det betyder
+  // "kabel ansluten, vantar". Driftlage 0 betyder att boxen tappat kontakten
+  // med molnet och sager ingenting alls om kabeln; att avsluta en laddning pa
+  // den grunden vore att straffa gasten for ett natverksglapp.
+  if (state.opMode === 0) { disconnectStrikes = 0; return false; }
   const looksDisconnected = state.cableConnected === false || state.opMode === 1;
 
   if (!looksDisconnected) { disconnectStrikes = 0; return false; }
@@ -2677,16 +2753,48 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
   /* ---------------- Diagnostik ---------------- */
   function diagPanel() {
     var s = D.snapshot;
-    var h = msgHtml() + '<div class="h">Levande värden</div><div class="tw"><table><tbody>'
-      + dr('cableConnected', String(s.cableConnected))
-      + dr('opMode', s.opMode + ' · ' + esc(D.opModeText))
-      + dr('powerKw', n1(s.powerKw) + ' kW')
-      + dr('sessionEnergyKwh', n1(s.sessionEnergyKwh) + ' kWh')
-      + dr('Kabelns löpnummer', '#' + (D.cable.episode||0))
-      + dr('Läst', ts(s.readAt))
-      + dr('Boxens temperatur', '<span style="color:var(--mut)">— läses inte</span>')
+    function v(x, unit, dec) {
+      if (x === null || x === undefined) return '<span style="color:var(--mut)">—</span>';
+      return (dec === 0 ? String(x) : Number(x).toFixed(dec === undefined ? 1 : dec).replace('.', ',')) + (unit ? ' ' + unit : '');
+    }
+    var pc = s.phaseCurrents || {}, eq = s.eqAvailable || {};
+
+    var h = msgHtml() + '<div class="h">Laddning just nu</div><div class="tw"><table><tbody>'
+      + dr('Driftlage', s.opMode + ' &middot; ' + esc(D.opModeText))
+      + dr('Kabel ansluten', s.cableConnected ? 'ja' : 'nej')
+      + dr('Kabellas', s.locked ? (s.lockedPermanently ? 'last, permanent last i boxen' : 'last') : 'olast')
+      + dr('Effekt', v(s.powerKw, 'kW', 2))
+      + dr('Sessionsenergi', v(s.sessionEnergyKwh, 'kWh', 2))
+      + dr('Livstidsenergi', v(s.lifetimeEnergyKwh, 'kWh', 2))
+      + dr('Spanning', v(s.voltage, 'V', 1))
+      + dr('Kabelns lopnummer', '#' + (D.cable.episode||0))
+      + dr('Last', ts(s.readAt))
+      + '</tbody></table></div>';
+
+    h += '<div class="h">Lastbalansering</div><div class="tw"><table><tbody>'
+      + dr('Boxen far dra', v(s.maxCurrent, 'A', 0))
+      + dr('Tilldelat just nu', v(s.allocatedCurrent, 'A', 0))
+      + dr('Strom L1 / L2 / L3', v(pc.l1,'',2) + ' / ' + v(pc.l2,'',2) + ' / ' + v(pc.l3,'',2) + ' A')
+      + dr('Strom nolledare', v(pc.n, 'A', 2))
+      + dr('Equalizern tillater', v(eq.l1,'',0) + ' / ' + v(eq.l2,'',0) + ' / ' + v(eq.l3,'',0) + ' A')
+      + dr('Nedreglering aktiv', s.deratingActive ? 'ja' : 'nej')
+      + dr('Orsak till utebliven strom', s.reasonForNoCurrent === null || s.reasonForNoCurrent === undefined
+            ? '<span style="color:var(--mut)">—</span>'
+            : 'kod ' + s.reasonForNoCurrent)
       + '</tbody></table></div>'
-      + '<p class="note">Sista raden är avsiktlig. Den gamla appen visade 28,4 °C — en hårdkodad siffra. En diagnostikvy som visar påhittade värden är sämre än ingen alls.</p>';
+      + '<p class="note">Skillnaden mellan <em>far dra</em> och <em>tilldelat just nu</em> ar lastbalanseringen i en enda siffra. '
+      + 'Ar en fasstrom nara noll laddar bilen pa tva faser, och da bar nolledaren returstrommen — darfor kan den ligga hogt aven nar en fas ar tyst.</p>';
+
+    h += '<div class="h">Boxens halsa</div><div class="tw"><table><tbody>'
+      + dr('Online', s.online === null || s.online === undefined ? '<span style="color:var(--mut)">—</span>' : (s.online ? 'ja' : 'nej'))
+      + dr('Ansluten till molnet', s.cloud === null || s.cloud === undefined ? '<span style="color:var(--mut)">—</span>' : (s.cloud ? 'ja' : 'nej'))
+      + dr('Wi-Fi', v(s.wifiRssi, 'dBm', 0))
+      + dr('Firmware', v(s.firmware, '', 0))
+      + dr('Felkod', s.errorCode === null || s.errorCode === undefined ? '<span style="color:var(--mut)">—</span>' : String(s.errorCode))
+      + dr('Senaste pulsslag', ts(s.latestPulse))
+      + '</tbody></table></div>'
+      + '<p class="note">Alla rader kommer fran ett faktiskt svar. Fanns inget varde star det streck. '
+      + 'Den gamla appen visade 28,4 grader som boxtemperatur — en hardkodad siffra. Easee rapporterar ingen temperatur alls, sa raden finns inte langre.</p>';
 
     h += '<div class="h">Systemet</div><div class="card">'
       + row('Version', esc(D.version))
@@ -2822,7 +2930,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
