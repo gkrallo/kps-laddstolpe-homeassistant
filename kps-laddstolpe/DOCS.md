@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.3.2 — fas 3: skarp Easee, endast avläsning.**
+**Version 0.3.3 — fas 3: skarp Easee, endast avläsning.**
 Nu kan tillägget läsa av din riktiga laddbox. Inga kommandon skickas till den —
 det kommer i fas 4.
 
@@ -73,6 +73,23 @@ Stiger inloggningarna med tiden är något fel, och då ska vi stanna och rätta
 innan vi går vidare. Den gamla molnappen loggade in **2 880 gånger per
 laddningsdygn** — det är precis så man blir IP-spärrad hos Easee, och en spärrad
 IP betyder att stolpen slutar svara helt.
+
+## Att läsa lastbalanseringen
+
+Adminfliken → **Diagnostik** → *Lastbalansering* visar det som faktiskt styr hur
+snabbt bilen laddar:
+
+| Rad | Betyder |
+|---|---|
+| Boxen får dra | Vad laddboxen är konfigurerad för |
+| Tilldelat just nu | Vad den faktiskt får ta ut i det här ögonblicket |
+| Ström L1 / L2 / L3 | Per fas. Ligger en fas nära noll laddar bilen på två faser |
+| Ström nolledare | Bär returströmmen vid tvåfasladdning, och kan därför ligga högt även när en fas är tyst |
+| Equalizern tillåter | Vad lastbalanseraren släpper fram, per fas |
+| Strömbegränsning | Easees egen förklaring, i klartext |
+
+Skillnaden mellan *får dra* och *tilldelat just nu* är lastbalanseringen i en
+enda siffra.
 
 ## Om du vill se rådata
 
