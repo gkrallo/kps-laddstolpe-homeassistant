@@ -1820,12 +1820,20 @@ function setPayment(id, state) {
   return { ok: true, session: s };
 }
 
-/** Publik vy — allt som gästsidan får se. Aldrig telefonnummer. */
-function publicView(s) {
+/**
+ * Publik vy — allt som gästsidan får se. Aldrig telefonnummer.
+ *
+ * Och sedan 0.6.1 inte heller kvittonyckeln, om den inte uttryckligen begärs.
+ * Nyckeln är en bärarnyckel: den som har den kommer åt betalsidan, kan markera
+ * laddningen som betald, och ser numrets övriga laddningar. Att skicka med den
+ * i statussvaret innebar att vem som helst som öppnade gästsidan under en
+ * pågående laddning fick den — utan att göra något alls.
+ */
+function publicView(s, { includeKey = false } = {}) {
   if (!s) return null;
   return {
     number: s.number,
-    receiptKey: s.receiptKey,
+    ...(includeKey ? { receiptKey: s.receiptKey } : {}),
     status: s.status,
     startedAt: s.startedAt,
     endedAt: s.endedAt,
@@ -2931,7 +2939,7 @@ button.btn + button.btn{margin-top:10px}
     var key = [s.view, s.session && s.session.number, s.price && s.price.totalSek,
                notice && notice.text, busyAction, s.starting,
                s.contact, s.contact === 'ok' ? 0 : Math.round((s.ageSeconds || 0) / 15),
-               receipt && receipt.number].join('|');
+               s.mine, receipt && receipt.number].join('|');
 
     // Rör inte DOM:en om inget ändrats — annars tappar man markören i textfältet
     var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
@@ -3009,15 +3017,25 @@ button.btn + button.btn{margin-top:10px}
     } else if (s.view === 'charging') {
       var ses = s.session || {};
       var starting = s.starting || busyAction === 'start';
+      var min = !!s.mine;
       el.icon.style.display = 'none';
-      el.title.textContent = starting ? 'Startar laddningen' : 'Laddar';
-      el.lead.textContent = starting
-        ? 'Laddstolpen svarar. Det kan ta en halv minut innan bilen börjar dra ström.'
-        : 'Du kan låsa mobilen och gå. Laddningen mäts vidare.';
+      // Rubriken beror på VEM som tittar, inte bara på vad boxen gör. För den
+      // som inte äger laddningen är "Startar laddningen" missvisande — det
+      // låter som något hen själv satt igång.
+      el.title.textContent = min
+        ? (starting ? 'Startar laddningen' : 'Laddar')
+        : 'Stolpen används';
+      el.lead.textContent = min
+        ? (starting
+            ? 'Laddstolpen svarar. Det kan ta en halv minut innan bilen börjar dra ström.'
+            : 'Du kan låsa mobilen och gå. Laddningen mäts vidare.')
+        : (starting
+            ? 'Någon annan har just startat en laddning här.'
+            : 'Någon annan laddar just nu. Stolpen blir ledig när den bilen är klar och kabeln dras ur.');
       el.slot.innerHTML = noticeBlock() + staleBlock(s) +
         '<div class="runline">' + ICONS.bolt + 'Pågått i <span id="vDur">' + duration(ses.startedAt) + '</span></div>' +
         '<div class="stats">' +
-          '<div class="stat wide"><div class="l">Att betala hittills</div><div><span class="v" id="vKr">' + kr(ses.costSek) + '</span><span class="u">kr</span></div></div>' +
+          '<div class="stat wide"><div class="l">' + (min ? 'Att betala hittills' : 'Laddat för hittills') + '</div><div><span class="v" id="vKr">' + kr(ses.costSek) + '</span><span class="u">kr</span></div></div>' +
           '<div class="stat"><div class="l">Laddat</div><div><span class="v" id="vKwh">' + num(ses.energyKwh, 2) + '</span><span class="u">kWh</span></div></div>' +
           '<div class="stat"><div class="l">Effekt</div><div><span class="v" id="vKw">' + num(ses.powerKw) + '</span><span class="u">kW</span></div></div>' +
         '</div>' +
@@ -3025,8 +3043,13 @@ button.btn + button.btn{margin-top:10px}
           '<div class="drow"><span>Priset denna kvart</span><span>' + kr(s.price.totalSek) + ' kr/kWh</span></div>' +
           '<div class="drow"><span>Varav elbörsen</span><span>' + kr(s.price.spotSek) + ' kr</span></div>' +
           '</div></details>' : '') +
-        '<button class="btn stop" id="stopBtn" style="margin-top:14px"' + (busyAction || starting ? ' disabled' : '') + '>' +
-        (busyAction === 'stop' ? 'Avslutar…' : (starting ? 'Väntar på laddboxen…' : 'Avsluta laddning')) + '</button>';
+        // Bara den som startade laddningen får avsluta den. Knappen fanns för
+        // alla förut, och /api/stop frågade inte heller — vem som helst som
+        // öppnade adressen kunde alltså avbryta grannens laddning.
+        (min
+          ? '<button class="btn stop" id="stopBtn" style="margin-top:14px"' + (busyAction || starting ? ' disabled' : '') + '>' +
+            (busyAction === 'stop' ? 'Avslutar…' : (starting ? 'Väntar på laddboxen…' : 'Avsluta laddning')) + '</button>'
+          : '<p class="note" style="text-align:center;margin-top:16px;font-size:14px;color:#93A39B">Bara den som startade laddningen kan avsluta den.</p>');
 
       var sb = document.getElementById('stopBtn');
       if (sb) sb.addEventListener('click', doStop);
@@ -3036,7 +3059,7 @@ button.btn + button.btn{margin-top:10px}
          samtidigt: gästen som laddat vill veta att det är klart och vad det
          kostade, och den som kommer gående vill veta om stolpen blir ledig. */
       var f = s.session || {};
-      var mitt = !!(recall() && recall().key === f.receiptKey);
+      var mitt = !!s.mine;
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
       el.title.textContent = mitt ? 'Din bil är klar' : 'Bilen är klar';
       el.lead.textContent = mitt
@@ -3141,7 +3164,12 @@ button.btn + button.btn{margin-top:10px}
    * rapporterat som ett nätverksfel.
    */
   function poll() {
-    fetch('api/status', { cache: 'no-store' })
+    // Telefonen visar upp sin kvittonyckel. Stämmer den med den pågående
+    // laddningen svarar servern att laddningen är gästens egen och skickar med
+    // vägen till betalsidan. Utan nyckel: samma vy, men ingen betallänk.
+    var sparad = recall();
+    var q = sparad && sparad.key ? '?k=' + encodeURIComponent(sparad.key) : '';
+    fetch('api/status' + q, { cache: 'no-store' })
       .then(function (r) {
         if (!r.ok) throw new Error('Servern svarade ' + r.status);
         return r.json();
@@ -3321,7 +3349,12 @@ button.btn + button.btn{margin-top:10px}
 
   function doStop() {
     busyAction = 'stop'; setNotice(null, null);
-    fetch('api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    var sparad = recall();
+    fetch('api/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ k: sparad && sparad.key ? sparad.key : null })
+    })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
         busyAction = null;
@@ -3339,6 +3372,27 @@ button.btn + button.btn{margin-top:10px}
       lastKey = ''; poll();
     }
   });
+
+  /**
+   * Kom vi hit via länken i SMS:et? Då bär adressen laddningens kvittonyckel,
+   * och telefonen ska minnas den.
+   *
+   * Utan det här visste sidan bara om laddningen var "min" ifall just den här
+   * webblasaren tryckt på startknappen. Startade man via SMS-länken var
+   * telefonen en främling för sin egen laddning: den fick ingen betallänk, och
+   * när kabeln drogs ur hände ingenting på skärmen.
+   *
+   * Nyckeln plockas bort ur adressraden direkt, så den inte följer med om
+   * sidan delas eller hamnar i historiken.
+   */
+  (function fangaNyckel() {
+    try {
+      var m = location.search.match(/[?&]k=([A-Za-z0-9_-]+)/);
+      if (!m) return;
+      remember({ key: decodeURIComponent(m[1]), dismissed: false });
+      if (history.replaceState) history.replaceState(null, '', location.pathname);
+    } catch (e) { /* ingen nyckel, inget problem */ }
+  })();
 
   poll();
   setInterval(poll, 5000);
@@ -5026,7 +5080,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -5349,7 +5403,7 @@ guest.post('/api/clienterror', async (req, res, ctx) => {
   return sendJson(res, 200, { ok: true });
 });
 
-guest.get('/api/status', (req, res) => {
+guest.get('/api/status', (req, res, ctx) => {
   loop.noteGuestPoll();
   const snap = loop.getSnapshot();
   const active = sessions.getActive();
@@ -5358,6 +5412,13 @@ guest.get('/api/status', (req, res) => {
   // 'ok' | 'stale' | 'lost'. Ett enda misslyckat anrop släcker inte längre
   // sidan: vi visar det vi senast visste och skriver ut hur gammalt det är.
   const contact = loop.contact();
+
+  /* Är det gästens egen laddning?
+     Telefonen visar upp kvittonyckeln den fick när laddningen startade. Bara
+     då får den tillbaka nyckeln i svaret — och därmed vägen till betalsidan.
+     En förbipasserande ser att stolpen är upptagen och hur mycket som laddats,
+     men får ingen betallänk och kommer inte åt numrets övriga laddningar. */
+  const mine = Boolean(active && ctx.query.get('k') && ctx.query.get('k') === active.receiptKey);
 
   let view = 'idle';
   let session = null;
@@ -5369,14 +5430,11 @@ guest.get('/api/status', (req, res) => {
     // Bilen är klar men står kvar. Stolpen är upptagen tills kabeln dras ur,
     // och det ska både gästen som laddat och en förbipasserande kunna se.
     view = 'finished';
-    session = sessions.publicView(active);
+    session = sessions.publicView(active, { includeKey: mine });
     busySince = active.startedAt;
   } else if (active) {
-    // Gästen som startade sessionen och en förbipasserande ska se olika saker.
-    // I fas 2 finns ingen inloggning ännu, så alla ser laddvyn. Från fas 5 knyts
-    // vyn till det verifierade numret och andra får "upptagen".
     view = 'charging';
-    session = sessions.publicView(active);
+    session = sessions.publicView(active, { includeKey: mine });
     busySince = active.startedAt;
   } else if (snap.cableConnected) {
     view = 'ready';
@@ -5398,6 +5456,7 @@ guest.get('/api/status', (req, res) => {
     requireVerification: config.settings().requireVerification,
     starting: startState.running,
     startError: !active && startState.error ? startState.error : null,
+    mine,
     readAt: snap.readAt,
     contact: contact.state,
     ageSeconds: contact.ageSeconds,
@@ -5549,7 +5608,8 @@ guest.post('/api/start', async (req, res, ctx) => {
     return sendJson(res, 200, {
       ok: true,
       starting: true,
-      session: sessions.publicView(sessions.getActive()),
+      // Den som just startat laddningen ar dess agare och ska ha nyckeln.
+      session: sessions.publicView(sessions.getActive(), { includeKey: true }),
     });
   } finally {
     startInFlight = false;
@@ -5564,6 +5624,14 @@ guest.post('/api/stop', async (req, res, ctx) => {
   const rl = limiter.hit(`stop:${ctx.ip}`, 10, 60 * 60 * 1000);
   if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök. Vänta en stund.' });
 
+  // Bara den som startade laddningen får avsluta den. Telefonen visar upp
+  // kvittonyckeln den fick vid start. Förut räckte det att känna till adressen.
+  const parsed = await readJsonBody(req);
+  const nyckel = (parsed.ok && parsed.body && parsed.body.k) || ctx.query.get('k');
+  if (nyckel !== active.receiptKey) {
+    return sendJson(res, 403, { error: 'Bara den som startade laddningen kan avsluta den.' });
+  }
+
   await loop.tick();                    // sista avläsningen innan vi summerar
 
   // Laddningen stoppas, men sessionen lever tills kabeln dras ur. Kvittot
@@ -5575,7 +5643,7 @@ guest.post('/api/stop', async (req, res, ctx) => {
       error: 'Laddningen kunde inte stoppas. Dra ur kabeln, så avslutas den automatiskt.',
     });
   }
-  return sendJson(res, 200, { ok: true, session: sessions.publicView(done) });
+  return sendJson(res, 200, { ok: true, session: sessions.publicView(done, { includeKey: true }) });
 });
 
 /**
@@ -5591,12 +5659,19 @@ guest.get('/s/:key', async (req, res, ctx) => {
   const say = (title, body, ok) => sendHtml(res, ok ? 200 : 409, magicPage(title, body, ok));
 
   /* Har den här länken redan startat en laddning? Då är den inte förbrukad —
-     den är nyckeln till just den laddningens kvitto, och ska fungera för
-     alltid. Förut svarade den "Länken fungerar inte", vilket är fel på två
-     sätt: länken fungerar, och det finns en obetald räkning bakom den. */
+     den är nyckeln till just den laddningen, och ska fungera för alltid.
+
+     Vart den leder beror på om laddningen fortfarande pågår. Trycker gästen på
+     länken mitt under laddningen vill hen se hur det går, inte få en räkning
+     för något som inte är klart. Är kabeln urdragen är laddningen historia och
+     då är kvittot rätt sida. */
   const tidigare = sessions.byStartToken(ctx.params.key);
   if (tidigare) {
-    res.writeHead(302, { Location: `../k/${encodeURIComponent(tidigare.receiptKey)}` });
+    const pagar = sessions.getActive() && sessions.getActive().id === tidigare.id;
+    const dit = pagar
+      ? `../?k=${encodeURIComponent(tidigare.receiptKey)}`     // laddvyn, och telefonen minns nyckeln
+      : `../k/${encodeURIComponent(tidigare.receiptKey)}`;     // kvitto och betalning
+    res.writeHead(302, { Location: dit });
     return res.end();
   }
 
@@ -5640,7 +5715,11 @@ guest.get('/s/:key', async (req, res, ctx) => {
     }
   })();
 
-  return say('Laddningen startar', 'Du skickas vidare…', true);
+  // Vidare till laddvyn, med nyckeln i adressen så telefonen vet att det är
+  // dess egen laddning. Annars vore gästen en främling för sin egen laddning
+  // resten av kvällen: ingen betallänk, och ingen reaktion när kabeln dras ur.
+  res.writeHead(302, { Location: `../?k=${encodeURIComponent(started.session.receiptKey)}` });
+  return res.end();
 });
 
 /**
@@ -5664,10 +5743,11 @@ guest.get('/k/:key', (req, res, ctx) => {
   }
 
   if (wantsJson) {
-    return sendJson(res, 200, { session: sessions.publicView(s), swish: swishFor(s) });
+    return sendJson(res, 200, { session: sessions.publicView(s, { includeKey: true }), swish: swishFor(s) });
   }
-  const tidigare = sessions.forPhone(s.phone).map((x) => sessions.publicView(x));
-  return sendHtml(res, 200, receiptPage.render(sessions.publicView(s), swishFor(s), config.ha().location_name, tidigare));
+  // Den som natt hit har redan nyckeln. Historiklankarna behover sina egna.
+  const tidigare = sessions.forPhone(s.phone).map((x) => sessions.publicView(x, { includeKey: true }));
+  return sendHtml(res, 200, receiptPage.render(sessions.publicView(s, { includeKey: true }), swishFor(s), config.ha().location_name, tidigare));
 });
 
 guest.post('/k/:key/betald', async (req, res, ctx) => {
@@ -5730,7 +5810,7 @@ admin.get('/api/admin/state', (req, res) => {
     priceNow: prices.currentPrice(),
     settings: config.settings(),
 
-    active: active ? { ...sessions.publicView(active), startedAt: active.startedAt } : null,
+    active: active ? { ...sessions.publicView(active, { includeKey: true }), startedAt: active.startedAt } : null,
     history: sessions.getHistory(60),
     historyCount: sessions.getHistory(9999).length,
     storage: { lastWrite: new Date().toISOString() },
@@ -5768,7 +5848,7 @@ admin.post('/api/admin/session/end', async (req, res) => {
       error: 'Laddboxen svarar men slutar inte ladda. Sessionen hålls öppen och räknas vidare.',
     });
   }
-  return sendJson(res, 200, { ok: true, session: sessions.publicView(done) });
+  return sendJson(res, 200, { ok: true, session: sessions.publicView(done, { includeKey: true }) });
 });
 
 admin.post('/api/admin/session/payment', async (req, res) => {
