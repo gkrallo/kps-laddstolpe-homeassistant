@@ -791,6 +791,7 @@ class SimulatedCharger {
 
     this.targetKw = 11.0;   // full effekt vid trefas 16 A
     this.throttled = false; // simulerar att Equalizern stryper
+    this.carFull = false;   // bilen tar inte emot mer strom (driftlage 4)
     this.powerKw = 0;
 
     this.sessionEnergyKwh = 0;
@@ -819,6 +820,7 @@ class SimulatedCharger {
     this.locked = Boolean(s.locked);
     this.enabled = s.enabled === undefined ? true : Boolean(s.enabled);
     this.throttled = Boolean(s.throttled);
+    this.carFull = Boolean(s.carFull);
     this.maxCurrent = Number(s.maxCurrent) || 16;
     this.targetKw = Number(s.targetKw) || 11.0;
     this.sessionEnergyKwh = Number(s.sessionEnergyKwh) || 0;
@@ -836,6 +838,7 @@ class SimulatedCharger {
       locked: this.locked,
       enabled: this.enabled,
       throttled: this.throttled,
+      carFull: this.carFull,
       maxCurrent: this.maxCurrent,
       targetKw: this.targetKw,
       sessionEnergyKwh: this.sessionEnergyKwh,
@@ -850,7 +853,7 @@ class SimulatedCharger {
     const hours = (now - this.lastTick) / 3600000;
     this.lastTick = now;
 
-    this.powerKw = this.charging && !this.throttled ? this.targetKw : 0;
+    this.powerKw = this.charging && !this.throttled && !this.carFull ? this.targetKw : 0;
 
     if (hours > 0 && this.powerKw > 0) {
       const added = this.powerKw * hours;
@@ -859,9 +862,18 @@ class SimulatedCharger {
     }
   }
 
+  /**
+   * Driftlägena, så trogna Easees egen betydelse som simulatorn kan vara.
+   *
+   * Den gamla varianten lät strypning bli läge 4. Det är fel och farligt fel:
+   * 4 betyder "bilen har pausat eller slutat ladda", medan en strypning är vi
+   * som håller igen. Blandar man ihop dem ser en bil i lastbalanseringskö ut
+   * som en färdigladdad bil — och då skriver appen kvitto mitt i kön.
+   */
   _opMode() {
     if (!this.cableConnected) return 1;
-    if (this.charging) return this.throttled ? 4 : 3;
+    if (this.carFull) return 4;                    // bilen tar inte emot mer
+    if (this.charging) return this.throttled ? 2 : 3;
     return 2;
   }
 
@@ -888,8 +900,9 @@ class SimulatedCharger {
       eqAvailable: { l1: null, l2: null, l3: null },
       voltage: null,
       deratingActive: this.throttled,
-      // 53 = "Laddaren är avstängd", samma kod en riktig box skickar
-      reasonForNoCurrent: this.enabled ? null : 53,
+      // Samma koder en riktig box skickar: 53 avstängd laddare,
+      // 28 begränsad av Equalizern, 79 bilen laddar inte.
+      reasonForNoCurrent: !this.enabled ? 53 : (this.carFull ? 79 : (this.throttled ? 28 : null)),
       enabled: this.enabled,
       errorCode: 0,
       online: true,
@@ -997,6 +1010,15 @@ class SimulatedCharger {
     this.throttled = Boolean(on);
     this._persist();
     log.info(`[Simulator] Lastbalanserare ${this.throttled ? 'stryper till 0 kW' : 'släpper på full effekt'}.`);
+    return { ok: true };
+  }
+
+  /** Bilen slutar ta emot ström — full, eller så avvisar den laddningen. */
+  setCarFull(on) {
+    this._advance();
+    this.carFull = Boolean(on);
+    this._persist();
+    log.info(`[Simulator] Bilen ${this.carFull ? 'tar inte emot mer ström (driftläge 4)' : 'börjar dra ström igen'}.`);
     return { ok: true };
   }
 
@@ -1554,7 +1576,7 @@ function nextNumber() {
   return (nums.length ? Math.max(...nums) : 1000) + 1;
 }
 
-function start({ phone, cableEpisode, startEnergyKwh, simulated }) {
+function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken }) {
   if (active) return { ok: false, error: 'En laddning pågår redan.' };
 
   active = {
@@ -1562,12 +1584,19 @@ function start({ phone, cableEpisode, startEnergyKwh, simulated }) {
     number: nextNumber(),
     receiptKey: newReceiptKey(),
     phone: phone || null,
+    // CHARGING -> FINISHED (klar, kabeln kvar) -> COMPLETED (kabeln urdragen)
     status: 'CHARGING',
     simulated: Boolean(simulated),
     cableEpisode: cableEpisode || null,
 
+    // Nyckeln ur start-SMS:ets länk. Sparas så att länken kan leda till det här
+    // kvittot för alltid i stället för att bli en återvändsgränd när den
+    // engångsanvänts.
+    startToken: startToken || null,
+
     startedAt: new Date().toISOString(),
-    endedAt: null,
+    chargingEndedAt: null,   // när bilen slutade ta emot ström
+    endedAt: null,           // när kabeln drogs ur
 
     startEnergyKwh: Number(startEnergyKwh) || 0,
     energyKwh: 0,
@@ -1726,12 +1755,58 @@ function finish(reason) {
   return done;
 }
 
+/**
+ * Laddningen är klar men bilen står kvar.
+ *
+ * Sessionen avslutas INTE här. Den lever tills kabeln dras ur, av två skäl:
+ * kvittot ska komma när gästen faktiskt åker, och skulle bilen börja dra ström
+ * igen — vissa gör det, för batterivård eller förvärmning — ska den strömmen
+ * hamna på rätt räkning i stället för att bli gratis.
+ */
+function markFinished(reason) {
+  if (!active || active.status !== 'CHARGING') return null;
+  active.status = 'FINISHED';
+  active.chargingEndedAt = new Date().toISOString();
+  active.finishReason = reason || null;
+  activeWriter.save(active, { immediate: true });
+  log.info(`Session ${active.number}: laddningen klar (${reason}). ${active.energyKwh} kWh, ${active.costSek} kr. Väntar på att kabeln dras ur.`);
+  return active;
+}
+
+/** Bilen vaknade och drar ström igen. */
+function resumeCharging() {
+  if (!active || active.status !== 'FINISHED') return null;
+  active.status = 'CHARGING';
+  active.chargingEndedAt = null;
+  active.finishReason = null;
+  activeWriter.save(active, { immediate: true });
+  log.info(`Session ${active.number}: bilen drar ström igen. Laddningen fortsätter räknas.`);
+  return active;
+}
+
 function getActive() { return active; }
 function getHistory(limit = 100) { return history.slice(-limit).reverse(); }
 function byReceiptKey(key) {
   if (!key) return null;
   if (active && active.receiptKey === key) return active;
   return history.find((s) => s.receiptKey === key) || null;
+}
+
+/** Nyckeln ur en start-SMS-länk. Låter länken leda till kvittot för alltid. */
+function byStartToken(key) {
+  if (!key) return null;
+  if (active && active.startToken === key) return active;
+  return history.find((s) => s.startToken === key) || null;
+}
+
+/** Alla laddningar från ett nummer, nyast först. Aldrig numret självt utåt. */
+function forPhone(phone, limit = 20) {
+  if (!phone) return [];
+  const all = active && active.phone === phone ? [active, ...history] : history.slice();
+  return all
+    .filter((s) => s.phone === phone)
+    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+    .slice(0, limit);
 }
 function unpaid() { return history.filter((s) => s.payment !== 'CONFIRMED'); }
 
@@ -1762,6 +1837,8 @@ function publicView(s) {
     usedEstimatedPrice: Boolean(s.usedEstimatedPrice),
     // Energi som är uppmätt men ännu inte prissatt. Noll i normalfallet.
     unpricedKwh: round(s.unpricedKwh || 0, 2),
+    chargingEndedAt: s.chargingEndedAt || null,
+    finishReason: s.finishReason || null,
     payment: s.payment,
     simulated: Boolean(s.simulated),
   };
@@ -1801,6 +1878,7 @@ function shiftStartBack(minutes) {
 
 return {
   load, start, accumulate, finish, flush, shiftStartBack,
+  markFinished, resumeCharging, byStartToken, forPhone,
   getActive, getHistory, byReceiptKey, unpaid, setPayment,
   publicView, maskPhone,
 };
@@ -1975,7 +2053,7 @@ async function tick() {
       price,
     });
 
-    await handleIdleFinish(state);
+    await handleChargingDone(state, active);
   } catch (err) {
     log.error(`Fel i bakgrundsloopen: ${err.stack || err.message}`);
   } finally {
@@ -2017,17 +2095,59 @@ async function handleDisconnect(state) {
   return true;
 }
 
-async function handleIdleFinish(state) {
-  const idle = state.powerKw <= 0.05 && (state.opMode === 4 || state.opMode === 2);
+/**
+ * Är laddningen klar?
+ *
+ * Easees egen dokumentation är tydligare än man först tror: driftläge 4
+ * heter "Completed" men betyder *"Car has paused/stopped charging"*. Bilen kan
+ * alltså ha pausat — för kall batteri, för egen schemaläggning — och tänka
+ * fortsätta. Läge 2 är "Car connected, charger is waiting for EV or load
+ * balancing", vilket är ännu vagare: där ryms både en färdig bil och en bil
+ * som står i kö bakom lastbalanseringen.
+ *
+ * Därför två olika väntetider, och en spärr.
+ *
+ * SPÄRREN: stryper lastbalanseringen är laddningen inte klar, den är pausad av
+ * oss. Att kalla det färdigt vore att skriva ett kvitto mitt i kön.
+ *
+ * Och eftersom "klar" numera inte avslutar något — sessionen lever tills
+ * kabeln dras ur, och börjar bilen dra ström igen går den tillbaka till
+ * laddar — kostar en förhastad slutsats bara en rad på skärmen som rättar sig
+ * själv. Då kan vi vara betydligt snabbare än de tjugo minuter det tog förut.
+ */
+const DONE_CONFIRM_MS = 90 * 1000;   // driftläge 4: bilen säger själv att den är klar
+const VAGUE_CONFIRM_MS = IDLE_FINISH_MS;  // driftläge 2 och 6: vagare, vänta ut det
 
-  if (!idle) { zeroPowerSince = null; return; }
-  if (!zeroPowerSince) { zeroPowerSince = Date.now(); return; }
+// Orsakskoder som betyder "vi stryper", inte "bilen är klar".
+const THROTTLE_REASONS = new Set([1, 2, 3, 4, 5, 6, 10, 25, 26, 27, 28, 29, 30, 50, 51, 52, 75, 76, 77, 78]);
 
-  if (Date.now() - zeroPowerSince >= IDLE_FINISH_MS) {
-    log.info('Färdigladdad utan effekt i 20 minuter. Avslutar sessionen.');
-    await endSession('färdigladdad');
-    zeroPowerSince = null;
+async function handleChargingDone(state, session) {
+  const flowing = state.opMode === 3 || state.powerKw > 0.1;
+
+  // Bilen vaknade. Utan det här skulle strömmen efter en paus bli gratis.
+  if (session.status === 'FINISHED') {
+    if (flowing) { sessions.resumeCharging(); zeroPowerSince = null; }
+    return;
   }
+
+  if (flowing) { zeroPowerSince = null; return; }
+
+  const throttled = THROTTLE_REASONS.has(Number(state.reasonForNoCurrent));
+  if (throttled) { zeroPowerSince = null; return; }
+
+  let wait;
+  if (state.opMode === 4) wait = DONE_CONFIRM_MS;
+  else if (state.opMode === 2 || state.opMode === 6) wait = VAGUE_CONFIRM_MS;
+  else { zeroPowerSince = null; return; }
+
+  if (!zeroPowerSince) { zeroPowerSince = Date.now(); return; }
+  if (Date.now() - zeroPowerSince < wait) return;
+
+  const varfor = state.opMode === 4
+    ? 'bilen tar inte emot mer ström'
+    : 'ingen ström på tjugo minuter';
+  sessions.markFinished(varfor);
+  zeroPowerSince = null;
 }
 
 /**
@@ -2072,11 +2192,40 @@ async function endSession(reason, { force = false } = {}) {
 
   // Kvitto-SMS. Fastnar det får sessionen ändå sitt kvitto på webben, så vi
   // låter aldrig ett misslyckat SMS stoppa avslutet.
+  //
+  // Det här är den ENDA platsen som skickar kvitto, och hit kommer vi bara när
+  // kabeln dragits ur. Förut gick kvittot när laddningen tog slut, vilket
+  // innebar att gästen fick sin räkning mitt i natten medan bilen stod kvar.
   if (done && done.phone) {
     sendReceiptSms(done).catch((err) => log.error(`Kvitto-SMS misslyckades: ${err.message}`));
   }
 
   return done;
+}
+
+/**
+ * Gästen eller du trycker "avsluta" medan kabeln sitter i.
+ *
+ * Skiljer sig från att bilen blir full: här har någon sagt att det är slut, så
+ * laddaren stängs av och bilen får inte börja om. Men sessionen lever kvar och
+ * kvittot väntar — allt avslutas när kabeln dras ur.
+ */
+async function stopChargingNow(reason, { force = false } = {}) {
+  const active = sessions.getActive();
+  if (!active) return null;
+
+  const stopped = await stopChargingSequence();
+  if (!force && stopped.ok && stopped.verified === false) {
+    log.error('Laddningen gick inte att stoppa. Sessionen hålls öppen och fortsätter räknas.');
+    return { stopFailed: true };
+  }
+
+  await applyCableLock(false);
+  await loop.tick();          // sista avläsningen så energin är räknad
+  await lockPole();           // ingen gratis omstart på samma kabel
+  const s = sessions.markFinished(reason);
+  await loop.tick();
+  return s;
 }
 
 async function refreshPricesIfDue() {
@@ -2210,7 +2359,7 @@ function stop() {
 
 return {
   init, start, stop, tick, noteGuestPoll, cadence, contact,
-  STALE_MS,
+  STALE_MS, stopChargingNow,
   getSnapshot: () => snapshot,
   getCableState: () => cableState,
   getLastTickAt: () => lastTickAt,
@@ -2634,9 +2783,10 @@ button.btn + button.btn{margin-top:10px}
   function kr(n) { return Number(n).toFixed(2).replace('.', ','); }
   function num(n, d) { return Number(n).toFixed(d === undefined ? 1 : d).replace('.', ','); }
 
-  function duration(fromIso) {
+  function duration(fromIso, tillIso) {
     if (!fromIso) return '';
-    var ms = Date.now() - Date.parse(fromIso);
+    var slut = tillIso ? Date.parse(tillIso) : Date.now();
+    var ms = slut - Date.parse(fromIso);
     if (!isFinite(ms) || ms < 0) ms = 0;
     var min = Math.floor(ms / 60000);
     var h = Math.floor(min / 60);
@@ -2792,6 +2942,7 @@ button.btn + button.btn{margin-top:10px}
     if (s.view === 'charging') { liveText = 'Laddar'; }
     else if (s.view === 'busy') { liveClass = 'live busy'; liveText = 'Upptagen'; }
     else if (s.view === 'ready') { liveText = 'Kabel ansluten'; }
+    else if (s.view === 'finished') { liveClass = 'live busy'; liveText = 'Klar, kabeln kvar'; }
     else if (s.view === 'readonly') { liveClass = 'live busy'; liveText = 'Avläsningsläge'; }
     else if (s.view === 'done') { liveClass = 'live busy'; liveText = 'Klar'; }
     else if (s.view === 'offline') { liveClass = 'live off'; liveText = 'Ingen kontakt'; }
@@ -2879,6 +3030,28 @@ button.btn + button.btn{margin-top:10px}
 
       var sb = document.getElementById('stopBtn');
       if (sb) sb.addEventListener('click', doStop);
+
+    } else if (s.view === 'finished') {
+      /* Bilen är klar men kabeln sitter kvar. Skärmen ska svara på två frågor
+         samtidigt: gästen som laddat vill veta att det är klart och vad det
+         kostade, och den som kommer gående vill veta om stolpen blir ledig. */
+      var f = s.session || {};
+      var mitt = !!(recall() && recall().key === f.receiptKey);
+      el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
+      el.title.textContent = mitt ? 'Din bil är klar' : 'Bilen är klar';
+      el.lead.textContent = mitt
+        ? 'Laddningen är avslutad. Dra ur kabeln när du åker, så får du kvittot via SMS.'
+        : 'Laddningen är avslutad, men bilen står kvar. Stolpen blir ledig när kabeln dras ur.';
+
+      el.slot.innerHTML = noticeBlock() + staleBlock(s) +
+        '<div class="stats">' +
+          '<div class="stat wide"><div class="l">' + (mitt ? 'Att betala' : 'Laddat för') + '</div><div><span class="v">' + kr(f.costSek) + '</span><span class="u">kr</span></div></div>' +
+          '<div class="stat"><div class="l">Laddat</div><div><span class="v">' + num(f.energyKwh, 2) + '</span><span class="u">kWh</span></div></div>' +
+          '<div class="stat"><div class="l">Laddade i</div><div><span class="v" style="font-size:24px">' + duration(f.startedAt, f.chargingEndedAt) + '</span></div></div>' +
+        '</div>' +
+        (f.unpricedKwh > 0 ? '<div class="msg info">' + num(f.unpricedKwh, 2) + ' kWh är ännu inte prissatta — appen saknar elpris för den perioden.</div>' : '') +
+        '<div class="msg info">Kvittot skickas när kabeln dras ur.</div>' +
+        (mitt && f.receiptKey ? '<a class="btn ghost" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(f.receiptKey) + '">Öppna kvitto och betala</a>' : '');
 
     } else if (s.view === 'readonly') {
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
@@ -3535,6 +3708,8 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<button class="b" data-act="sim" data-cmd="unplug">Dra ur kabeln</button>'
         + '<button class="b" data-act="sim" data-cmd="throttle">Strypa till 0 kW</button>'
         + '<button class="b" data-act="sim" data-cmd="unthrottle">Släpp på effekten</button>'
+        + '<button class="b" data-act="sim" data-cmd="full">Bilen är full</button>'
+        + '<button class="b" data-act="sim" data-cmd="wake">Bilen drar ström igen</button>'
         + '<button class="b" data-act="sim" data-cmd="ff15">Spola fram 15 min</button>'
         + '<button class="b" data-act="sim" data-cmd="ff60">Spola fram 60 min</button>'
         + '<button class="b" data-act="sim" data-cmd="disable">Stäng av stolpen</button>'
@@ -4041,7 +4216,11 @@ async function send({ to, text, kind = 'övrigt', ip = null, extra = null }) {
       extra, ok: true,
     });
 
-    log.info(`[SMS] ${effective === 'dryrun' ? 'Torrkörning' : 'Skickat'} ${kind} till ${maskPhone(to)} (${m.parts} del${m.parts > 1 ? 'ar' : ''}).`);
+    // 46elks id och status med i loggen. Ett 200-svar betyder bara att de tagit
+    // emot meddelandet, inte att det kommit fram — utan id:t går det inte att
+    // spåra i deras panel när ett SMS uteblir.
+    const spar = data && data.id ? ` [46elks ${data.id}${data.status ? ' ' + data.status : ''}]` : '';
+    log.info(`[SMS] ${effective === 'dryrun' ? 'Torrkörning' : 'Lämnat till 46elks'} ${kind} till ${maskPhone(to)} (${m.parts} del${m.parts > 1 ? 'ar' : ''})${spar}.`);
     return { ok: true, dryrun: effective === 'dryrun', parts: m.parts, data };
   } catch (err) {
     log.error(`[SMS] Nätverksfel: ${err.message}`);
@@ -4647,7 +4826,46 @@ function duration(a, b) {
  * fungerar. En `swish://`-länk gör ingenting alls på en dator eller i en mobil
  * utan Swish, och misslyckas dessutom tyst.
  */
-function render(session, swishData, place) {
+/**
+ * Tidigare laddningar från samma mobilnummer.
+ *
+ * Gästen vill kunna se vad tidigare gånger kostade, och hitta tillbaka till en
+ * räkning som inte är betald. Listan visar aldrig numret — bara datum, mängd,
+ * belopp och status, med länk till respektive kvitto.
+ *
+ * Notera vad det innebär: den som får den här länken vidarebefordrad ser också
+ * personens övriga laddningar hos dig. Det är en medveten avvägning.
+ */
+function historyBlock(rader, denna) {
+  const andra = (rader || []).filter((s) => s.receiptKey !== denna);
+  if (!andra.length) return '';
+
+  const obetalda = andra.filter((s) => s.payment !== 'CONFIRMED').length;
+  const rows = andra.map((s) => {
+    const status = s.payment === 'CONFIRMED' ? 'betald'
+      : s.payment === 'GUEST_CLAIMS_PAID' ? 'markerad betald' : 'obetald';
+    const cls = s.payment === 'CONFIRMED' ? 'p-paid' : s.payment === 'GUEST_CLAIMS_PAID' ? 'p-claim' : 'p-open';
+    return `<a class="hrow" href="${esc(s.receiptKey)}">
+      <span class="hwhen">${esc(kortDatum(s.startedAt))}<span class="hkwh">${kwh(s.energyKwh)} kWh</span></span>
+      <span class="hsum">${kr(s.costSek)} kr<span class="pill ${cls}">${status}</span></span>
+    </a>`;
+  }).join('');
+
+  return `<div class="card">
+    <h2 class="h2">Dina tidigare laddningar</h2>
+    <p class="sub">${andra.length} ${andra.length === 1 ? 'laddning' : 'laddningar'}${obetalda ? `, varav ${obetalda} obetald${obetalda === 1 ? '' : 'a'}` : ', alla betalda'}.</p>
+    ${rows}
+  </div>`;
+}
+
+function kortDatum(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleString('sv-SE', {
+    timeZone: 'Europe/Stockholm', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function render(session, swishData, place, tidigare) {
   const paid = session.payment === 'CONFIRMED';
   const claimed = session.payment === 'GUEST_CLAIMS_PAID';
 
@@ -4698,6 +4916,15 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
 .note{margin-top:18px;font-size:13px;color:rgba(232,240,234,.45);line-height:1.6;text-align:center}
 .msg{margin-top:14px;padding:12px 14px;border-radius:11px;font-size:14.5px;line-height:1.5;
  background:rgba(226,177,68,.1);border:1px solid rgba(226,177,68,.35);color:#EBCE93}
+
+.h2{font-size:19px;font-weight:600;margin:0 0 4px;color:#fff}
+.hrow{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;
+ padding:14px 2px;border-top:1px solid rgba(226,177,68,.14);text-decoration:none;color:inherit}
+.hwhen{font-size:15.5px;color:#E6EFE9;display:flex;flex-direction:column;gap:3px}
+.hkwh{font-size:13.5px;color:#95AC9E;font-variant-numeric:tabular-nums}
+.hsum{font-size:16.5px;font-weight:600;color:#F3D082;text-align:right;white-space:nowrap;
+ display:flex;flex-direction:column;align-items:flex-end;gap:5px;font-variant-numeric:tabular-nums}
+.hsum .pill{font-weight:500}
 </style>
 </head>
 <body>
@@ -4748,6 +4975,8 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
     ${paid ? '<p class="note">Tack, betalningen är bekräftad.</p>' : ''}
   </div>
 
+  ${historyBlock(tidigare, session.receiptKey)}
+
   <p class="note">Sidan finns kvar — spara SMS:et så hittar du hit igen.</p>
 </div>
 
@@ -4797,7 +5026,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.5.2';
+const VERSION = '0.6.0';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -5136,6 +5365,12 @@ guest.get('/api/status', (req, res) => {
 
   if (contact.state === 'lost') {
     view = 'offline';
+  } else if (active && active.status === 'FINISHED') {
+    // Bilen är klar men står kvar. Stolpen är upptagen tills kabeln dras ur,
+    // och det ska både gästen som laddat och en förbipasserande kunna se.
+    view = 'finished';
+    session = sessions.publicView(active);
+    busySince = active.startedAt;
   } else if (active) {
     // Gästen som startade sessionen och en förbipasserande ska se olika saker.
     // I fas 2 finns ingen inloggning ännu, så alla ser laddvyn. Från fas 5 knyts
@@ -5272,6 +5507,7 @@ guest.post('/api/start', async (req, res, ctx) => {
       cableEpisode: loop.getCableState().episode,
       startEnergyKwh: state.sessionEnergyKwh,
       simulated: Boolean(state.simulated),
+      startToken: parsed.body.token || null,
     });
     if (!started.ok) return sendJson(res, 409, { error: started.error });
 
@@ -5329,7 +5565,10 @@ guest.post('/api/stop', async (req, res, ctx) => {
   if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök. Vänta en stund.' });
 
   await loop.tick();                    // sista avläsningen innan vi summerar
-  const done = await loop.endSession('avslutad av gästen');
+
+  // Laddningen stoppas, men sessionen lever tills kabeln dras ur. Kvittot
+  // kommer då. Gästen ser summan direkt på skärmen under tiden.
+  const done = await loop.stopChargingNow('avslutad av gästen');
 
   if (done && done.stopFailed) {
     return sendJson(res, 502, {
@@ -5351,6 +5590,16 @@ guest.get('/s/:key', async (req, res, ctx) => {
 
   const say = (title, body, ok) => sendHtml(res, ok ? 200 : 409, magicPage(title, body, ok));
 
+  /* Har den här länken redan startat en laddning? Då är den inte förbrukad —
+     den är nyckeln till just den laddningens kvitto, och ska fungera för
+     alltid. Förut svarade den "Länken fungerar inte", vilket är fel på två
+     sätt: länken fungerar, och det finns en obetald räkning bakom den. */
+  const tidigare = sessions.byStartToken(ctx.params.key);
+  if (tidigare) {
+    res.writeHead(302, { Location: `../k/${encodeURIComponent(tidigare.receiptKey)}` });
+    return res.end();
+  }
+
   if (sessions.getActive()) {
     return say('Stolpen används just nu', 'Någon annan har hunnit före. Försök igen när den blir ledig.', false);
   }
@@ -5367,6 +5616,7 @@ guest.get('/s/:key', async (req, res, ctx) => {
     cableEpisode: loop.getCableState().episode,
     startEnergyKwh: state.sessionEnergyKwh,
     simulated: Boolean(state.simulated),
+    startToken: ctx.params.key,
   });
   if (!started.ok) return say('Kunde inte starta', started.error, false);
 
@@ -5416,7 +5666,8 @@ guest.get('/k/:key', (req, res, ctx) => {
   if (wantsJson) {
     return sendJson(res, 200, { session: sessions.publicView(s), swish: swishFor(s) });
   }
-  return sendHtml(res, 200, receiptPage.render(sessions.publicView(s), swishFor(s), config.ha().location_name));
+  const tidigare = sessions.forPhone(s.phone).map((x) => sessions.publicView(x));
+  return sendHtml(res, 200, receiptPage.render(sessions.publicView(s), swishFor(s), config.ha().location_name, tidigare));
 });
 
 guest.post('/k/:key/betald', async (req, res, ctx) => {
@@ -5504,6 +5755,10 @@ admin.post('/api/admin/prices/refresh', async (req, res) => {
   return sendJson(res, 200, { ok: true, prices: prices.status() });
 });
 
+/**
+ * Avsluta från adminfliken. Här FÅR sessionen stängas helt även om kabeln
+ * sitter i — det är din nödutgång när något hängt sig, och då ska kvittot ut.
+ */
 admin.post('/api/admin/session/end', async (req, res) => {
   if (!sessions.getActive()) return sendJson(res, 409, { error: 'Ingen laddning pågår.' });
   await loop.tick();
@@ -5602,6 +5857,8 @@ admin.post('/api/admin/sim', async (req, res) => {
     case 'unplug': out = charger.unplug(); break;
     case 'throttle': out = charger.setThrottled(true); break;
     case 'unthrottle': out = charger.setThrottled(false); break;
+    case 'full': out = charger.setCarFull(true); break;
+    case 'wake': out = charger.setCarFull(false); break;
     case 'disable': out = await charger.setEnabled(false); break;
     case 'stuck': out = charger.setStuck(true); break;
     case 'unstuck': out = charger.setStuck(false); break;
