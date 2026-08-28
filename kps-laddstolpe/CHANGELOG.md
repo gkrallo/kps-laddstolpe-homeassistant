@@ -1,5 +1,36 @@
 # Ändringslogg
 
+## 0.6.1
+
+Appen vet nu vems laddning det är.
+
+**Startade du via länken i SMS:et var telefonen en främling för sin egen
+laddning.** Sidan räknade bara den som ägare som tryckt på startknappen i just
+den webbläsaren. Gick du in via länken visste den ingenting — och det är därför
+ingenting hände på skärmen när du drog ur kabeln, trots att SMS:et kom.
+Länken bär nu med sig laddningens nyckel, telefonen sparar den, och nyckeln
+plockas bort ur adressraden direkt så den inte följer med om sidan delas.
+
+**Länken under pågående laddning leder till laddvyn**, inte till kvittot. Den
+som trycker mitt i laddningen vill se hur det går, inte få en räkning för något
+som inte är klart. Är kabeln urdragen är laddningen historia, och då är kvittot
+rätt sida. Samma länk, olika svar beroende på var i förloppet du är.
+
+**Och betallänken låg öppen för vem som helst.** Kvittonyckeln följde med i
+statussvaret till alla som öppnade gästsidan under en pågående laddning. Med den
+kom man åt betalsidan, kunde markera laddningen som betald — och sedan 0.6.0
+även se numrets alla tidigare laddningar. Nyckeln skickas nu bara till den som
+redan har den, alltså den som laddar.
+
+**Samma sak med avsluta-knappen.** Den visades för alla, och servern frågade
+inte vems laddning det var. Vem som helst som kände till adressen kunde avbryta
+grannens laddning. Nu kan bara den som startade avsluta, både i gränssnittet och
+i servern.
+
+En förbipasserande ser fortfarande att stolpen används, hur mycket som laddats
+och att den blir ledig när kabeln dras ur. Det är det som är vitsen med sidan.
+Det som försvann var betallänken och möjligheten att gripa in.
+
 ## 0.6.0
 
 Sessionen slutar inte längre när bilen blir full. Den slutar när kabeln dras ur.
