@@ -1,5 +1,62 @@
 # Ändringslogg
 
+## 0.6.0
+
+Sessionen slutar inte längre när bilen blir full. Den slutar när kabeln dras ur.
+
+**Ett nytt läge däremellan: klar, men bilen står kvar.** Förut fanns bara
+laddar och avslutad, så i det ögonblick bilen blev full skrev appen kvittot,
+skickade SMS och betraktade allt som över — medan bilen fortfarande stod
+inkopplad. Gästsidan hoppade tillbaka till "Redo att ladda", som om stolpen var
+fri, fast den inte var det.
+
+Nu står det **"Bilen är klar"** med hur mycket som laddats och vad det kostar.
+Den som laddat ser att det är färdigt och att kvittot kommer när kabeln dras ur.
+Den som kommer gående ser att stolpen är upptagen men blir ledig så fort bilen
+flyttas. Ingen behöver gissa.
+
+**Och vaknar bilen igen räknas strömmen.** En bil som pausat kan börja dra ström
+på nytt — för batterivård, eller förvärmning inför morgonen. Sessionen lever, så
+den strömmen hamnar på rätt räkning i stället för att bli gratis. Skärmen går
+tillbaka till "Laddar" av sig själv.
+
+**Kvitto-SMS:et kommer när kabeln dras ur**, inte när bilen blir full. Det var
+därför du fick din räkning mitt i natten medan bilen stod kvar till morgonen.
+
+**Klar upptäcks på nittio sekunder i stället för tjugo minuter.** Den gamla
+regeln väntade ut tjugo minuter utan effekt, oavsett vad boxen sa. Nu läses
+driftläget: Easee rapporterar läge 4 när bilen slutat ta emot ström, och det
+räcker med att det står sig i nittio sekunder. Att vara snabb är ofarligt nu —
+en förhastad slutsats avslutar ingenting längre, den rättar bara sig själv om
+bilen fortsätter.
+
+**Med en spärr som är hela poängen.** Läge 4 heter "Completed" hos Easee men
+betyder *bilen har pausat eller slutat ladda* — inte nödvändigtvis full. Och
+läge 2 rymmer både en färdig bil och en bil som står i kö bakom
+lastbalanseringen. Därför: stryper Equalizern är laddningen inte klar, oavsett
+hur länge effekten legat på noll. Att kalla det färdigt vore att skriva kvitto
+mitt i kön. De vaga lägena får fortfarande vänta ut sina tjugo minuter.
+
+*Simulatorn hade samma förväxling inbyggd — den lät strypning se ut som läge 4.
+Den är rättad, annars hade testet inte varit värt något.*
+
+**Startlänken i SMS:et fungerar för alltid.** Den var en engångsnyckel med tio
+minuters livslängd, så ett tryck dagen efter gav "Länken fungerar inte" — fast
+det fanns en obetald räkning bakom den. Nu leder länken till just den
+laddningens kvitto, hur lång tid som än gått.
+
+**Kvittosidan visar dina tidigare laddningar.** Datum, mängd, belopp och om de
+är betalda, med länk till varje kvitto. Praktiskt om någon laddat flera gånger
+och vill se vad som är kvar att betala.
+
+*Värt att veta: den som får en kvittolänk vidarebefordrad ser också personens
+övriga laddningar hos dig. Det är avsiktligt men inte gratis.*
+
+**46elks id och status står i loggen.** Ett SMS som "skickats" är bara ett SMS
+46elks tagit emot — leveransen är en annan sak. Utan id:t går ett uteblivet SMS
+inte att slå upp i deras panel. Loggraden säger nu *"Lämnat till 46elks"*, vilket
+är vad den alltid har betytt.
+
 ## 0.5.2
 
 **Gästsidan kraschade så fort kabeln satt i.** Två variabler i sidans skript
