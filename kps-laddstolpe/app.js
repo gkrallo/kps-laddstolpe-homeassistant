@@ -2673,6 +2673,22 @@ summary:focus-visible{outline:2px solid #E2B144;outline-offset:2px;border-radius
 .drow{display:flex;justify-content:space-between;gap:12px;padding:6px 0;font-variant-numeric:tabular-nums}
 .drow.tot{border-top:1px solid rgba(226,177,68,.2);margin-top:6px;padding-top:9px;color:#EDF3EF;font-weight:600}
 
+/* Prisdiagrammet. Två serier, en enda y-axel — bägge är kr/kWh, och att ge dem
+   var sin skala hade uppfunnit ett samband som inte finns. Färgerna är prövade
+   mot den här bakgrunden för färgblindhet: guld och blått ligger 27 steg isär
+   även vid protanopi, och guldet är nedstämt så det håller sig i det spann som
+   är läsbart mot mörkt. */
+.curve{margin-top:6px}
+.curve svg{width:100%;height:auto;display:block;touch-action:pan-y}
+.legend{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;
+  font-size:14.5px;color:#BFD2C6;margin:2px 0 10px}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.legend i{width:16px;height:3px;border-radius:2px;display:block}
+.readout{text-align:center;font-size:15px;color:#E6EFE9;min-height:22px;
+  margin:8px 0 2px;font-variant-numeric:tabular-nums}
+.readout b{color:#F3D082}
+.curvenote{font-size:13.5px;color:#93A39B;line-height:1.5;margin:10px 0 0;text-align:center}
+
 .field{margin-bottom:14px}
 .field label{display:block;font-size:14.5px;color:#BFD2C6;margin-bottom:7px}
 .field input{width:100%;font:inherit;font-size:21px;font-weight:500;letter-spacing:.02em;
@@ -2803,15 +2819,207 @@ button.btn + button.btn{margin-top:10px}
     return m + ' min';
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Elpriset framåt                                                     */
+  /* ------------------------------------------------------------------ */
+
+  var SERIE_TOTAL = '#c98500';   // vårt pris — det gästen faktiskt betalar
+  var SERIE_SPOT  = '#3987e5';   // elbörsen
+  var curveOpen = false;         // överlever en ombyggnad av vyn
+  var curveData = null;          // hämtas en gång, inte vid varje ritning
+
+  function curveBlock() {
+    return '<details class="curve-d"' + (curveOpen ? ' open' : '') + '>' +
+      '<summary>Elpriset närmaste timmarna</summary>' +
+      '<div class="dbody" id="curveBody">' +
+      (curveData ? '' : '<p class="curvenote">Hämtar priserna…</p>') +
+      '</div></details>';
+  }
+
+  function hookCurve() {
+    var d = document.querySelector('.curve-d');
+    if (!d) return;
+    d.addEventListener('toggle', function () {
+      curveOpen = d.open;
+      if (d.open) laddaKurva();
+    });
+    if (d.open) laddaKurva();
+  }
+
+  function laddaKurva() {
+    if (curveData) return ritaKurva();
+    fetch('api/prices', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) { curveData = data; ritaKurva(); },
+            function () { kurvText('Priserna gick inte att hämta just nu.'); });
+  }
+
+  function kurvText(t) {
+    var b = document.getElementById('curveBody');
+    if (b) b.innerHTML = '<p class="curvenote">' + esc(t) + '</p>';
+  }
+
+  /**
+   * En trappa, inte en lutande linje.
+   *
+   * Elbörsens pris är konstant inom varje kvart och byter tvärt vid kvartsskiftet.
+   * En linje som lutar mellan punkterna påstår att priset glider däremellan, och
+   * det gör det inte — man skulle läsa av fel pris för nästan varje tidpunkt.
+   */
+  function ritaKurva() {
+    var b = document.getElementById('curveBody');
+    if (!b || !curveData) return;
+    var pts = curveData.points || [];
+    if (pts.length < 2) {
+      return kurvText('Elbörsen har inte lämnat några priser för de kommande timmarna än. '
+        + 'Morgondagens priser brukar komma vid ettiden på eftermiddagen.');
+    }
+
+    var W = 320, H = 150, L = 40, R = 8, T = 12, B = 26;   // ritytans marginaler
+    var t0 = Date.parse(pts[0].t);
+    var t1 = Date.parse(pts[pts.length - 1].t) + 15 * 60000;   // sista kvarten räknas hel
+
+    var hi = 0, lo = 0, i;
+    for (i = 0; i < pts.length; i++) {
+      if (pts[i].total > hi) hi = pts[i].total;
+      if (pts[i].spot < lo) lo = pts[i].spot;      // spotpriset kan vara negativt
+    }
+    hi = Math.ceil(hi * 10) / 10 || 1;
+    lo = Math.floor(lo * 10) / 10;
+    if (hi - lo < 0.5) hi = lo + 0.5;
+
+    var x = function (ms) { return L + (ms - t0) / (t1 - t0) * (W - L - R); };
+    var y = function (v) { return T + (hi - v) / (hi - lo) * (H - T - B); };
+
+    // Trappan: vågrätt genom kvarten, lodrätt vid skiftet.
+    var trappa = function (falt) {
+      var d = '';
+      for (var i = 0; i < pts.length; i++) {
+        var ms = Date.parse(pts[i].t);
+        var yv = y(pts[i][falt]);
+        d += (i === 0 ? 'M' : 'L') + x(ms).toFixed(1) + ' ' + yv.toFixed(1);
+        d += 'L' + x(ms + 15 * 60000).toFixed(1) + ' ' + yv.toFixed(1);
+      }
+      return d;
+    };
+
+    // Hårfina stödlinjer, en nyans från bakgrunden. Aldrig streckade.
+    var grid = '', etiketter = '';
+    var steg = [lo, lo + (hi - lo) / 2, hi];
+    for (i = 0; i < steg.length; i++) {
+      var gy = y(steg[i]).toFixed(1);
+      grid += '<line x1="' + L + '" y1="' + gy + '" x2="' + (W - R) + '" y2="' + gy + '" stroke="rgba(226,177,68,.14)" stroke-width="1"/>';
+      etiketter += '<text x="' + (L - 6) + '" y="' + (Number(gy) + 4) + '" text-anchor="end" font-size="11" fill="#8FA398">' + kr(steg[i]) + '</text>';
+    }
+    // Nollinjen får synas när elbörsen går under noll. Att spotpriset kan vara
+    // negativt medan ditt pris ändå är över en krona är hela poängen med att
+    // visa båda kurvorna.
+    if (lo < 0) {
+      grid += '<line x1="' + L + '" y1="' + y(0).toFixed(1) + '" x2="' + (W - R) + '" y2="' + y(0).toFixed(1) + '" stroke="rgba(230,239,233,.34)" stroke-width="1"/>';
+      // Nollan får bara sitt namn utskrivet om den inte trängs med etiketten
+      // under. Två tal ovanpå varandra är svårare att läsa än inget tal alls.
+      if (Math.abs(y(0) - y(lo)) > 13) {
+        grid += '<text x="' + (L - 6) + '" y="' + (y(0) + 4).toFixed(1) + '" text-anchor="end" font-size="11" fill="#8FA398">0</text>';
+      }
+    }
+
+    /* Timmarna längs botten, var tredje timme så de inte krockar.
+       Vänsterkanten heter "nu" i stället för sitt klockslag. Kurvan börjar per
+       definition i den kvart vi står i, så en lodrät nu-linje hade alltid legat
+       längst till vänster och bara upprepat vad ramen redan säger — dessutom
+       krockade dess etikett med det översta värdet på y-axeln. */
+    var timmar = '<text x="' + L + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="#BFD2C6">nu</text>';
+    for (i = 0; i < pts.length; i++) {
+      var d0 = new Date(pts[i].t);
+      if (d0.getMinutes() !== 0 || d0.getHours() % 3 !== 0) continue;
+      var tx = x(Date.parse(pts[i].t));
+      if (tx > W - R - 12 || tx < L + 26) continue;
+      timmar += '<text x="' + tx.toFixed(1) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="#8FA398">'
+        + tvasiffrig(d0.getHours()) + '</text>';
+    }
+    var nuLinje = '';
+
+    // Billigaste kvarten — den enda punkt som är värd en egen etikett.
+    var billigast = 0;
+    for (i = 1; i < pts.length; i++) if (pts[i].total < pts[billigast].total) billigast = i;
+    var bx = x(Date.parse(pts[billigast].t) + 7.5 * 60000), by = y(pts[billigast].total);
+    var billigMark = '<circle cx="' + bx.toFixed(1) + '" cy="' + by.toFixed(1) + '" r="4" fill="' + SERIE_TOTAL + '" stroke="#12241b" stroke-width="2"/>';
+
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Elpriset de närmaste timmarna">'
+      + grid + etiketter + timmar + nuLinje
+      + '<path d="' + trappa('spot') + '" fill="none" stroke="' + SERIE_SPOT + '" stroke-width="2" stroke-linejoin="round"/>'
+      + '<path d="' + trappa('total') + '" fill="none" stroke="' + SERIE_TOTAL + '" stroke-width="2" stroke-linejoin="round"/>'
+      + billigMark
+      + '<line id="cross" x1="0" y1="' + T + '" x2="0" y2="' + (H - B) + '" stroke="#E6EFE9" stroke-width="1" opacity="0"/>'
+      + '<rect id="hit" x="' + L + '" y="0" width="' + (W - L - R) + '" height="' + H + '" fill="transparent"/>'
+      + '</svg>';
+
+    var d1 = new Date(pts[billigast].t);
+    b.innerHTML =
+      '<div class="legend">'
+      + '<span><i style="background:' + SERIE_TOTAL + '"></i>Vårt pris</span>'
+      + '<span><i style="background:' + SERIE_SPOT + '"></i>Elbörsen</span>'
+      + '</div>'
+      + '<div class="curve">' + svg + '</div>'
+      + '<div class="readout" id="readout">Billigast ' + tvasiffrig(d1.getHours()) + ':' + tvasiffrig(d1.getMinutes())
+      + ' — <b>' + kr(pts[billigast].total) + ' kr/kWh</b></div>'
+      + '<p class="curvenote">Dra fingret över kurvan för att se priset en viss tid. '
+      + 'Priset gäller kvarten ut och byter tvärt vid kvartsskiftet — därför trappstegen.</p>';
+
+    kopplaKrysshar(b, pts, x, t0, t1, L, W, R);
+  }
+
+  function tvasiffrig(n) { return (n < 10 ? '0' : '') + n; }
+
+  /** Dra fingret, läs priset. Träffytan är hela diagrammets höjd. */
+  function kopplaKrysshar(b, pts, x, t0, t1, L, W, R) {
+    var svg = b.querySelector('svg');
+    var cross = b.querySelector('#cross');
+    var hit = b.querySelector('#hit');
+    var ut = b.querySelector('#readout');
+    if (!svg || !cross || !hit || !ut) return;
+    var original = ut.innerHTML;
+
+    function las(ev) {
+      var box = svg.getBoundingClientRect();
+      var px = ((ev.touches ? ev.touches[0].clientX : ev.clientX) - box.left) / box.width * W;
+      var andel = (px - L) / (W - L - R);
+      if (andel < 0) andel = 0; if (andel > 1) andel = 1;
+      var ms = t0 + andel * (t1 - t0);
+      var narmast = 0, bast = Infinity;
+      for (var i = 0; i < pts.length; i++) {
+        var d = Math.abs(Date.parse(pts[i].t) + 7.5 * 60000 - ms);
+        if (d < bast) { bast = d; narmast = i; }
+      }
+      var p = pts[narmast], dt = new Date(p.t);
+      cross.setAttribute('x1', x(Date.parse(p.t) + 7.5 * 60000).toFixed(1));
+      cross.setAttribute('x2', x(Date.parse(p.t) + 7.5 * 60000).toFixed(1));
+      cross.setAttribute('opacity', '1');
+      ut.innerHTML = tvasiffrig(dt.getHours()) + ':' + tvasiffrig(dt.getMinutes())
+        + ' — <b>' + kr(p.total) + ' kr/kWh</b>, varav elbörsen ' + kr(p.spot) + ' kr';
+    }
+    function slapp() { cross.setAttribute('opacity', '0'); ut.innerHTML = original; }
+
+    hit.addEventListener('pointerdown', las);
+    hit.addEventListener('pointermove', function (e) { if (e.buttons || e.pointerType === 'touch') las(e); });
+    hit.addEventListener('pointerup', slapp);
+    hit.addEventListener('pointerleave', slapp);
+    hit.addEventListener('pointercancel', slapp);
+  }
+
   function priceBlock(p, compact) {
     if (!p) {
+      // Panelen följer med även utan prisuppgift. Den som undrar varför priset
+      // saknas får svaret där — i stället för en tom rad utan förklaring.
       return '<div class="pricebox"><div class="lbl">Priset just nu</div>' +
-             '<div class="sub" style="margin-top:0">Prisuppgift saknas just nu.<br>Laddningen mäts ändå och räknas rätt.</div></div>';
+             '<div class="sub" style="margin-top:0">Prisuppgift saknas just nu.<br>Laddningen mäts ändå och räknas rätt.</div></div>' +
+             curveBlock();
     }
     if (compact) {
       return '<div class="pricebox" style="padding:13px 14px"><div class="sub" style="margin-top:0">' +
              'Priset just nu <strong style="color:#F3D082">' + kr(p.totalSek) + ' kr/kWh</strong><br>' +
-             'Varav elbörsen ' + kr(p.spotSek) + ' kr.</div></div>';
+             'Varav elbörsen ' + kr(p.spotSek) + ' kr.</div></div>' +
+             curveBlock();
     }
     return '<div class="pricebox">' +
       '<div class="lbl">Priset just nu</div>' +
@@ -2824,7 +3032,8 @@ button.btn + button.btn{margin-top:10px}
       '<div class="drow"><span>Avgift för stolpen</span><span>' + kr(p.serviceSek) + ' kr</span></div>' +
       '<div class="drow tot"><span>Per kWh</span><span>' + kr(p.totalSek) + ' kr</span></div>' +
       '<p style="margin:12px 0 0">Elbörsens pris ändras var femtonde minut. Du betalar det som gäller just den kvart du laddar, inte ett snittpris.</p>' +
-      '</div></details>';
+      '</div></details>' +
+      curveBlock();
   }
 
   function noticeBlock() {
@@ -2941,9 +3150,15 @@ button.btn + button.btn{margin-top:10px}
                s.contact, s.contact === 'ok' ? 0 : Math.round((s.ageSeconds || 0) / 15),
                s.mine, receipt && receipt.number].join('|');
 
-    // Rör inte DOM:en om inget ändrats — annars tappar man markören i textfältet
-    var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
-    if (key === lastKey && typing) return;
+    /* Rör inte DOM:en om ingenting ändrats.
+       Villkoret var "key === lastKey && typing", alltså hoppade den bara över
+       ombyggnaden medan någon skrev i ett fält. Resten av tiden byggdes hela
+       vyn om vid varje avläsning — var femte sekund — och skrev då tillbaka
+       serverns råa energivärde i rutan. Mellan gångerna räknade tickSmooth()
+       upp den fyra gånger i sekunden. Resultatet var sågtanden: 29,45 · 29,46 ·
+       29,47 · 29,45 · 29,46 … i all oändlighet, eftersom serverns värde inte
+       hann ändra sig mellan pollningarna. */
+    if (key === lastKey) return;
     lastKey = key;
 
     var liveClass = 'live', liveText = 'Ledig';
@@ -3105,7 +3320,13 @@ button.btn + button.btn{margin-top:10px}
         '</div>' +
         (d.usedEstimatedPrice ? '<div class="msg info">Delar av laddningen prissattes mot senast kända elpris eftersom elbörsen inte svarade.</div>' : '') +
         (d.unpricedKwh > 0 ? '<div class="msg info">' + num(d.unpricedKwh, 2) + ' kWh är ännu inte prissatta — appen saknar elpris för den perioden. Energin är mätt och står kvar.</div>' : '') +
-        '<div class="msg info">Swish och SMS-kvitto kopplas in i fas 5.</div>' +
+        // Här stod "Swish och SMS-kvitto kopplas in i fas 5" kvar sedan fas 2.
+        // Båda finns sedan länge — och det är betalningen gästen ska ledas till.
+        (d.receiptKey
+          ? '<a class="btn" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(d.receiptKey) + '">Betala med Swish</a>'
+          : '') +
+        '<p style="text-align:center;font-size:14px;color:#93A39B;margin:14px 0 0;line-height:1.5">' +
+        'Kvittot har skickats till din mobil. Länken i SMS:et leder hit och fungerar tills du betalat.</p>' +
         '<button class="btn ghost" id="againBtn">Klar</button>';
       var ab = document.getElementById('againBtn');
       if (ab) ab.addEventListener('click', function () {
@@ -3135,6 +3356,9 @@ button.btn + button.btn{margin-top:10px}
       el.lead.textContent = lead;
       el.slot.innerHTML = noticeBlock() + receiptBanner();
     }
+
+    // Prispanelen finns bara i några vyer; hookCurve gör ingenting i de andra.
+    hookCurve();
 
     if (s.mode === 'simulering') {
       el.foot.innerHTML = '<span class="simbadge">Simuleringsläge</span><br>Ingen riktig laddbox är inkopplad.';
@@ -3251,16 +3475,32 @@ button.btn + button.btn{margin-top:10px}
    * Det här är enbart för ögat. Det som debiteras är alltid de riktiga
    * mätvärdena från laddboxen; den här uppskattningen når aldrig kvittot.
    */
+  /* Vad som senast visades, så siffrorna aldrig backar. Energi som gått genom
+     kabeln kommer inte tillbaka; ser man talet sjunka tror man att appen räknar
+     fel. Är uppskattningen före det uppmätta värdet får den stå still tills
+     mätvärdet hunnit ikapp, i stället för att hoppa bakåt. */
+  var visadKwh = 0, visadKr = 0, visadFor = null;
+
+  // Hur länge vi vågar räkna vidare på egen hand. Har vi inte hört av boxen på
+  // en och en halv minut vet vi inte att bilen fortfarande laddar, och då ska
+  // siffran stå stilla i stället för att uppfinna energi.
+  var MAX_GISSNING_MS = 90 * 1000;
+
   function tickSmooth() {
     if (!state || state.view !== 'charging' || !state.session) return;
     var ses = state.session;
     var kwEl = document.getElementById('vKw');
     if (!kwEl) return;
 
-    var sinceMeasureMs = lagMs + (Date.now() - receivedAt);
+    if (visadFor !== ses.number) { visadFor = ses.number; visadKwh = 0; visadKr = 0; }
+
+    var sinceMeasureMs = Math.min(lagMs + (Date.now() - receivedAt), MAX_GISSNING_MS);
     var extraKwh = (Number(ses.powerKw) || 0) * (sinceMeasureMs / 3600000);
     var estKwh = Number(ses.energyKwh) + extraKwh;
     var estKr = Number(ses.costSek) + (state.price ? extraKwh * state.price.totalSek : 0);
+
+    estKwh = Math.max(estKwh, visadKwh); visadKwh = estKwh;
+    estKr = Math.max(estKr, visadKr); visadKr = estKr;
 
     var krEl = document.getElementById('vKr');
     var kwhEl = document.getElementById('vKwh');
@@ -5080,7 +5320,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, readJsonBody } = httpModule;
 
-const VERSION = '0.6.1';
+const VERSION = '0.7.0';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -5402,6 +5642,29 @@ guest.post('/api/clienterror', async (req, res, ctx) => {
   if (stack) log.debug(`[Gästsidan] ${stack}`);
   return sendJson(res, 200, { ok: true });
 });
+
+/**
+ * Elpriset framåt. Egen adress, inte en del av statussvaret.
+ *
+ * Statussvaret hämtas var femte sekund av varje öppen telefon; att lägga
+ * fyrtioåtta kvartspriser i det vore att skicka samma tabell om och om igen för
+ * något gästen tittar på en gång. Den här hämtas när panelen fälls ut.
+ */
+guest.get('/api/prices', (req, res) => {
+  const punkter = prices.forecast(12).map((p) => ({
+    t: p.t,
+    spot: round2(p.spotSek),
+    total: round2(p.totalSek),
+  }));
+  return sendJson(res, 200, {
+    points: punkter,
+    now: prices.currentPrice(),
+    zone: config.ha().price_zone || 'SE3',
+    serverTime: new Date().toISOString(),
+  });
+});
+
+function round2(n) { return Math.round(Number(n || 0) * 1000) / 1000; }
 
 guest.get('/api/status', (req, res, ctx) => {
   loop.noteGuestPoll();
