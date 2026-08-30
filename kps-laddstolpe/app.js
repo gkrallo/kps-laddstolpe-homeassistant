@@ -2781,14 +2781,20 @@ summary:focus-visible{outline:2px solid #E2B144;outline-offset:2px;border-radius
   background:rgba(10,20,15,.7);color:#fff}
 .field input::placeholder{color:#6F8578;font-weight:400}
 
-button.btn{display:block;width:100%;font:inherit;font-size:19px;font-weight:600;
+/* Knappstilen gällde bara <button>, aldrig <a>. En länk med class="btn" fick
+   därför ingen knappstil alls — den blev en rad lila text, eftersom
+   webbläsarens egen regel för besökta länkar (a:visited) väger tyngre än en
+   klass. Därför står färgen utskriven för a.btn i alla lägen. */
+button.btn,a.btn{display:block;width:100%;font:inherit;font-size:19px;font-weight:600;
   padding:18px 16px;border-radius:14px;border:0;background:#E2B144;color:#14231A;cursor:pointer;
-  letter-spacing:-.01em}
+  letter-spacing:-.01em;text-align:center;text-decoration:none;box-sizing:border-box}
+a.btn,a.btn:link,a.btn:visited,a.btn:hover,a.btn:active{color:#14231A}
+a.btn.ghost,a.btn.ghost:link,a.btn.ghost:visited{color:#E6EFE9}
 button.btn[disabled]{opacity:.55;cursor:default}
-button.btn:focus-visible{outline:3px solid #F3D082;outline-offset:3px}
-button.btn.ghost{background:transparent;color:#E6EFE9;border:1.5px solid rgba(230,239,233,.35)}
+button.btn:focus-visible,a.btn:focus-visible{outline:3px solid #F3D082;outline-offset:3px}
+button.btn.ghost,a.btn.ghost{background:transparent;color:#E6EFE9;border:1.5px solid rgba(230,239,233,.35)}
 button.btn.stop{background:transparent;color:#F0A79E;border:1.5px solid rgba(240,167,158,.5)}
-button.btn + button.btn{margin-top:10px}
+button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{margin-top:10px}
 
 .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
 .stat{background:rgba(10,20,15,.5);border:1px solid rgba(226,177,68,.2);border-radius:13px;padding:15px 14px;text-align:center}
@@ -3420,7 +3426,7 @@ button.btn + button.btn{margin-top:10px}
         (f.free
           ? '<div class="msg info">Fri laddning — ingen betalning.</div>'
           : '<div class="msg info">Kvittot skickas när kabeln dras ur.</div>') +
-        (mitt && f.receiptKey ? '<a class="btn ghost" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(f.receiptKey) + '">' + (f.free ? 'Visa sammanställning' : 'Öppna kvitto och betala') + '</a>' : '');
+        (mitt && f.receiptKey ? '<a class="btn ghost" href="k/' + encodeURIComponent(f.receiptKey) + '">' + (f.free ? 'Visa sammanställning' : 'Öppna kvitto och betala') + '</a>' : '');
 
     } else if (s.view === 'readonly') {
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
@@ -3453,15 +3459,21 @@ button.btn + button.btn{margin-top:10px}
         (d.unpricedKwh > 0 ? '<div class="msg info">' + num(d.unpricedKwh, 2) + ' kWh är ännu inte prissatta — appen saknar elpris för den perioden. Energin är mätt och står kvar.</div>' : '') +
         // Här stod "Swish och SMS-kvitto kopplas in i fas 5" kvar sedan fas 2.
         // Båda finns sedan länge — och det är betalningen gästen ska ledas till.
+        // Har gästen redan kvitterat ska knappen inte be om betalning igen.
         (d.free
           ? '<div class="msg info">Fri laddning — ingen betalning. Siffran visar vad elen kostade.</div>'
-          : (d.receiptKey
-              ? '<a class="btn" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(d.receiptKey) + '">Betala med Swish</a>'
-              : '')) +
-        (d.free ? '' :
+          : !Number(d.costSek)
+            ? '<div class="msg info">Summan blev noll kronor. Det finns ingenting att betala.</div>'
+          : (d.payment === 'GUEST_CLAIMS_PAID'
+              ? '<div class="msg info">Du har markerat laddningen som betald. Väntar på bekräftelse.</div>'
+                + (d.receiptKey ? '<a class="btn ghost" href="k/' + encodeURIComponent(d.receiptKey) + '">Visa kvitto</a>' : '')
+              : (d.receiptKey
+                  ? '<a class="btn" href="k/' + encodeURIComponent(d.receiptKey) + '">Betala med Swish</a>'
+                  : ''))) +
+        (d.free || !Number(d.costSek) || d.payment === 'GUEST_CLAIMS_PAID' ? '' :
           '<p style="text-align:center;font-size:14px;color:#93A39B;margin:14px 0 0;line-height:1.5">' +
           'Kvittot har skickats till din mobil. Länken i SMS:et leder hit och fungerar tills du betalat.</p>') +
-        '<button class="btn ghost" id="againBtn">Klar</button>';
+        '<button class="btn ghost" id="againBtn">' + (d.free ? 'Klar' : 'Stäng') + '</button>';
       var ab = document.getElementById('againBtn');
       if (ab) ab.addEventListener('click', function () {
         var saved = recall();
@@ -3671,8 +3683,16 @@ button.btn + button.btn{margin-top:10px}
   function receiptBanner() {
     // Fri laddning har inget att betala och ska inte ligga och pasta motsatsen.
     if (!receipt || receipt.status !== 'COMPLETED' || receipt.payment === 'FREE') return '';
+    if (!Number(receipt.costSek)) return '';   // noll kronor ar inget att paminna om
+    /* Har gasten redan kvitterat far banderollen inte fortsatta kalla
+       laddningen obetald. Det var motsagelsen: man tryckte "Jag har betalat"
+       och mottes anda av "du har en obetald laddning" pa nasta skarm. */
+    var kvitterad = receipt.payment === 'GUEST_CLAIMS_PAID';
+    var text = kvitterad
+      ? 'Din laddning på ' + kr(receipt.costSek) + ' kr väntar på bekräftelse.'
+      : 'Du har en obetald laddning på ' + kr(receipt.costSek) + ' kr.';
     return '<div class="msg info" style="display:flex;justify-content:space-between;align-items:center;gap:12px">' +
-      '<span>Du har en obetald laddning på ' + kr(receipt.costSek) + ' kr.</span>' +
+      '<span>' + text + '</span>' +
       '<a href="#" id="openReceipt" style="color:#F3D082;white-space:nowrap;font-weight:600">Visa kvitto</a></div>';
   }
 
@@ -5537,6 +5557,10 @@ function render(session, swishData, place, tidigare) {
   // Fri laddning: sammanställning, inte räkning. Ingen Swish, ingen knapp att
   // markera som betald — det finns ingenting att betala.
   const fri = session.free === true || session.payment === 'FREE';
+  // En laddning som slutade på noll kronor har ingenting att betala. Att kalla
+  // den "obetald" och inte erbjuda nagon vag att betala vore att be om nagot
+  // som inte gar att gora.
+  const inget = !fri && Number(session.costSek) === 0;
   const paid = session.payment === 'CONFIRMED';
   const claimed = session.payment === 'GUEST_CLAIMS_PAID';
 
@@ -5581,15 +5605,28 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
 .qrcap{font-size:13px;color:#95AC9E;margin-top:10px;line-height:1.5}
 .btn{display:block;width:100%;text-align:center;font:inherit;font-size:19px;font-weight:600;
  padding:18px 16px;border-radius:14px;border:0;background:#E2B144;color:#14231A;
- cursor:pointer;text-decoration:none;margin-top:16px}
+ cursor:pointer;text-decoration:none;margin-top:16px;box-sizing:border-box}
+/* a:visited i webblasarens egen stilmall vager tyngre an en klass, sa fargen
+   maste skrivas ut for lankarna — annars blir knappen en rad lila text. */
+a.btn,a.btn:link,a.btn:visited,a.btn:hover,a.btn:active{color:#14231A}
+a.btn.ghost,a.btn.ghost:link,a.btn.ghost:visited{color:#E6EFE9}
 .btn.ghost{background:transparent;color:#E6EFE9;border:1.5px solid rgba(230,239,233,.35)}
 .btn[disabled]{opacity:.5}
+.btn:focus-visible{outline:3px solid #F3D082;outline-offset:3px}
 .manual{margin-top:20px;padding-top:18px;border-top:1px solid rgba(226,177,68,.14);
  font-size:14.5px;color:#AFC5B6;line-height:1.6}
 .manual b{color:#EDF3EF;font-variant-numeric:tabular-nums}
 .note{margin-top:18px;font-size:13px;color:rgba(232,240,234,.45);line-height:1.6;text-align:center}
 .msg{margin-top:14px;padding:12px 14px;border-radius:11px;font-size:14.5px;line-height:1.5;
  background:rgba(226,177,68,.1);border:1px solid rgba(226,177,68,.35);color:#EBCE93}
+.msg.claim{background:rgba(111,211,155,.09);border-color:rgba(111,211,155,.35);color:#BFE6CF}
+details{border-top:1px solid rgba(226,177,68,.18);margin-top:16px}
+summary{list-style:none;cursor:pointer;padding:13px 2px;font-size:15px;color:#C4D6C9;
+ display:flex;justify-content:space-between;align-items:center}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"+";font-size:19px;color:#E2B144;line-height:1}
+details[open] summary::after{content:"–"}
+.dbody{padding:0 2px 8px}
 
 .h2{font-size:19px;font-weight:600;margin:0 0 4px;color:#fff}
 .hrow{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;
@@ -5605,8 +5642,8 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
 <div class="wrap">
   <div class="top">
     <span class="place">${esc(place)}</span>
-    <span class="pill ${fri ? 'p-paid' : paid ? 'p-paid' : claimed ? 'p-claim' : 'p-open'}">
-      ${fri ? 'Fri laddning' : paid ? 'Betald' : claimed ? 'Du har markerat betald' : 'Obetald'}
+    <span class="pill ${fri || inget || paid ? 'p-paid' : claimed ? 'p-claim' : 'p-open'}">
+      ${fri ? 'Fri laddning' : inget ? 'Inget att betala' : paid ? 'Betald' : claimed ? 'Du har markerat betald' : 'Obetald'}
     </span>
   </div>
 
@@ -5629,7 +5666,25 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
       ? `<div class="msg">${kwh(session.unpricedKwh)} kWh av det som laddats är inte prissatt — appen saknar elpris för den perioden helt. Energin står med ovan, men kostnaden för den ingår inte i summan.</div>`
       : ''}
 
-    ${fri ? '<div class="msg">Fri laddning — ingen betalning. Summan visar vad elen kostade.</div>' : paid ? '' : swishData ? `
+    ${fri ? '<div class="msg">Fri laddning — ingen betalning. Summan visar vad elen kostade.</div>'
+      : inget ? '<div class="msg">Summan blev noll kronor. Det finns ingenting att betala.</div>'
+      : paid ? '' : swishData ? `
+    ${claimed ? `
+    <div class="msg claim">Du har markerat den här laddningen som betald.
+      ${esc(place)} bekräftar när betalningen kommit fram. Du behöver inte göra något mer.</div>
+    <details><summary>Betala igen om något gick fel</summary><div class="dbody">
+      <div class="qrbox">
+        <div class="qr">${swishData.svg}</div>
+        <p class="qrcap">Skanna med Swish-appen,<br>eller tryck på knappen nedan.</p>
+      </div>
+      <a class="btn" href="${esc(swishData.link)}">Öppna Swish och betala</a>
+      <div class="manual">
+        Eller swisha för hand:<br>
+        Nummer <b>${esc(swishData.number)}</b><br>
+        Belopp <b>${kr(swishData.amountSek)} kr</b><br>
+        Meddelande <b>${esc(swishData.message)}</b>
+      </div>
+    </div></details>` : `
     <div class="qrbox">
       <div class="qr">${swishData.svg}</div>
       <p class="qrcap">Skanna med Swish-appen,<br>eller tryck på knappen nedan.</p>
@@ -5643,7 +5698,7 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
       Nummer <b>${esc(swishData.number)}</b><br>
       Belopp <b>${kr(swishData.amountSek)} kr</b><br>
       Meddelande <b>${esc(swishData.message)}</b>
-    </div>` : `
+    </div>`}` : `
     <div class="msg">Inget Swish-nummer är inlagt i appen än.</div>`}
 
     ${paid ? '<p class="note">Tack, betalningen är bekräftad.</p>' : ''}
@@ -5700,7 +5755,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
