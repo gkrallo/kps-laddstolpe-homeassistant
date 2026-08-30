@@ -15,6 +15,9 @@ på Home Assistant i stället för i molnet.
 |---|---|---|
 | [KPs Laddstolpe](./kps-laddstolpe) | 0.8.1 | Fri laddning, ihågkomna telefoner, priskurva |
 
+Fullständig beskrivning i [DOCS.md](./kps-laddstolpe/DOCS.md), ändringar i
+[CHANGELOG.md](./kps-laddstolpe/CHANGELOG.md).
+
 ## Arkitektur
 
 Två separata webbservrar i samma tillägg, med helt skilda rutt-tabeller:
@@ -34,20 +37,27 @@ inställningar i Home Assistant.
 
 Hela tillägget ligger i **en enda fil**, `kps-laddstolpe/app.js`. Det är ett
 medvetet val: uppdatering sker genom att öppna filen, markera allt, klistra in
-den nya versionen och spara. Filen är indelad i tolv numrerade avsnitt med
+den nya versionen och spara. Filen är indelad i nitton numrerade avsnitt med
 tydliga rubriker.
 
 Inga npm-beroenden. Bara Nodes inbyggda moduler, inget React, inget byggsteg —
 tillägget byggs på sekunder på en Raspberry Pi i stället för minuter.
 
+Home Assistant ser en ny version först när raden `version:` i
+`kps-laddstolpe/config.yaml` ändrats. Byter man bara ut `app.js` händer
+ingenting.
+
 ## Faser
 
-| Fas | Innehåll |
-|---|---|
-| 1 | Anslutningstest — två lyssnare, certifikat, ingress |
-| 2 | Backend i simuleringsläge |
-| 3 | Skarp Easee, endast läsning |
-| 4 | Kommandon och färdigt gästgränssnitt |
-| 5 | SMS, Swish och kvitto |
-| 6 | Härdning och HA-sensorer |
-| 7 | Parallelldrift och avveckling av molnversionen |
+| Fas | Innehåll | |
+|---|---|---|
+| 1 | Anslutningstest — två lyssnare, certifikat, ingress | klar |
+| 2 | Backend i simuleringsläge | klar |
+| 3 | Skarp Easee, endast läsning | klar |
+| 4 | Kommandon och färdigt gästgränssnitt | klar |
+| 5 | SMS, Swish och kvitto | klar |
+| 6 | Härdning och HA-sensorer | |
+| 7 | Parallelldrift och avveckling av molnversionen | |
+
+Utöver faserna: ägarskap per laddning, fri laddning för familjen, ihågkomna
+telefoner, priskurva och appen på hemskärmen.

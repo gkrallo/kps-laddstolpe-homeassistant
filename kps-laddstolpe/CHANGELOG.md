@@ -1,5 +1,25 @@
 # Ändringslogg
 
+## 0.8.2
+
+Bara dokumentation och ordning i filen. Inget i hur appen fungerar.
+
+**DOCS.md var skriven för 0.5.0** och beskrev en app som slutade när bilen blev
+full. Den är omskriven för hur det faktiskt fungerar nu: sessionens tre lägen,
+ägarskapet per laddning, fri laddning, ihågkomna telefoner, priskurvan, appen på
+hemskärmen, betalningens fem lägen och alla inställningar i adminfliken. De gamla
+fasgrindarna är ersatta av ett avsnitt om vad man kan prova utan att det kostar
+något.
+
+**Avsnittsnumren i `app.js` gick inte att följa.** När de ihågkomna telefonerna
+lades in i 0.8.0 skrev de över rubriken för verifieringen, som därefter stod utan
+rubrik alls, och numren kom i oordning: 13, 14, 19, 15, 16, 17, 12, 18. Nu 1–19 i
+läsordning, med innehållsförteckningen högst upp i takt med filen. README:n
+påstod tolv avsnitt; det är nitton.
+
+**Två rubriker i adminfliken saknade sina svenska tecken:** *Ihagkomna telefoner*
+och *Ra API-inspektor*.
+
 ## 0.8.1
 
 **"Betala med Swish" var en rad lila text.** Knappstilen på gästsidan var

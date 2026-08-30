@@ -1,5 +1,5 @@
 name: KPs Laddstolpe
-version: "0.8.1"
+version: "0.8.2"
 slug: kps_laddstolpe
 description: Laddstolpe med spotprisdebitering, SMS-kvitto och Swish.
 url: https://github.com/gkrallo/kps-laddstolpe-homeassistant

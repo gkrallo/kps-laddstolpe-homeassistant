@@ -2,8 +2,9 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.5.0 — fas 5: SMS, verifiering, Swish och kvitto.**
-Hela gästflödet är på plats: kod via SMS, laddning, kvitto med Swish-QR.
+**Version 0.8.1.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
+med SMS, laddning som lever tills kabeln dras ur, priskurva, kvitto med
+Swish-QR, fri laddning för familjen och appen på hemskärmen.
 
 ## Installation
 
@@ -12,13 +13,20 @@ Hela gästflödet är på plats: kod via SMS, laddning, kvitto med Swish-QR.
 3. Stäng rutan. Installera tillägget som dyker upp under **KPs Laddstolpe**.
 4. Slå på **Starta vid uppstart**, **Vakthund** och **Visa i sidofältet**.
 
-Låt **Automatisk uppdatering** vara avstängd. Du vill välja själv när en ny fas installeras.
+Låt **Automatisk uppdatering** vara avstängd. Du vill välja själv när en ny
+version installeras.
+
+En ny version syns i Home Assistant först när raden `version:` i `config.yaml`
+har ändrats. HA tittar bara på den raden — byter du bara ut `app.js` händer
+ingenting.
 
 ## Inställningar
 
-Två sorters inställningar, medvetet åtskilda.
+Två sorters inställningar, medvetet åtskilda. Blandar man ihop dem får man
+antingen omstart vid varje avgiftsändring, eller hemligheter som ligger utanför
+Home Assistants säkerhetskopiering.
 
-**Här, under Konfiguration** — ändras nästan aldrig, kräver omstart:
+### Under Konfiguration — ändras nästan aldrig, kräver omstart
 
 | Alternativ | Standard | Betydelse |
 |---|---|---|
@@ -47,129 +55,280 @@ Två sorters inställningar, medvetet åtskilda.
 | `avlasning` | Riktig Easee, men **enbart läsning**. Inga kommandon skickas. |
 | `skarp` | Riktig Easee med kommandon. |
 
-**I adminfliken** — ändras ofta, slår igenom direkt: avgifter, strömgräns.
+Går något oväntat i skarpt läge: byt tillbaka till `avlasning`. Då slutar appen
+omedelbart skicka kommandon, utan att du behöver avinstallera något.
 
-## Grinden för fas 3
+### I adminfliken — ändras ofta, slår igenom direkt
 
-Först: **gör fas 2-proven igen i `simulering`** efter uppdateringen, så att
-ingenting gått sönder. De står längre ner.
+| Inställning | Standard | Var | Betydelse |
+|---|---|---|---|
+| Elhandelspåslag | 0,069 kr/kWh | Priser | Din självkostnad. |
+| Rörlig nätavgift | 0,122 kr/kWh | Priser | Din självkostnad. |
+| Energiskatt | 0,360 kr/kWh | Priser | Din självkostnad. |
+| Avgift för stolpen | 0,500 kr/kWh | Priser | Ditt påslag, egen rad på kvittot. |
+| Maxström | 16 A | Laddbox | Skickas till boxen. |
+| Ström vid tappad kontakt | 12 A | Laddbox | Vad boxen får dra om den tappar molnet. |
+| Låset på stolpen | på | Laddbox | Stänger av stolpen när ingen laddar. |
+| Kabellås under laddning | av | Laddbox | Av som standard — boxar med permanent kabellås sköter det själva. |
+| Kräv verifiering | på | SMS | Stäng bara av vid felsökning. |
+| Startförsök per timme och avsändare | 15 | SMS | Hela hushållet delar IP bakom hemmaroutern. |
+| Fria nummer | tom lista | SMS | Familjen. Se *Fri laddning* nedan. |
+| Kom ihåg telefoner | på | SMS | Se *Ihågkomna telefoner* nedan. |
+| SMS-läge | simulerat | SMS | Se *SMS-lägena* nedan. |
+| Vitlista | tom lista | SMS | Gäller i läget *Bara mina nummer*. |
+| SMS per dygn / per nummer och timme / per IP och timme | 40 / 3 / 5 | SMS | Tak, så att ett fel inte kan kosta pengar. |
 
-Byt sedan `mode` till `avlasning` och fyll i dina Easee-uppgifter. Fyra prov.
+## Så fungerar en laddning
 
-**1. Inloggningen fungerar.** Titta i loggen. Där ska stå
-*"[Easee] Inloggad. Token giltig i cirka 24 timmar."* Står det att inloggningen
-nekades är e-post eller lösenord fel.
-
-**2. Värdena stämmer.** Adminfliken → **Diagnostik**. Jämför `cableConnected`,
-`totalPower` och `sessionEnergy` med vad Easee-appen visar i mobilen. De ska vara
-samma. Sitter ingen kabel i ska `chargerOpMode` vara 1.
-
-**3. Inga kommandon slipper igenom.** Gästsidan ska säga *"Avläsningsläge"*
-längst ner, och även med kabeln i ska ingen startknapp visas.
-
-**4. Tokenförnyelsen håller ett dygn.** Det här provet tar tid men är det
-viktigaste. Låt tillägget rulla ett dygn. Gå sedan till adminfliken →
-**Laddbox** och titta på Easee-rutan:
-
-> **Inloggningar ska vara 1.** Tokenförnyelser ska vara 1 eller 2.
-> Anrop senaste timmen ska ligga runt 12 i viloläge.
-
-Stiger inloggningarna med tiden är något fel, och då ska vi stanna och rätta det
-innan vi går vidare. Den gamla molnappen loggade in **2 880 gånger per
-laddningsdygn** — det är precis så man blir IP-spärrad hos Easee, och en spärrad
-IP betyder att stolpen slutar svara helt.
-
-## Grinden för fas 4
-
-Gör proven i den här ordningen. Varje steg är farligare än det före, och
-poängen är att upptäcka fel medan konsekvensen fortfarande är liten.
-
-**Först i `simulering`:** tryck *Boxen vägrar stanna* på Laddbox-fliken under en
-pågående laddning, och försök sedan avsluta från mobilen. Appen ska **neka** och
-säga att kabeln behöver dras ur — sessionen ska leva vidare och fortsätta räkna.
-Tryck sedan *Boxen lyder igen* och avsluta som vanligt.
-
-Byt därefter `mode` till `skarp`. Ha bilen och dig själv på plats.
-
-**0. Öva på låset i `simulering` först.** Laddbox-fliken → *Stäng av stolpen*.
-Sätt sedan i kabeln och starta från gästsidan. Loggen ska visa
-*"slå på laddaren"* före *"starta laddning"*. Avsluta laddningen och kontrollera
-under Diagnostik att raden **Stolpen** säger *avstängd* igen.
-
-**1. Ofarligast först: maxström.** Laddbox-fliken → *Skicka maxström*. Ingen
-laddning pågår. Kontrollera i Easee-appen att värdet ändrats.
-
-**2. Stopp utan att något laddar.** Tryck *Stoppa laddning*. Ingenting ska hända
-och kommandot ska bekräftas. Titta i kommandologgen.
-
-**3. Start med din egen bil.** Sätt i kabeln, tryck *Starta laddning* i
-adminfliken. Bilen ska börja ladda inom en halvminut, och loggen ska säga
-*"bekräftat av laddboxen efter N s"*. Stoppa sedan från admin.
-
-**4. Hela gästflödet.** Sätt i kabeln, gå till gästsidan i mobilen, skriv ditt
-nummer och tryck *Starta laddning*. Låt den gå några minuter och titta på att
-kronorna stiger. Tryck *Avsluta laddning* och kontrollera kvittot.
-
-**5. Kabeln dras ur under pågående laddning.** Sessionen ska avslutas inom en
-minut och kvittot dyka upp i mobilen.
-
-> Går något oväntat: byt tillbaka `mode` till `avlasning`. Då slutar appen
-> omedelbart skicka kommandon, utan att du behöver avinstallera något.
-
-## Grinden för fas 5
-
-**Allt går att prova utan att ett enda SMS kostar något.** Låt `smsMode` stå på
-`simulerat` — koden hamnar då i adminfliken i stället för i din telefon.
-
-**1. Kodvägen.** Gästsidan → skriv ditt nummer → *Skicka kod*. Gå till
-adminfliken → **SMS** → Logg → *Visa*. Där står koden. Skriv in den på
-gästsidan. Laddningen ska starta.
-
-**2. Fel kod.** Skriv fyra fel siffror. Det ska stå hur många försök som är kvar,
-och efter fem ska koden spärras.
-
-**3. Länkvägen.** Begär en ny kod, kopiera länken ur SMS-loggen och klistra in
-den i webbläsaren. Laddningen ska starta direkt. Öppnar du samma länk igen ska
-den nekas.
-
-**4. Länken bunden till kabeln.** Begär en kod. Dra ur kabeln och sätt i den
-igen. Tryck sedan på länken. Den ska säga att kabeln kopplats ur och vägra
-starta — det är skyddet mot att starta laddning på fel bil.
-
-**5. Kvittot.** Avsluta en laddning. I SMS-loggen ska ett kvitto-SMS ligga med
-en länk. Öppna den. Kvittosidan ska visa belopp, en QR-kod, en Swish-knapp och
-numret i klartext.
-
-**6. Skanna QR-koden med mobilen.** Det här är det enda jag inte kunnat testa
-själv — det finns ingen QR-avkodare i min miljö, bara mina egna kontroller av
-att kodningen är matematiskt korrekt. Rikta Swish-appen mot skärmen och se att
-mottagare, belopp och meddelande blir rätt. **Betala inte** — kontrollera bara
-att uppgifterna stämmer, och avbryt.
-
-**7. Taken.** Sätt `smsMaxPerDay` till 2 i adminfliken och begär tre koder. Den
-tredje ska nekas. Sätt sedan tillbaka värdet.
-
-Först när allt detta stämmer: byt `smsMode` till **Bara mina nummer**, lägg ditt
-eget nummer i vitlistan, och gör om prov 1 och 5. Då kommer SMS:en på riktigt,
-men bara till dig.
-
-## Låset på stolpen
+### Låset
 
 Stolpen står avstängd när ingen laddar. Det är det som hindrar någon från att
-koppla in sig utan att gå via appen — Easee vägrar helt enkelt ge ström.
+koppla in sig utan att gå via appen — Easee vägrar helt enkelt ge ström. Appen
+slår på laddaren när någon startar och stänger av den igen efteråt.
 
-Appen sköter det åt dig: den slår på laddaren när någon startar och stänger av
-den igen när laddningen är slut. Brytaren finns i adminfliken under **Laddbox →
-Låset på stolpen** och är påslagen som standard.
+Vill du ladda din egen bil utan appen: tryck *Lås upp stolpen* i adminfliken,
+ladda via Easee-appen, och tryck *Lås stolpen* efteråt. Under **Diagnostik**
+visar raden *Stolpen* om den är avstängd just nu.
 
-Vill du ladda din egen bil utan att gå via appen: tryck *Lås upp stolpen* i
-adminfliken, ladda som vanligt via Easee-appen, och tryck *Lås stolpen* efteråt.
+### Numret
 
-Under **Diagnostik** visar raden *Stolpen* om den är avstängd just nu.
+Gästen skriver sitt mobilnummer, får en fyrsiffrig kod i ett SMS och skriver in
+den. SMS:et innehåller också en länk som startar direkt. Numret är ett bevis,
+inte ett textfält — det är det som gör laddningen spårbar.
+
+Koden är bunden till kabeln. Dras kabeln ur och sätts i igen efter att koden
+begärts vägrar länken starta. Det är skyddet mot att starta laddning på fel bil.
+
+### Sessionens tre lägen
+
+```
+CHARGING  →  FINISHED  →  COMPLETED
+laddar       bilen klar,   kabeln urdragen,
+             kabeln kvar   kvitto skickat
+```
+
+**Sessionen slutar inte när bilen blir full. Den slutar när kabeln dras ur.**
+Däremellan står det *"Bilen är klar"* med mängd och belopp: den som laddat ser
+att det är färdigt, den som kommer gående ser att stolpen är upptagen men blir
+ledig så fort bilen flyttas.
+
+Vaknar bilen igen — batterivård, förvärmning — går sessionen tillbaka till
+*Laddar* av sig själv, och den strömmen hamnar på rätt räkning.
+
+**Kvitto-SMS:et kommer vid urdragning**, inte när bilen blir full. Annars kom
+räkningen mitt i natten medan bilen stod kvar till morgonen.
+
+### Hur "klar" upptäcks
+
+Easee rapporterar driftläge 4 när bilen slutat ta emot ström. Det räcker med att
+det står sig i **nittio sekunder**. Men läge 4 heter "Completed" hos Easee och
+betyder *bilen har pausat eller slutat ladda* — inte nödvändigtvis full. Och
+läge 2 rymmer både en färdig bil och en bil som står i kö bakom
+lastbalanseringen.
+
+Därför spärren: **stryper Equalizern är laddningen inte klar**, hur länge
+effekten än legat på noll. De vaga lägena får vänta ut tjugo minuter i stället.
+Att vara snabb är ofarligt — en förhastad slutsats avslutar ingenting, den
+rättar bara sig själv om bilen fortsätter.
+
+### Ägarskap
+
+Telefonen som startade laddningen bär en nyckel. Den kommer antingen från
+startknappen eller från länken i SMS:et, och plockas bort ur adressraden direkt
+så att den inte följer med om sidan delas.
+
+Bara den nyckeln ger betallänken och knappen *Avsluta laddning*, både i
+gränssnittet och i servern. En förbipasserande ser att stolpen används, hur
+mycket som laddats och att den blir ledig när kabeln dras ur — men kan varken
+komma åt räkningen eller avbryta grannens laddning.
+
+## Fri laddning
+
+Adminfliken → **SMS → Fri laddning**. Skriv numren hur du vill: 070-123 45 67
+och +46701234567 räknas som samma nummer.
+
+Laddningen registreras ändå, **med den verkliga elkostnaden**, så att du kan se
+vad hushållets egen laddning kostar över en månad. Det som uteblir är avgiften
+för stolpen, kravet på betalning och kvitto-SMS:et.
+
+De ser priset **utan avgiften** — avgiften är din ersättning för slitage och
+meningslös internt. Elkostnaden står kvar, för det är den man behöver för att
+avgöra om det är rätt tid att ladda. Priskurvans form är identisk, så rådet om
+när man bör ladda är detsamma.
+
+Statusen slås upp vid varje start. Tar du bort ett nummer ur listan börjar det
+betala nästa gång. En pågående laddning behåller det den startade med.
+
+## Ihågkomna telefoner
+
+Den som en gång bekräftat sitt nummer med SMS slipper göra om det. Nästa gång
+står det *"Vi känner igen den här telefonen"* och en enda knapp. Grannen som
+laddar en gång om året möter samma nummerfält som förut.
+
+Nyckeln **sparas aldrig i klartext** — bara en hash, som ett lösenord. Och
+nyckeln bär bara *identitet*, alltså vilket nummer telefonen tillhör; om det
+numret laddar gratis avgörs separat vid varje start.
+
+Varje telefon syns i adminfliken med när den senast användes, går att namnge
+("Emils telefon") och att spärra. En spärr gäller omedelbart. Brytaren för hela
+funktionen ligger under **SMS → Ihågkomna telefoner**.
+
+## Appen på hemskärmen
+
+Gästsidan går att lägga till på hemskärmen och beter sig då som en app: eget
+fönster utan adressfält, eget kort i appväxlaren, egen ikon och startskärm.
+
+| | |
+|---|---|
+| **Android, Chrome** | Meny ⋮ → *Lägg till på startskärmen* |
+| **iPhone, Safari** | Dela-ikonen → *Lägg till på hemskärmen* |
+
+Det är inte bara utseende. En iPhone raderar allt en vanlig webbsida sparat
+efter sju dagars overksamhet — där ligger telefonens minne av vilken laddning
+som är dess egen, och nyckeln som gör att den slipper SMS nästa gång. Sidor på
+hemskärmen är undantagna. Det är förutsättningen för att "kom ihåg mig" ska
+hålla på en iPhone.
+
+**Ingen service worker, medvetet.** Hela appen är ett enda dokument, så det
+finns inget skal att spara skilt från logiken — en cache skulle kunna servera en
+hel gammal app efter en uppdatering. Priset är att Chrome inte självt föreslår
+installation; man får välja det i menyn.
+
+För den som laddar en enda gång ändras ingenting.
+
+## Priskurvan
+
+Längst ned på startsidan, bredvid *Hur räknas priset?*, fälls en kurva ut över
+de kommande tolv timmarna — eller så långt elbörsen lämnat priser.
+
+Två linjer, samma axel: **vårt pris** och **elbörsen**. Avståndet mellan dem är
+nätavgift, skatt och avgiften för stolpen, och det är hela poängen med att visa
+båda. Går elbörsen under noll syns det som en linje under nollstrecket medan
+vårt pris ändå ligger över en krona. **Ström är inte gratis för att börspriset
+är det.**
+
+Det är en trappa, inte en lutande linje: priset är konstant inom varje kvart och
+byter tvärt vid kvartsskiftet. Dra fingret över kurvan så visas priset för den
+kvarten. Billigaste kvarten är utmärkt med en punkt och står i klartext under
+diagrammet.
+
+Priserna hämtas först när panelen fälls ut.
+
+## Betalningen
+
+| Läge | Vad gästen ser |
+|---|---|
+| Obetald | *Betala med Swish* — knapp, QR-kod och numret i klartext. |
+| Du har markerat betald | Gästen har tryckt *Jag har betalat*. Knappen är borta; betalvägen ligger kvar under *Betala igen om något gick fel*. |
+| Betald | Du har bekräftat i adminfliken. Banderollen på startsidan försvinner. |
+| Inget att betala | Laddningen slutade på noll kronor. Ingen betalvy visas. |
+| Fri laddning | Sammanställning, inte räkning. Ingen Swish, ingen knapp. |
+
+Kvittolänken i SMS:et fungerar **för alltid**. Trycker man på den mitt under
+laddningen leder den till laddvyn, inte till kvittot — den som trycker mitt i
+vill se hur det går, inte få en räkning för något som inte är klart.
+
+Kvittosidan visar också numrets tidigare laddningar med datum, mängd, belopp och
+betalstatus. *Värt att veta: den som får en kvittolänk vidarebefordrad ser också
+personens övriga laddningar hos dig. Det är avsiktligt men inte gratis.*
+
+## SMS-lägena
+
+| Läge | Betyder |
+|---|---|
+| `simulerat` | Inget skickas. Koden hamnar i adminfliken under **SMS → Logg → Visa**. |
+| `dryrun` | Anropet byggs och loggas men skickas aldrig till 46elks. |
+| `whitelist` | Skickar bara till nummer i vitlistan. |
+| `live` | Skarpt. |
+
+Ett SMS som "skickats" är bara ett SMS 46elks tagit emot — leveransen är en
+annan sak. Loggraden säger därför *"Lämnat till 46elks"*, och 46elks id och
+status står med, så att ett uteblivet SMS går att slå upp i deras panel.
+
+## Så räknas priset
+
+Momsen ligger inbakad i självkostnaden och nämns aldrig, varken i gränssnittet
+eller på kvittot:
+
+```
+pris/kWh = (elbörspris + 0,069 + 0,122 + 0,360) × 1,25 + 0,500
+```
+
+Varje kilowattimme prissätts mot **den kvart den faktiskt levererades i**.
+Kvartarna matchas på tidsstämpel, aldrig på position i listan — annars blir
+varje pris fel de dygn som har 92 eller 100 kvartar på grund av
+sommartidsomställningen.
+
+Energi som mätts upp innan priset finns kastas inte. Den ligger kvar med sin
+tidsstämpel och prissätts i efterhand mot sin egen kvart så snart priset kommer.
+
+**Prisdata cachas** på disk med sju dygns historik. Ligger elprisetjustnu.se
+nere vid midnatt kan midnattskvarten ändå debiteras rätt. Saknas priset helt
+används senast kända värde, sessionen märks som uppskattad, och det står på
+kvittot. Appen gissar aldrig tyst.
+
+## Siffrorna på skärmen
+
+Mellan två avläsningar räknar webbläsaren vidare utifrån effekten, så beloppet
+stiger mjukt i stället för att stå still och sedan hoppa.
+
+Siffran backar aldrig. Effekten är ett ögonblicksvärde och energin är effekten
+summerad över tid, så uppskattningen springer regelbundet förbi mätvärdet —
+förut hoppade talet då tillbaka, om och om igen. Nu står den still tills
+mätvärdet hunnit ikapp. Hörs inget från laddboxen på nittio sekunder slutar
+skärmen räkna vidare helt, i stället för att uppfinna energi utifrån en effekt
+vi inte längre vet något om.
+
+**Det som debiteras är alltid de riktiga mätvärdena** från laddboxen, aldrig
+uppskattningen.
+
+## Tre avläsningstakter
+
+| Takt | När |
+|---|---|
+| var 10:e sekund | någon har gästsidan öppen |
+| var 30:e sekund | laddning pågår, eller kabeln sitter i, eller kontakten nyss tappats |
+| var 5:e minut | viloläge |
+
+Att någon står vid stolpen och tittar är den enda situation där en snabbare
+avläsning gör verklig nytta — det är då man vill se effekten ändras när
+lastbalanseraren griper in. Aktuell takt syns på adminfliken.
+
+**Easee-token hanteras varsamt.** En inloggning, sedan förnyelse med
+`refresh_token` innan den går ut. Vid 429 eller serverfel backar appen av
+exponentiellt, upp till en halvtimme. Femminuterstakten i viloläge är glest nog
+att vara hövlig, tätt nog att refresh-token inte ska hinna dö av inaktivitet —
+vilket den gör om ingen rör kontot på en vecka.
+
+Den gamla molnappen loggade in **2 880 gånger per laddningsdygn**. Det är precis
+så man blir IP-spärrad hos Easee, och en spärrad IP betyder att stolpen slutar
+svara helt.
+
+## Lagringen
+
+**Byggd för SD-kort.** Aktiv session skrivs som mest varannan minut, avslutade
+skrivs en gång till en separat fil. Allt skrivs till en `.tmp`-fil som byter
+namn på plats, så att ett strömavbrott mitt i en skrivning aldrig kan förstöra
+det som redan finns.
+
+Certifikatet i `/ssl` kontrolleras varje timme och byts ut i den igångvarande
+servern utan omstart, så att en förnyelse från DuckDNS slår igenom av sig själv.
+
+## Två ingångar
+
+| | Gästsidan | Adminfliken |
+|---|---|---|
+| Port | 8443, öppen i routern | 8099, endast internt |
+| Inloggning | Ingen | Din HA-inloggning, via Ingress |
+| Kan ändra inställningar | Nej — rutterna finns inte | Ja |
+
+Adminvägarna registreras aldrig på den publika servern. Det är inte ett lösenord
+som skyddar dem; de existerar helt enkelt inte där. Under **Diagnostik** finns
+hela listan över vad gästsidan kan svara på, så du kan se det själv.
 
 ## Att läsa lastbalanseringen
 
-Adminfliken → **Diagnostik** → *Lastbalansering* visar det som faktiskt styr hur
+Adminfliken → **Diagnostik → Lastbalansering** visar det som faktiskt styr hur
 snabbt bilen laddar:
 
 | Rad | Betyder |
@@ -186,106 +345,67 @@ enda siffra.
 
 ## Om du vill se rådata
 
-Adminfliken → **Diagnostik** → *Rå API-inspektör*. Knapparna visar Easees
+Adminfliken → **Diagnostik → Rå API-inspektör**. Knapparna visar Easees
 obearbetade svar för laddarstatus, detaljer, konfiguration, Equalizer och listan
 över dina laddboxar. Det är det snabbaste sättet att förstå varför boxen beter
 sig som den gör.
 
-## Grinden för fas 2, som referens
+## Att prova utan att det kostar något
 
-Fem prov i `simulering`. Alla görs utan bil och utan laddbox.
+Allt går att prova i `simulering` med `smsMode` på `simulerat`. Koden hamnar då i
+adminfliken i stället för i din telefon, och laddboxen är virtuell.
 
-**1. Priset hämtas.** Öppna adminfliken → **Priser**. Där ska stå antal kvartar
-för idag och gärna även morgondagen (släpps av Nord Pool vid 13–14-tiden).
-Rutan längst ner visar vad en kilowattimme kostar just nu.
+**Grunderna.** Laddbox-fliken → *Sätt i kabeln*. Gästsidan byter till *Redo att
+ladda*. Begär en kod, hämta den ur SMS-loggen, starta. *Spola fram 60 min* — och
+kontrollera att kostnaden ökat i takt med priset per kWh.
 
-**2. En laddning från början till slut.** Fliken **Laddbox** → *Sätt i kabeln*.
-Gästsidan byter till "Redo att ladda". Skriv ett mobilnummer, tryck *Starta
-laddning*. Gå tillbaka till admin → *Spola fram 60 min*. Kostnaden ska ha ökat
-och stämma mot priset per kWh gånger antal kWh.
+**Lastbalanseringen räknas rätt.** *Strypa till 0 kW*, sedan *Spola fram 60 min*.
+Energin ska stå still, kostnaden ska inte öka, och sessionen ska **inte**
+avslutas — strypning är inte samma sak som klar. Släpp sedan på effekten igen.
 
-**3. Lastbalanseringen räknas rätt.** Tryck *Strypa till 0 kW* och sedan
-*Spola fram 60 min*. **Energin ska stå still och kostnaden ska inte öka** — och
-sessionen ska inte avslutas. Det här är hela poängen med appen: en dyr kvart
-utan ström ska kosta noll. Tryck sedan *Släpp på effekten* och spola fram igen,
-så ska den öka som vanligt.
+**Klar men kabeln kvar.** Låt simulatorn bli klar. Gästsidan ska säga *Bilen är
+klar* — inte *Redo att ladda* — och inget kvitto-SMS ska ha skickats. Dra sedan
+ur kabeln: nu kommer kvittot.
 
-**4. Omstart mitt i en laddning.** Med en laddning igång: stoppa tillägget och
-starta det igen. Loggen ska säga *Återupptar pågående session*, och gästsidan
-ska visa samma kilowattimmar och kronor som innan. Ingenting får gå förlorat.
+**Omstart mitt i en laddning.** Stoppa tillägget och starta det igen. Loggen ska
+säga *Återupptar pågående session*, och gästsidan ska visa samma kilowattimmar
+och kronor som innan.
 
-**5. Kabeln dras ur.** Tryck *Dra ur kabeln*. Sessionen avslutas — men först
-efter **två** avläsningar i rad, inte den första. På mobilen ska kvittot dyka
-upp av sig självt inom några sekunder, med kilowattimmar, elkostnad, avgift och
-summa. Trycker du *Klar* och laddar om sidan ska en rad högst upp påminna om att
-laddningen är obetald. Kvittot finns också under **Sessioner** i adminfliken.
+**Boxen vägrar stanna.** Tryck *Boxen vägrar stanna* under en laddning och
+försök avsluta från mobilen. Appen ska neka och säga att kabeln behöver dras ur.
 
-### Varför två avläsningar och inte en
+**Fri laddning.** Lägg ditt eget nummer i *Fria nummer* och ladda. Ingen avgift i
+priset, ingen betalvy, inget kvitto-SMS — men laddningen ska ligga under
+**Sessioner** med sin verkliga elkostnad.
 
-Det är ingen betänketid för att hinna sätta i kabeln igen — drar man ur är
-laddningen slut. Det är ett filter mot en enda felaktig avläsning från Easees
-moln, som annars skulle avsluta en pågående laddning i onödan. Det kostar
-trettio sekunder och skyddar mot ett fel som är obehagligt att upptäcka i
-efterhand.
+**Ihågkommen telefon.** Ladda en gång med kod. Dra ur, sätt i, öppna gästsidan
+igen: nu ska det stå *Vi känner igen den här telefonen*. Spärra telefonen i
+adminfliken och prova igen — då ska nummerfältet vara tillbaka.
 
-## Vad som byggts
+**Taken.** Sätt `smsMaxPerDay` till 2 och begär tre koder. Den tredje ska nekas.
 
-**Prisberäkningen** följer formeln du valt. Momsen ligger inbakad i
-självkostnaden och nämns aldrig, varken i gränssnittet eller på kvittot:
+**QR-koden.** Det enda som inte går att prova härifrån. Rikta Swish-appen mot
+skärmen och se att mottagare, belopp och meddelande blir rätt. **Betala inte** —
+kontrollera bara att uppgifterna stämmer, och avbryt.
 
-```
-pris/kWh = (elbörspris + 0,069 + 0,122 + 0,360) × 1,25 + 0,500
-```
+Först när allt detta stämmer: byt `smsMode` till **Bara mina nummer**, lägg ditt
+eget nummer i vitlistan, och gör om koden och kvittot. Då kommer SMS:en på
+riktigt, men bara till dig.
 
-Varje kilowattimme prissätts mot den kvart den faktiskt levererades i.
-Kvartarna matchas på tidsstämpel, aldrig på position i listan — annars blir
-varje pris fel de dygn som har 92 eller 100 kvartar på grund av
-sommartidsomställningen.
+### Innan du går skarpt mot Easee
 
-**Prisdata cachas** på disk med sju dygns historik. Ligger elprisetjustnu.se
-nere vid midnatt kan midnattskvarten ändå debiteras rätt. Saknas priset helt
-används senast kända värde, sessionen märks som uppskattad, och det står på
-kvittot. Appen gissar aldrig tyst.
+Byt `mode` till `avlasning` och fyll i dina Easee-uppgifter. Loggen ska säga
+*"[Easee] Inloggad. Token giltig i cirka 24 timmar."* Jämför sedan
+`cableConnected`, `totalPower` och `sessionEnergy` under **Diagnostik** med vad
+Easee-appen visar i mobilen.
 
-**Lagringen är byggd för SD-kort.** Aktiv session skrivs som mest varannan
-minut, avslutade skrivs en gång till en separat fil. Allt skrivs till en
-`.tmp`-fil som byter namn på plats, så ett strömavbrott mitt i en skrivning
-aldrig kan förstöra det som redan finns.
+Låt det rulla ett dygn och titta på Easee-rutan under **Laddbox**:
 
-**Easee-token hanteras varsamt.** En inloggning, sedan förnyelse med
-`refresh_token` innan den går ut. Vid 429 eller serverfel backar appen av
-exponentiellt, upp till en halvtimme. Loopen pollar var 30:e sekund under
-laddning men bara var femte minut i viloläge — glest nog att vara hövlig, tätt
-nog att Easees refresh-token inte ska hinna dö av inaktivitet, vilket den gör
-om ingen rör kontot på en vecka.
+> **Inloggningar ska vara 1.** Tokenförnyelser 1 eller 2. Anrop senaste timmen
+> runt 12 i viloläge.
 
-**Tre avläsningstakter.** Var tionde sekund när någon har gästsidan öppen, var
-trettionde när en laddning pågår utan publik, var femte minut i viloläge. Att
-någon står vid stolpen och tittar är den enda situation där en snabbare
-avläsning gör verklig nytta — det är då man vill se effekten ändras när
-lastbalanseraren griper in. Aktuell takt syns på adminfliken.
-
-**Siffrorna tickar jämnt.** Mellan två avläsningar räknar webbläsaren vidare
-utifrån effekten, så beloppet stiger mjukt i stället för att stå still och sedan
-hoppa. Det är enbart för ögat: **det som debiteras är alltid de riktiga
-mätvärdena** från laddboxen, aldrig uppskattningen.
-
-**Certifikatet laddas om automatiskt.** Fas 1 läste `/ssl` en enda gång vid
-start, vilket betydde att tillägget hade fortsatt servera det gamla certifikatet
-efter att DuckDNS förnyat det. Nu kontrolleras filerna varje timme och byts ut i
-den igångvarande servern utan omstart.
-
-## Två ingångar
-
-| | Gästsidan | Adminfliken |
-|---|---|---|
-| Port | 8443, öppen i routern | 8099, endast internt |
-| Inloggning | Ingen | Din HA-inloggning, via Ingress |
-| Kan ändra inställningar | Nej — rutterna finns inte | Ja |
-
-Adminvägarna registreras aldrig på den publika servern. Det är inte ett lösenord
-som skyddar dem; de existerar helt enkelt inte där. Under **Diagnostik** finns
-hela listan över vad gästsidan kan svara på, så du kan se det själv.
+Stiger inloggningarna med tiden är något fel, och då ska det rättas innan du går
+vidare till `skarp`.
 
 ## Om det inte fungerar
 
@@ -293,10 +413,13 @@ hela listan över vad gästsidan kan svara på, så du kan se det själv.
 fil finns inte före ca kl 13 — det är normalt. Saknas även dagens har Pi:n
 troligen inte kommit ut på internet.
 
-**Gästsidan säger "Ingen kontakt med laddstolpen".** I simuleringsläge ska det
-inte hända — kontrollera att `mode` står på `simulering`. I avläsningsläge
-betyder det att Easee inte svarar; titta i loggen och i Easee-rutan under
-**Laddbox**.
+**Gästsidan säger "Telefonen når inte appen".** Telefonen fick inget svar från
+tillägget. Kontrollera att Pi:n är igång, att porten 8443 fortfarande
+vidarebefordras i routern och att certifikatet inte gått ut.
+
+**Gästsidan säger "Ingen kontakt med laddstolpen".** Här svarar tillägget, men
+det når inte Easee. I simuleringsläge ska det inte hända. I avläsnings- eller
+skarpt läge: titta i loggen och i Easee-rutan under **Laddbox**.
 
 **"Väntar N sekunder efter tidigare fel mot Easee."** Appen backar av med flit
 efter ett misslyckat anrop. Rätta orsaken, starta om tillägget, så nollställs
@@ -305,4 +428,25 @@ väntetiden.
 **Sessionen avslutas direkt när jag startar.** Kontrollera under **Diagnostik**
 att `cableConnected` är `true`.
 
+**"För många startförsök."** Taket ligger på 15 per timme och avsändare, och
+hela hushållet delar IP bakom hemmaroutern. Höj det under **SMS** om det tar i.
+
+**Gästen kommer inte åt betallänken.** Betallänken går bara till den telefon som
+startade laddningen. Har den telefonen rensat sitt minne finns länken kvar i
+kvitto-SMS:et — den fungerar för alltid.
+
 **Adminfliken är tom.** Slå på *Visa i sidofältet* under tilläggets Info-flik.
+
+**En laddning ligger kvar som obetald fast den är betald.** Bekräfta den under
+**Sessioner** i adminfliken. Det är bekräftelsen som tar bort banderollen hos
+gästen.
+
+## Så är koden upplagd
+
+Hela tillägget ligger i **en enda fil**, `app.js`, indelad i nitton numrerade
+avsnitt med tydliga rubriker. Inga npm-beroenden — bara Nodes inbyggda moduler,
+ingen React, inget byggsteg. Tillägget byggs på sekunder på en Raspberry Pi i
+stället för minuter.
+
+Inga lösenord eller nycklar ligger i repot. Allt sådant matas in i tilläggets
+inställningar i Home Assistant.

@@ -3,11 +3,10 @@
 /* ============================================================================
  *
  *  KPs Laddstolpe — Home Assistant-tillägg
- *  Fas 3: skarp Easee, endast avläsning
  *
  *  Hela tillägget ligger i den här enda filen. Det är ett medvetet val: du
  *  uppdaterar den genom att öppna filen på GitHub, markera allt, klistra in den
- *  nya versionen och spara. En fil att få rätt i stället för elva.
+ *  nya versionen och spara. En fil att få rätt i stället för nitton.
  *
  *  Inga npm-beroenden. Bara Nodes inbyggda moduler, ingen React, inget
  *  byggsteg — tillägget byggs på sekunder på en Raspberry Pi.
@@ -20,18 +19,25 @@
  *    4  Certifikat              med automatisk omladdning varje timme
  *    5  Elpriser                hämtning, cache, kvartsmatchning, prisformel
  *    6  Laddboxen               gemensamt gränssnitt + simulator
- *    7  Sessioner               kvartsvis kostnad, kvittonycklar
- *    8  Bakgrundsloopen         30 sekunder, kabelns löpnummer, auto-avslut
+ *    7  Sessioner               kvartsvis kostnad, kvittonycklar, ägarskap
+ *    8  Bakgrundsloopen         kabelns löpnummer, auto-avslut, tempo
  *    9  Webbservern             egen liten router, hastighetsbegränsare
- *   10  Gästsidan               HTML
- *   11  Adminfliken             HTML
- *   12  Rutter och uppstart
+ *   10  Gästsidan               HTML: ladda, priskurva, betala
+ *   11  Adminfliken             HTML: bara innanför Home Assistant
+ *   12  SMS                     46elks, lägen från simulerat till skarpt
+ *   13  Ihågkomna telefoner     enhetsnycklar, hashade på disk
+ *   14  Verifiering av mobilnummer
+ *   15  QR-koder                ritade för hand, inga beroenden
+ *   16  Swish                   betalsträngen och länken
+ *   17  Kvittosidan             permanent länk per laddning
+ *   18  Rutter och uppstart     två lyssnare med skilda rutt-tabeller
+ *   19  Ikoner och manifest     appen på hemskärmen
  *
  * ==========================================================================*/
 
 
 /* ========================================================================== */
-/* 1  Loggen                                                                */
+/*  1  Loggen                                                                */
 /* ========================================================================== */
 
 const log = (function () {
@@ -69,7 +75,7 @@ return {
 })();
 
 /* ========================================================================== */
-/* 2  Lagring på disk                                                       */
+/*  2  Lagring på disk                                                       */
 /* ========================================================================== */
 
 const store = (function () {
@@ -167,7 +173,7 @@ return { DATA_DIR, readJson, writeJsonNow, throttledWriter, ensureDir };
 })();
 
 /* ========================================================================== */
-/* 3  Inställningar                                                         */
+/*  3  Inställningar                                                         */
 /* ========================================================================== */
 
 const config = (function () {
@@ -387,7 +393,7 @@ return {
 })();
 
 /* ========================================================================== */
-/* 4  Certifikat                                                            */
+/*  4  Certifikat                                                            */
 /* ========================================================================== */
 
 const tls = (function () {
@@ -510,7 +516,7 @@ return { load, watch, check, status, current: () => current };
 })();
 
 /* ========================================================================== */
-/* 5  Elpriser                                                              */
+/*  5  Elpriser                                                              */
 /* ========================================================================== */
 
 const prices = (function () {
@@ -726,7 +732,7 @@ return { loadCache, refresh, spotAt, currentPrice, priceBreakdown, forecast, sta
 })();
 
 /* ========================================================================== */
-/* 6  Laddboxen                                                             */
+/*  6  Laddboxen                                                             */
 /* ========================================================================== */
 
 const chargerModule = (function () {
@@ -1565,7 +1571,7 @@ return { create, OP_MODE, NO_CURRENT_REASON, SimulatedCharger, EaseeCharger };
 })();
 
 /* ========================================================================== */
-/* 7  Sessioner                                                             */
+/*  7  Sessioner                                                             */
 /* ========================================================================== */
 
 const sessions = (function () {
@@ -1956,7 +1962,7 @@ return {
 })();
 
 /* ========================================================================== */
-/* 8  Bakgrundsloopen                                                       */
+/*  8  Bakgrundsloopen                                                       */
 /* ========================================================================== */
 
 const loop = (function () {
@@ -2443,7 +2449,7 @@ return {
 })();
 
 /* ========================================================================== */
-/* 9  Webbservern                                                           */
+/*  9  Webbservern                                                           */
 /* ========================================================================== */
 
 const httpModule = (function () {
@@ -2674,7 +2680,7 @@ return {
 })();
 
 /* ========================================================================== */
-/* 10  Gästsidan                                                            */
+/* 10  Gästsidan                                                             */
 /* ========================================================================== */
 
 const guestPage = (function () {
@@ -3833,7 +3839,7 @@ return { render };
 })();
 
 /* ========================================================================== */
-/* 11  Adminfliken                                                          */
+/* 11  Adminfliken                                                           */
 /* ========================================================================== */
 
 const adminPage = (function () {
@@ -4144,7 +4150,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       + 'nummer harifran borjar det betala nasta gang, utan att nagon behover rora deras telefon. '
       + 'En pagaende laddning behaller det den startade med.</p></div>';
 
-    h += '<div class="h">Ihagkomna telefoner</div><div class="card">'
+    h += '<div class="h">Ihågkomna telefoner</div><div class="card">'
       + '<div class="row"><span><span class="lab">Kom ihag telefoner</span>'
       + '<div class="hint">Den som en gang bekraftat sitt nummer slipper SMS nasta gang och startar '
       + 'med ett tryck. Nyckeln sparas bara som hash — aldrig i klartext.</div></span>'
@@ -4384,7 +4390,7 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       + '<p class="note">Hela listan över vad den publika servern kan svara på. Ingen adminväg finns med — det är inte ett lösenord som skyddar dem, de existerar helt enkelt inte här.</p>';
 
     if (D.easee) {
-      h += '<div class="h">Ra API-inspektor</div><div class="btns">'
+      h += '<div class="h">Rå API-inspektör</div><div class="btns">'
         + '<button class="b" data-act="raw" data-what="state">Laddarstatus</button>'
         + '<button class="b" data-act="raw" data-what="details">Detaljer</button>'
         + '<button class="b" data-act="raw" data-what="config">Konfiguration</button>'
@@ -4542,7 +4548,7 @@ return { render };
 })();
 
 /* ========================================================================== */
-/* 13  SMS                                                                    */
+/* 12  SMS                                                                   */
 /* ========================================================================== */
 
 const sms = (function () {
@@ -4803,9 +4809,7 @@ return { send, measure, normalize, status, loadCounters, recent: (n = 40) => log
 })();
 
 /* ========================================================================== */
-/* 14  Verifiering av mobilnummer                                             */
-/* ========================================================================== */
-/* 19  Ihagkomna telefoner                                                    */
+/* 13  Ihågkomna telefoner                                                   */
 /* ========================================================================== */
 
 const devices = (function () {
@@ -4948,6 +4952,8 @@ return { load, issue, resolve, all, revoke, rename, revokeByPhone, flush, maskPh
 })();
 
 /* ========================================================================== */
+/* 14  Verifiering av mobilnummer                                            */
+/* ========================================================================== */
 
 const verify = (function () {
 
@@ -5069,7 +5075,7 @@ return { begin, check, consume, stats, TTL_MS };
 })();
 
 /* ========================================================================== */
-/* 15  QR-koder                                                               */
+/* 15  QR-koder                                                              */
 /* ========================================================================== */
 
 const qr = (function () {
@@ -5426,7 +5432,7 @@ return { encode, svg };
 
 })();
 /* ========================================================================== */
-/* 16  Swish                                                                  */
+/* 16  Swish                                                                 */
 /* ========================================================================== */
 
 const swish = (function () {
@@ -5475,7 +5481,7 @@ return { payee, deepLink, qrPayload, qrSvg };
 })();
 
 /* ========================================================================== */
-/* 17  Kvittosidan                                                            */
+/* 17  Kvittosidan                                                           */
 /* ========================================================================== */
 
 const receiptPage = (function () {
@@ -5730,7 +5736,7 @@ return { render };
 })();
 
 /* ========================================================================== */
-/* 12  Rutter och uppstart                                                  */
+/* 18  Rutter och uppstart                                                   */
 /* ========================================================================== */
 
 /**
@@ -5755,7 +5761,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.8.1';
+const VERSION = '0.8.2';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -6053,7 +6059,7 @@ async function readStateForStart() {
 }
 
 /* ========================================================================== */
-/* 18  Ikoner och manifest                                                    */
+/* 19  Ikoner och manifest                                                   */
 /* ========================================================================== */
 
 /**
