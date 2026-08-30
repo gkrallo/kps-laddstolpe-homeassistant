@@ -1934,6 +1934,32 @@ function round(n, d) {
 function flush() { activeWriter.flush(); }
 
 /**
+ * Kryss i rutan: den här laddningen har redan delat ut en enhetsnyckel den här
+ * vägen. Varje väg har sin egen ruta, och det är med flit.
+ *
+ * En laddning som startas via länken i SMS:et kan mycket väl röra TVÅ
+ * webbläsare på samma telefon: länken öppnas i Safari, medan hemskärmsappen
+ * står kvar med koden den bad om. På en iPhone har de varsitt lager och är, ur
+ * stolpens synvinkel, två skilda telefoner. Båda har bevisat samma nummer, och
+ * båda ska bli ihågkomna — annars måste man skriva numret igen i den ena.
+ *
+ * Rutan finns bara för att en upprepad förfrågan inte ska fylla listan med
+ * dubbletter av samma webbläsare.
+ */
+function markDeviceIssued(id, vag) {
+  const falt = vag === 'claim' ? 'deviceClaimIssued' : 'deviceLinkIssued';
+  if (active && active.id === id) {
+    active[falt] = true;
+    activeWriter.save(active, { immediate: true });
+    return;
+  }
+  const s = history.find((x) => x.id === id);
+  if (!s) return;
+  s[falt] = true;
+  store.writeJsonNow(HISTORY_FILE, history);
+}
+
+/**
  * Endast för simuleringsläget.
  *
  * "Spola fram 60 minuter" flyttar simulatorns egen klocka, men inte
@@ -1955,7 +1981,7 @@ function shiftStartBack(minutes) {
 
 return {
   load, start, accumulate, finish, flush, shiftStartBack,
-  markFinished, resumeCharging, byStartToken, forPhone,
+  markFinished, resumeCharging, byStartToken, forPhone, markDeviceIssued,
   getActive, getHistory, byReceiptKey, unpaid, setPayment,
   publicView, maskPhone,
 };
@@ -2912,6 +2938,25 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
   function devGet() { try { return localStorage.getItem(DEV) || null; } catch (e) { return null; } }
   function devForget() { try { localStorage.removeItem(DEV); } catch (e) {} }
 
+  /* Koden vi bett om men annu inte anvant.
+     Den ligger pa disk, inte bara i en variabel, for att den ska overleva att
+     appen stangs. Trycker man pa lanken i SMS:et i stallet for att skriva
+     koden ar det har enda spar sidan har av att laddningen ar dess egen. */
+  var PEND = 'kps.pending';
+  var PEND_MAX_MS = 12 * 60 * 60 * 1000;
+  function pendSave(token, phone) {
+    try { localStorage.setItem(PEND, JSON.stringify({ token: token, phone: phone, at: Date.now() })); } catch (e) {}
+  }
+  function pendGet() {
+    try {
+      var v = JSON.parse(localStorage.getItem(PEND) || 'null');
+      if (!v || !v.token) return null;
+      if (Date.now() - (v.at || 0) > PEND_MAX_MS) { pendForget(); return null; }
+      return v;
+    } catch (e) { return null; }
+  }
+  function pendForget() { try { localStorage.removeItem(PEND); } catch (e) {} }
+
   function kr(n) { return Number(n).toFixed(2).replace('.', ','); }
   function num(n, d) { return Number(n).toFixed(d === undefined ? 1 : d).replace('.', ','); }
 
@@ -3572,6 +3617,14 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
         ? Math.max(0, Date.parse(data.serverTime) - Date.parse(data.readAt))
         : 0;
 
+      /* Ager telefonen ingen laddning, men har en kod den bett om? Da kan
+         laddningen ha startats med lanken i SMS:et, i en annan webblasare an
+         den har. Fraga servern — den vet vilken token som startade vad.
+         Ligger det har efter den tidiga returen nedan hade det aldrig gjorts
+         under en pagaende laddning, alltsa precis nar det behovs. */
+      var egen = recall();
+      if ((data.session && !data.session.receiptKey) || !(egen && egen.key)) tryClaim();
+
       if (data.session) { receipt = null; safeRender(); tickSmooth(); return; }
 
       // Kvittouppslaget har egen felhantering. Förut låg det i samma kedja, så
@@ -3722,6 +3775,10 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
         if (!res.ok) { setNotice('err', res.body.error || 'Koden kunde inte skickas.'); return; }
         verifyToken = res.body.token;
         verifyPhone = res.body.phone;
+        // Spara den ocksa pa disk: trycker gasten pa lanken i SMS:et i stallet
+        // for att skriva koden ar det harifran sidan hittar tillbaka till sin
+        // egen laddning, aven om appen stangts under tiden.
+        pendSave(res.body.token, res.body.phone);
         lastKey = '';
         setNotice(res.body.simulated ? 'info' : null,
           res.body.simulated ? 'Simuleringsläge: koden står i adminfliken under SMS.' : null);
@@ -3763,6 +3820,7 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
       .then(function (res) {
         busyAction = null;
         verifyToken = null; verifyPhone = null;
+        if (res.ok) pendForget();
         if (!res.ok) {
           // Nyckeln duger inte längre — spärrad, okänd eller avstängd funktion.
           // Glöm den, annars fastnar telefonen i ett läge som inte går att ta
@@ -3779,13 +3837,53 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
       .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
   }
 
+  /**
+   * Hamta hem en laddning som startades via lanken i SMS:et.
+   *
+   * Sidan bad om koden och sitter kvar med sin token. Startades laddningen med
+   * lanken i stallet svarar servern med kvittonyckeln — och med en enhetsnyckel,
+   * sa att telefonen ar ihagkommen nasta gang och det har inte behover handa om.
+   *
+   * Enda tillfallet det gors av: nagon laddar, sidan har en vantande kod, och
+   * telefonen ager ingen laddning. Da och bara da ar det har fragan att stalla.
+   */
+  var claimBusy = false, claimNast = 0;
+  function tryClaim() {
+    if (claimBusy || Date.now() < claimNast) return;
+    var p = pendGet();
+    if (!p) return;
+    claimBusy = true;
+    claimNast = Date.now() + 15000;
+    fetch('api/verify/claim', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: p.token })
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (b) {
+        claimBusy = false;
+        if (!b || !b.ok) return;
+        if (b.device) devSave(b.device);
+        if (b.receiptKey) remember({ key: b.receiptKey, dismissed: false });
+        pendForget();
+        verifyToken = null; verifyPhone = null;
+        // Beskedet om var koden star ar inte langre sant — den ar anvand.
+        setNotice(null, null);
+        lastKey = '';
+        poll();
+      }, function () { claimBusy = false; });
+  }
+
   function doStop() {
     busyAction = 'stop'; setNotice(null, null);
     var sparad = recall();
     fetch('api/stop', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ k: sparad && sparad.key ? sparad.key : null })
+      body: JSON.stringify({
+        k: sparad && sparad.key ? sparad.key : null,
+        d: devGet()
+      })
     })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
@@ -3819,9 +3917,14 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
    */
   (function fangaNyckel() {
     try {
-      var m = location.search.match(/[?&]k=([A-Za-z0-9_-]+)/);
-      if (!m) return;
-      remember({ key: decodeURIComponent(m[1]), dismissed: false });
+      var k = location.search.match(/[?&]k=([A-Za-z0-9_-]+)/);
+      // Enhetsnyckeln foljer med samma vag sedan 0.8.3, sa att telefonen blir
+      // ihagkommen aven nar laddningen startats fran lanken.
+      var d = location.search.match(/[?&]d=([A-Za-z0-9_-]+)/);
+      if (!k && !d) return;
+      if (k) remember({ key: decodeURIComponent(k[1]), dismissed: false });
+      if (d) devSave(decodeURIComponent(d[1]));
+      pendForget();
       if (history.replaceState) history.replaceState(null, '', location.pathname);
     } catch (e) { /* ingen nyckel, inget problem */ }
   })();
@@ -4533,7 +4636,13 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
 
   load();
   setInterval(function(){
-    var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
+    /* Pausa omladdningen medan nagon skriver.
+       Spärren tittade bara efter INPUT. Fälten för fria nummer och vitlistan
+       är TEXTAREA — flerradiga, ett nummer per rad — och räknades alltså aldrig
+       som "skriver". Var femte sekund revs hela panelen och det man skrivit
+       försvann med den, tillsammans med markören. */
+    var akt = document.activeElement;
+    var typing = !!akt && (/^(INPUT|TEXTAREA|SELECT)$/.test(akt.tagName) || akt.isContentEditable);
     var inspecting = current === 'diag' && document.getElementById('rawOut')
       && document.getElementById('rawOut').textContent.indexOf('{') === 0;
     if (!typing && !inspecting) load();
@@ -5761,7 +5870,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -6219,11 +6328,24 @@ guest.get('/api/status', (req, res, ctx) => {
   const enhet = devices.resolve(ctx.query.get('d'));
 
   /* Är det gästens egen laddning?
-     Telefonen visar upp kvittonyckeln den fick när laddningen startade. Bara
-     då får den tillbaka nyckeln i svaret — och därmed vägen till betalsidan.
+     Två vägar, och båda behövs.
+
+     1. KVITTONYCKELN. Telefonen visar upp nyckeln den fick när laddningen
+        startade. Den är bunden till just den laddningen.
+
+     2. NUMRET. En ihågkommen telefon vars nummer är samma som laddningens är
+        också ägare, även om just den webbläsaren aldrig sett kvittonyckeln.
+        Utan detta blev man främling för sin egen laddning så fort den startats
+        från en annan yta än den man tittar i — och på en iPhone är det
+        normalfallet: hemskärmsappen och Safari har varsitt eget lager, så en
+        länk i ett SMS öppnas alltid utanför appen och nyckeln hamnar där.
+
      En förbipasserande ser att stolpen är upptagen och hur mycket som laddats,
      men får ingen betallänk och kommer inte åt numrets övriga laddningar. */
-  const mine = Boolean(active && ctx.query.get('k') && ctx.query.get('k') === active.receiptKey);
+  const mine = Boolean(active && (
+    (ctx.query.get('k') && ctx.query.get('k') === active.receiptKey)
+    || (enhet && enhet.phone && active.phone && enhet.phone === active.phone)
+  ));
 
   let view = 'idle';
   let session = null;
@@ -6348,6 +6470,48 @@ guest.post('/api/verify/check', async (req, res, ctx) => {
     device: nyckel,
     free: config.isFreeNumber(out.phone),
   });
+});
+
+/**
+ * Steg 2b: koden skrevs aldrig in — någon tryckte på länken i stället.
+ *
+ * Sidan som bad om koden sitter kvar med sin verifieringstoken. Samma token
+ * ligger i länken, och servern sparar den på sessionen som `startToken`. Alltså
+ * VET servern redan att just den token startade just den laddningen; det var
+ * bara ingen som frågade.
+ *
+ * Det här är vad som saknades på en iPhone. Hemskärmsappen och Safari har
+ * varsitt eget lager — en länk i ett SMS öppnas alltid i Safari, så nyckeln
+ * hamnade där och appen mötte sin egen laddning som en främling: ingen
+ * betallänk, ingen avsluta-knapp, ingen reaktion när kabeln drogs ur.
+ *
+ * Förtroendet är detsamma som länkens eget: den som har token har SMS:et, och
+ * med SMS:et kunde man redan starta laddningen och nå kvittot.
+ */
+guest.post('/api/verify/claim', async (req, res, ctx) => {
+  loop.noteGuestPoll();
+
+  const rl = limiter.hit(`claim:${ctx.ip}`, 240, 60 * 60 * 1000);
+  if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök. Vänta en stund.' });
+
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+
+  const s = sessions.byStartToken(parsed.body.token);
+  if (!s) return sendJson(res, 200, { ok: false });
+
+  /* Egen nyckel till den här webbläsaren, inte samma som länken fick.
+     De är två skilda lager på samma telefon — det är hela orsaken till att vi
+     står här — och en nyckel kan inte flyttas mellan dem. Rutan hindrar bara
+     att en upprepad förfrågan lägger till samma webbläsare två gånger. */
+  let device = null;
+  if (!s.deviceClaimIssued) {
+    device = devices.issue(s.phone);
+    if (device) sessions.markDeviceIssued(s.id, 'claim');
+  }
+
+  log.info(`Session #${s.number} hämtades hem av sidan som begärde koden.`);
+  return sendJson(res, 200, { ok: true, receiptKey: s.receiptKey, device });
 });
 
 guest.post('/api/start', async (req, res, ctx) => {
@@ -6493,11 +6657,18 @@ guest.post('/api/stop', async (req, res, ctx) => {
   const rl = limiter.hit(`stop:${ctx.ip}`, 10, 60 * 60 * 1000);
   if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök. Vänta en stund.' });
 
-  // Bara den som startade laddningen får avsluta den. Telefonen visar upp
-  // kvittonyckeln den fick vid start. Förut räckte det att känna till adressen.
+  /* Bara den som laddar får avsluta. Samma två vägar som i statussvaret:
+     kvittonyckeln, eller en ihågkommen telefon med samma nummer som
+     laddningen. De måste följas åt — visar vyn knappen men servern nekar den,
+     ser appen trasig ut i stället för försiktig. */
   const parsed = await readJsonBody(req);
   const nyckel = (parsed.ok && parsed.body && parsed.body.k) || ctx.query.get('k');
-  if (nyckel !== active.receiptKey) {
+  const enhet = devices.resolve(
+    (parsed.ok && parsed.body && parsed.body.d) || ctx.query.get('d'),
+  );
+  const agare = (nyckel && nyckel === active.receiptKey)
+    || (enhet && enhet.phone && active.phone && enhet.phone === active.phone);
+  if (!agare) {
     return sendJson(res, 403, { error: 'Bara den som startade laddningen kan avsluta den.' });
   }
 
@@ -6587,10 +6758,24 @@ guest.get('/s/:key', async (req, res, ctx) => {
     }
   })();
 
-  // Vidare till laddvyn, med nyckeln i adressen så telefonen vet att det är
+  /* Telefonen ska bli ihågkommen även den här vägen.
+     Enhetsnyckeln delades förut bara ut när koden skrevs in på sidan. Startade
+     man via länken blev numret aldrig ihågkommet — nästa gång fick man skriva
+     det på nytt, och en förfrågan till gick iväg. Numret är bevisat: koden gick
+     till telefonen och användes. */
+  let enhetsnyckel = null;
+  if (!started.session.deviceLinkIssued) {
+    enhetsnyckel = devices.issue(v.phone);
+    if (enhetsnyckel) sessions.markDeviceIssued(started.session.id, 'link');
+  }
+
+  // Vidare till laddvyn, med nycklarna i adressen så telefonen vet att det är
   // dess egen laddning. Annars vore gästen en främling för sin egen laddning
   // resten av kvällen: ingen betallänk, och ingen reaktion när kabeln dras ur.
-  res.writeHead(302, { Location: `../?k=${encodeURIComponent(started.session.receiptKey)}` });
+  // Sidan plockar bort dem ur adressraden direkt.
+  const dit = `../?k=${encodeURIComponent(started.session.receiptKey)}`
+    + (enhetsnyckel ? `&d=${encodeURIComponent(enhetsnyckel)}` : '');
+  res.writeHead(302, { Location: dit });
   return res.end();
 });
 

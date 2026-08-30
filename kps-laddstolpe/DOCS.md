@@ -133,14 +133,28 @@ rättar bara sig själv om bilen fortsätter.
 
 ### Ägarskap
 
-Telefonen som startade laddningen bär en nyckel. Den kommer antingen från
-startknappen eller från länken i SMS:et, och plockas bort ur adressraden direkt
-så att den inte följer med om sidan delas.
+Telefonen som laddar får betallänken och knappen *Avsluta laddning*. En
+förbipasserande ser att stolpen används, hur mycket som laddats och att den blir
+ledig när kabeln dras ur — men kan varken komma åt räkningen eller avbryta
+grannens laddning. Det gäller både i gränssnittet och i servern.
 
-Bara den nyckeln ger betallänken och knappen *Avsluta laddning*, både i
-gränssnittet och i servern. En förbipasserande ser att stolpen används, hur
-mycket som laddats och att den blir ledig när kabeln dras ur — men kan varken
-komma åt räkningen eller avbryta grannens laddning.
+Tre vägar leder fram till att appen vet att laddningen är din:
+
+| Väg | När |
+|---|---|
+| Kvittonyckeln | Du tryckte på startknappen, eller kom in via länken i SMS:et. Nyckeln plockas bort ur adressraden direkt så att den inte följer med om sidan delas. |
+| Numret | Telefonen är ihågkommen och laddningen går på samma nummer. Gäller även om just den webbläsaren aldrig sett kvittonyckeln. |
+| Koden du bad om | Sidan bad om en kod och du tryckte på länken i stället för att skriva in den. Sidan frågar då servern om dess kod startade något, och hämtar hem laddningen. |
+
+**Varför tre.** På en iPhone har hemskärmsappen och Safari varsitt eget lager —
+de delar ingenting. En länk i ett SMS öppnas alltid i Safari, så startar du den
+vägen hamnar kvittonyckeln där och appen på hemskärmen vet ingenting om den. De
+två andra vägarna finns för att appen ska hitta hem ändå. På Android delar
+Chrome och hemskärmsappen samma lager, så där räcker den första.
+
+Följden är att samma telefon kan stå två gånger i listan över ihågkomna
+telefoner, en gång per webbläsare. Det är avsiktligt: nycklarna går inte att
+flytta mellan lagren.
 
 ## Fri laddning
 
@@ -431,9 +445,14 @@ att `cableConnected` är `true`.
 **"För många startförsök."** Taket ligger på 15 per timme och avsändare, och
 hela hushållet delar IP bakom hemmaroutern. Höj det under **SMS** om det tar i.
 
-**Gästen kommer inte åt betallänken.** Betallänken går bara till den telefon som
-startade laddningen. Har den telefonen rensat sitt minne finns länken kvar i
-kvitto-SMS:et — den fungerar för alltid.
+**Gästen kommer inte åt betallänken.** Betallänken går bara till den som laddar.
+Har telefonen rensat sitt minne finns länken kvar i kvitto-SMS:et — den fungerar
+för alltid.
+
+**Appen på hemskärmen ser laddningen som någon annans.** Ska inte hända längre,
+men om det gör det: öppna appen igen efter några sekunder, så hämtar den hem
+laddningen. Har den telefonen aldrig bekräftat sitt nummer *inne i appen* finns
+inget att känna igen den på — bekräfta en gång där, så gäller det framåt.
 
 **Adminfliken är tom.** Slå på *Visa i sidofältet* under tilläggets Info-flik.
 

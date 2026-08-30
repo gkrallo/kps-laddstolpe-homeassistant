@@ -1,5 +1,47 @@
 # Ändringslogg
 
+## 0.8.3
+
+**Din egen laddning kändes inte igen i hemskärmsappen.** Startade du via länken
+i SMS:et och öppnade appen efteråt möttes du av din egen laddning som en
+främling: ingen betallänk, ingen avsluta-knapp, ingen reaktion när kabeln drogs
+ur.
+
+Orsaken sitter i iOS. En sida på hemskärmen och samma sida i Safari har varsitt
+eget lager — de delar ingenting ([WebKit 181849](https://bugs.webkit.org/show_bug.cgi?id=181849)).
+En länk i ett SMS öppnas alltid i Safari, så nyckeln som säger *det här är min
+laddning* hamnade där, och appen hade ingen möjlighet att veta om den. På
+Android delar Chrome och hemskärmsappen samma lager, så där syntes det aldrig.
+
+Tre saker fick det att sitta ihop:
+
+**Appen hämtar hem sin laddning.** Sidan som bad om koden sitter kvar med sin
+verifieringstoken, och servern sparar redan vilken token som startade vilken
+laddning. Den kunskapen fanns — ingen frågade efter den. Nu gör appen det, och
+får tillbaka kvittonyckeln. Token ligger på disk, inte bara i en variabel, så
+den överlever att appen stängs och öppnas igen.
+
+**Ägarskap går också på nummer.** En ihågkommen telefon vars nummer är samma som
+den pågående laddningen är ägare, även om just den webbläsaren aldrig sett
+kvittonyckeln. Det gäller både vyn och servern — annars visas en knapp som
+sedan nekas.
+
+**Länkstarten kommer ihåg telefonen.** Enhetsnyckeln delades förut bara ut när
+koden skrevs in på sidan. Startade man via länken blev numret aldrig ihågkommet,
+och nästa gång fick man skriva det igen. Båda webbläsarna blir nu ihågkomna var
+för sig, och det är avsiktligt: de är två skilda lager på samma telefon, båda
+har bevisat samma nummer, och en nyckel går inte att flytta mellan dem.
+
+*Provet hittade en riktig konflikt på vägen: länken hann göra Safari ihågkommen
+och satte ett kryss som gjorde att appen blev utan. Rutan är nu en per väg.*
+
+**Fältet för fria nummer gick inte att skriva i.** Så fort man skrev en siffra
+försvann texten. Adminfliken laddar om sig själv var femte sekund, och spärren
+som ska pausa omladdningen medan man skriver tittade bara efter `input`. Fältet
+för fria nummer och vitlistan är `textarea` — flerradiga, ett nummer per rad —
+och räknades alltså aldrig som att någon skrev. Hela panelen revs mitt i, med
+texten och markören.
+
 ## 0.8.2
 
 Bara dokumentation och ordning i filen. Inget i hur appen fungerar.
