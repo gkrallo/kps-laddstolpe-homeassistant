@@ -1,5 +1,37 @@
 # Ändringslogg
 
+## 0.8.1
+
+**"Betala med Swish" var en rad lila text.** Knappstilen på gästsidan var
+skriven som `button.btn` och gällde alltså aldrig en länk. Länken fick ingen
+knappstil alls, och då slog webbläsarens egen regel för besökta länkar igenom —
+den väger tyngre än en klass. Nu är det en riktig knapp, och färgen står
+utskriven för länkar i alla lägen så att det inte kan hända igen.
+
+**Knappen "Klar" hette fel.** Den stänger kvittovyn, inget annat — men "Klar"
+läses som "klar med betalningen". Den heter **Stäng** nu. Vid fri laddning, där
+det verkligen är klart, står det fortfarande Klar.
+
+**"Jag har betalat" tog inte.** Knappen sa "Tack" en sekund och kom sedan
+tillbaka, samtidigt som hörnet påstod att du markerat betald. Kvitteringen
+sparades hela tiden — det var bara sidan som ritade om betalningsdelen som om
+ingenting hänt. Nu står det vad som faktiskt gäller: *"Du har markerat den här
+laddningen som betald. Gräshagen 4 bekräftar när betalningen kommit fram."*
+Knappen är borta, och betalvägen ligger kvar under *Betala igen om något gick
+fel* för den som ändå vill försöka.
+
+**Och startsidan sa emot.** Efter kvitteringen möttes du av "du har en obetald
+laddning" på samma belopp. Nu står det *"väntar på bekräftelse"* tills du
+bekräftat i adminfliken, då banderollen försvinner.
+
+**En laddning som slutar på noll kronor** kallas inte längre obetald. Den säger
+*"Inget att betala"*, och ingen betalvy visas — det fanns ingenting att betala
+och ingen väg att göra det.
+
+*Sedd med ögat, inte bara provad: när knappstilen skrevs om blev "Stäng"
+osynlig, mörk text på mörk botten. Provet mäter numera kontrasten på båda
+knapparna.*
+
 ## 0.8.0 — steg 2 och 3
 
 Familjen slipper krånglet, och grannen märker ingen skillnad.
