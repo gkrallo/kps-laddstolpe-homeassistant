@@ -229,6 +229,22 @@ const SETTINGS_DEFAULTS = {
   // Numret ska vara ett bevis, inte ett textfält. Stäng bara av vid felsökning.
   requireVerification: true,
 
+  /* Tak för antal startförsök per timme och avsändare.
+     Skyddet finns för att någon utifrån inte ska kunna hamra på stolpen. Men
+     hela familjen sitter bakom samma hemma-IP, och även ett nekat försök
+     räknas — fem i timmen tog slut fortare än man tror. */
+  maxStartsPerHourPerIp: 15,
+
+  /* Nummer som laddar utan att betala — familjen.
+     Sessionen registreras ändå, med den verkliga elkostnaden, så att du kan se
+     vad hushållets egen laddning kostar. Det som uteblir är avgiften för
+     stolpen och kravet på betalning. */
+  freeNumbers: [],
+
+  /* Kom ihåg telefoner som en gång bekräftat sitt nummer, så att de slipper
+     SMS nästa gång. Varje telefon syns och kan spärras i Laddbox-fliken. */
+  rememberDevices: true,
+
   // SMS: simulerat | dryrun | whitelist | live
   smsMode: 'simulerat',
   smsWhitelist: [],
@@ -266,6 +282,7 @@ const NUMERIC = [
   'supplierFeeSek', 'gridTransferSek', 'energyTaxSek', 'vatMultiplier',
   'serviceFeeSek', 'maxChargerCurrent', 'offlineMaxCurrent',
   'smsMaxPerDay', 'smsMaxPerHourPerNumber', 'smsMaxPerHourPerIp',
+  'maxStartsPerHourPerIp',
 ];
 const SMS_MODES = ['simulerat', 'dryrun', 'whitelist', 'live'];
 
@@ -313,6 +330,17 @@ function updateSettings(patch) {
     next.smsWhitelist = patch.smsWhitelist.map((v) => String(v).trim()).filter(Boolean);
   }
 
+  if ('freeNumbers' in patch) {
+    if (!Array.isArray(patch.freeNumbers)) {
+      return { ok: false, error: 'Fria nummer måste vara en lista.' };
+    }
+    next.freeNumbers = patch.freeNumbers.map((v) => String(v).trim()).filter(Boolean);
+  }
+
+  if ('rememberDevices' in patch) {
+    next.rememberDevices = patch.rememberDevices === true || patch.rememberDevices === 'true';
+  }
+
   // Rimlighetsspärrar som skyddar mot fingerfel
   if (next.maxChargerCurrent < 6 || next.maxChargerCurrent > 32) {
     return { ok: false, error: 'Maxström måste ligga mellan 6 och 32 A.' };
@@ -327,10 +355,31 @@ function updateSettings(patch) {
   return { ok: true, settings };
 }
 
+/**
+ * Laddar det här numret gratis?
+ *
+ * Jämförelsen sker på normaliserad form, så att 070-123 45 67, 0701234567 och
+ * +46701234567 är samma nummer. Annars vore listan en fälla: man skriver numret
+ * som man brukar och undrar varför det ändå kommer en räkning.
+ */
+function isFreeNumber(phone) {
+  const norm = (v) => {
+    const c = String(v || '').replace(/[\s\-()]/g, '');
+    if (/^0[1-9]\d{7,10}$/.test(c)) return '+46' + c.slice(1);
+    if (/^\+46[1-9]\d{7,10}$/.test(c)) return c;
+    if (/^46[1-9]\d{7,10}$/.test(c)) return '+' + c;
+    return c || null;
+  };
+  const mal = norm(phone);
+  if (!mal) return false;
+  return (settings.freeNumbers || []).some((v) => norm(v) === mal);
+}
+
 return {
   loadHaOptions,
   loadSettings,
   updateSettings,
+  isFreeNumber,
   ha: () => ha,
   settings: () => settings,
   SMS_MODES,
@@ -1576,7 +1625,7 @@ function nextNumber() {
   return (nums.length ? Math.max(...nums) : 1000) + 1;
 }
 
-function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken }) {
+function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken, free }) {
   if (active) return { ok: false, error: 'En laddning pågår redan.' };
 
   active = {
@@ -1584,6 +1633,14 @@ function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken }) {
     number: nextNumber(),
     receiptKey: newReceiptKey(),
     phone: phone || null,
+
+    /* Fri laddning — familjen. Sessionen registreras ändå, med den verkliga
+       elkostnaden, så att du kan se vad hushållets egen laddning kostar. Det
+       som uteblir är avgiften för stolpen och kravet på betalning.
+       Statusen låses vid start: ändrar du listan mitt under en laddning ska
+       inte räkningen ändra sig under gästens fötter. */
+    free: Boolean(free),
+
     // CHARGING -> FINISHED (klar, kabeln kvar) -> COMPLETED (kabeln urdragen)
     status: 'CHARGING',
     simulated: Boolean(simulated),
@@ -1605,7 +1662,7 @@ function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken }) {
     costSek: 0,
 
     usedEstimatedPrice: false,
-    payment: 'UNPAID',      // UNPAID | GUEST_CLAIMS_PAID | CONFIRMED
+    payment: free ? 'FREE' : 'UNPAID',   // FREE | UNPAID | GUEST_CLAIMS_PAID | CONFIRMED
     samples: [],
 
     // Energi som mätts upp men ännu inte kunnat prissättas, med tidpunkt, så
@@ -1621,8 +1678,12 @@ function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken }) {
 
 /** Lägger en uppmätt mängd energi till kostnaden, till ett givet pris. */
 function charge(kwh, price) {
+  // Elkostnaden räknas alltid — det är vad strömmen faktiskt kostade dig.
+  // Avgiften för stolpen är din ersättning för slitage, och den är meningslös
+  // internt, så den uteblir för fria laddningar.
+  const avgift = active.free ? 0 : price.serviceSek;
   active.costEnergySek = round(active.costEnergySek + kwh * price.energySek, 4);
-  active.costServiceSek = round(active.costServiceSek + kwh * price.serviceSek, 4);
+  active.costServiceSek = round(active.costServiceSek + kwh * avgift, 4);
   active.costSek = round(active.costEnergySek + active.costServiceSek, 2);
   if (price.estimated) active.usedEstimatedPrice = true;
 }
@@ -1808,10 +1869,10 @@ function forPhone(phone, limit = 20) {
     .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
     .slice(0, limit);
 }
-function unpaid() { return history.filter((s) => s.payment !== 'CONFIRMED'); }
+function unpaid() { return history.filter((s) => s.payment !== 'CONFIRMED' && s.payment !== 'FREE'); }
 
 function setPayment(id, state) {
-  const valid = ['UNPAID', 'GUEST_CLAIMS_PAID', 'CONFIRMED'];
+  const valid = ['UNPAID', 'GUEST_CLAIMS_PAID', 'CONFIRMED', 'FREE'];
   if (!valid.includes(state)) return { ok: false, error: 'Okänd betalningsstatus.' };
   const s = history.find((x) => x.id === id);
   if (!s) return { ok: false, error: 'Sessionen hittades inte.' };
@@ -1843,10 +1904,12 @@ function publicView(s, { includeKey = false } = {}) {
     costServiceSek: round(s.costServiceSek, 2),
     costSek: round(s.costSek, 2),
     usedEstimatedPrice: Boolean(s.usedEstimatedPrice),
+    free: Boolean(s.free),
     // Energi som är uppmätt men ännu inte prissatt. Noll i normalfallet.
     unpricedKwh: round(s.unpricedKwh || 0, 2),
     chargingEndedAt: s.chargingEndedAt || null,
     finishReason: s.finishReason || null,
+    cableEpisode: s.cableEpisode || null,
     payment: s.payment,
     simulated: Boolean(s.simulated),
   };
@@ -2204,8 +2267,12 @@ async function endSession(reason, { force = false } = {}) {
   // Det här är den ENDA platsen som skickar kvitto, och hit kommer vi bara när
   // kabeln dragits ur. Förut gick kvittot när laddningen tog slut, vilket
   // innebar att gästen fick sin räkning mitt i natten medan bilen stod kvar.
-  if (done && done.phone) {
+  // Fri laddning får inget kvitto-SMS. Det finns ingen räkning att skicka, och
+  // ett SMS som säger "0 kr" är bara en kostnad för dig och en pling för dem.
+  if (done && done.phone && !done.free) {
     sendReceiptSms(done).catch((err) => log.error(`Kvitto-SMS misslyckades: ${err.message}`));
+  } else if (done && done.free) {
+    log.info(`Session ${done.number} var fri laddning. Inget kvitto-SMS. Elkostnad ${done.costEnergySek} kr.`);
   }
 
   return done;
@@ -2813,6 +2880,8 @@ button.btn + button.btn{margin-top:10px}
   // felhanteringen ritade om det till "Ingen kontakt med laddstolpen".
   var verifyToken = null;
   var verifyPhone = null;
+  // "Inte du?" — gäller bara det här besöket, nyckeln slängs inte.
+  var glomKand = false;
 
   // Telefonen minns vilken laddning som är dess egen, så att kvittot kan visas
   // när sessionen tagit slut — och hittas igen senare om den är obetald.
@@ -2821,6 +2890,15 @@ button.btn + button.btn{margin-top:10px}
   function remember(v) { try { localStorage.setItem(STORE, JSON.stringify(v)); } catch (e) {} }
   function recall() { try { return JSON.parse(localStorage.getItem(STORE) || 'null'); } catch (e) { return null; } }
   function forget() { try { localStorage.removeItem(STORE); } catch (e) {} }
+
+  /* Telefonens egen nyckel. Den bevisar vilket nummer telefonen tillhor, sa
+     att man slipper vanta pa ett SMS varje gang.
+     Pa en iPhone raderas det har efter sju dagar utan besok — om inte appen
+     lagts till pa hemskarmen, som ar undantagen. Darfor manifestet i 0.7.1. */
+  var DEV = 'kps.device';
+  function devSave(t) { try { localStorage.setItem(DEV, t); } catch (e) {} }
+  function devGet() { try { return localStorage.getItem(DEV) || null; } catch (e) { return null; } }
+  function devForget() { try { localStorage.removeItem(DEV); } catch (e) {} }
 
   function kr(n) { return Number(n).toFixed(2).replace('.', ','); }
   function num(n, d) { return Number(n).toFixed(d === undefined ? 1 : d).replace('.', ','); }
@@ -2866,7 +2944,8 @@ button.btn + button.btn{margin-top:10px}
 
   function laddaKurva() {
     if (curveData) return ritaKurva();
-    fetch('api/prices', { cache: 'no-store' })
+    var dk = devGet();
+    fetch('api/prices' + (dk ? '?d=' + encodeURIComponent(dk) : ''), { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (data) { curveData = data; ritaKurva(); },
             function () { kurvText('Priserna gick inte att hämta just nu.'); });
@@ -3166,7 +3245,8 @@ button.btn + button.btn{margin-top:10px}
     var key = [s.view, s.session && s.session.number, s.price && s.price.totalSek,
                notice && notice.text, busyAction, s.starting,
                s.contact, s.contact === 'ok' ? 0 : Math.round((s.ageSeconds || 0) / 15),
-               s.mine, receipt && receipt.number].join('|');
+               s.mine, s.known && s.known.phone, s.free, glomKand,
+               receipt && receipt.number].join('|');
 
     /* Rör inte DOM:en om ingenting ändrats.
        Villkoret var "key === lastKey && typing", alltså hoppade den bara över
@@ -3226,6 +3306,34 @@ button.btn + button.btn{margin-top:10px}
       var ci = document.getElementById('code');
       if (ci) ci.focus();
 
+    } else if (s.view === 'ready' && s.known && !glomKand) {
+      /* Telefonen känns igen. Numret bevisades en gång och nyckeln har burit
+         det sedan dess — alltså inget textfält, ingen väntan på SMS, ett tryck.
+         Det här är hela poängen med steg tre: de som laddar ofta ska inte
+         behöva göra om verifieringen varje gång. */
+      el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
+      el.title.textContent = 'Redo att ladda';
+      el.lead.innerHTML = 'Vi känner igen den här telefonen.<span class="tel">'
+        + escTel(s.known.phone) + '</span>';
+      el.slot.innerHTML = noticeBlock() + staleBlock(s) + receiptBanner() +
+        '<button class="btn" id="oneTapBtn"' + (busyAction ? ' disabled' : '') + '>'
+        + (busyAction ? 'Startar…' : 'Starta laddning') + '</button>' +
+        (s.known.free
+          ? '<div class="msg info">Din laddning är fri. Priset nedan är vad elen kostar — avgiften för stolpen tillkommer inte.</div>'
+          : '') +
+        '<p style="text-align:center;font-size:14.5px;margin:16px 0 0">' +
+        '<button class="linkish" id="otherPhone" style="color:#BFD2C6">Inte du? Använd ett annat nummer</button></p>' +
+        priceBlock(s.price, true);
+
+      var ot = document.getElementById('oneTapBtn');
+      if (ot) ot.addEventListener('click', function () { doStart(null, null, devGet()); });
+      var op = document.getElementById('otherPhone');
+      if (op) op.addEventListener('click', function () {
+        // Bara den här gången — nyckeln slängs inte, för telefonen kan mycket
+        // väl vara rätt nästa gång även om någon annan lånar den nu.
+        glomKand = true; lastKey = ''; safeRender();
+      });
+
     } else if (s.view === 'ready') {
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
       el.title.textContent = 'Redo att ladda';
@@ -3266,9 +3374,10 @@ button.btn + button.btn{margin-top:10px}
             ? 'Någon annan har just startat en laddning här.'
             : 'Någon annan laddar just nu. Stolpen blir ledig när den bilen är klar och kabeln dras ur.');
       el.slot.innerHTML = noticeBlock() + staleBlock(s) +
+        (ses.free && min ? '<div class="msg info">Fri laddning — ingen betalning. Siffran visar vad elen kostar.</div>' : '') +
         '<div class="runline">' + ICONS.bolt + 'Pågått i <span id="vDur">' + duration(ses.startedAt) + '</span></div>' +
         '<div class="stats">' +
-          '<div class="stat wide"><div class="l">' + (min ? 'Att betala hittills' : 'Laddat för hittills') + '</div><div><span class="v" id="vKr">' + kr(ses.costSek) + '</span><span class="u">kr</span></div></div>' +
+          '<div class="stat wide"><div class="l">' + (ses.free ? 'Elkostnad hittills' : (min ? 'Att betala hittills' : 'Laddat för hittills')) + '</div><div><span class="v" id="vKr">' + kr(ses.costSek) + '</span><span class="u">kr</span></div></div>' +
           '<div class="stat"><div class="l">Laddat</div><div><span class="v" id="vKwh">' + num(ses.energyKwh, 2) + '</span><span class="u">kWh</span></div></div>' +
           '<div class="stat"><div class="l">Effekt</div><div><span class="v" id="vKw">' + num(ses.powerKw) + '</span><span class="u">kW</span></div></div>' +
         '</div>' +
@@ -3296,18 +3405,22 @@ button.btn + button.btn{margin-top:10px}
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
       el.title.textContent = mitt ? 'Din bil är klar' : 'Bilen är klar';
       el.lead.textContent = mitt
-        ? 'Laddningen är avslutad. Dra ur kabeln när du åker, så får du kvittot via SMS.'
+        ? (f.free
+            ? 'Laddningen är avslutad. Dra ur kabeln när du åker.'
+            : 'Laddningen är avslutad. Dra ur kabeln när du åker, så får du kvittot via SMS.')
         : 'Laddningen är avslutad, men bilen står kvar. Stolpen blir ledig när kabeln dras ur.';
 
       el.slot.innerHTML = noticeBlock() + staleBlock(s) +
         '<div class="stats">' +
-          '<div class="stat wide"><div class="l">' + (mitt ? 'Att betala' : 'Laddat för') + '</div><div><span class="v">' + kr(f.costSek) + '</span><span class="u">kr</span></div></div>' +
+          '<div class="stat wide"><div class="l">' + (f.free ? 'Elkostnad' : (mitt ? 'Att betala' : 'Laddat för')) + '</div><div><span class="v">' + kr(f.costSek) + '</span><span class="u">kr</span></div></div>' +
           '<div class="stat"><div class="l">Laddat</div><div><span class="v">' + num(f.energyKwh, 2) + '</span><span class="u">kWh</span></div></div>' +
           '<div class="stat"><div class="l">Laddade i</div><div><span class="v" style="font-size:24px">' + duration(f.startedAt, f.chargingEndedAt) + '</span></div></div>' +
         '</div>' +
         (f.unpricedKwh > 0 ? '<div class="msg info">' + num(f.unpricedKwh, 2) + ' kWh är ännu inte prissatta — appen saknar elpris för den perioden.</div>' : '') +
-        '<div class="msg info">Kvittot skickas när kabeln dras ur.</div>' +
-        (mitt && f.receiptKey ? '<a class="btn ghost" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(f.receiptKey) + '">Öppna kvitto och betala</a>' : '');
+        (f.free
+          ? '<div class="msg info">Fri laddning — ingen betalning.</div>'
+          : '<div class="msg info">Kvittot skickas när kabeln dras ur.</div>') +
+        (mitt && f.receiptKey ? '<a class="btn ghost" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(f.receiptKey) + '">' + (f.free ? 'Visa sammanställning' : 'Öppna kvitto och betala') + '</a>' : '');
 
     } else if (s.view === 'readonly') {
       el.icon.innerHTML = ICONS.check; el.icon.style.display = '';
@@ -3340,11 +3453,14 @@ button.btn + button.btn{margin-top:10px}
         (d.unpricedKwh > 0 ? '<div class="msg info">' + num(d.unpricedKwh, 2) + ' kWh är ännu inte prissatta — appen saknar elpris för den perioden. Energin är mätt och står kvar.</div>' : '') +
         // Här stod "Swish och SMS-kvitto kopplas in i fas 5" kvar sedan fas 2.
         // Båda finns sedan länge — och det är betalningen gästen ska ledas till.
-        (d.receiptKey
-          ? '<a class="btn" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(d.receiptKey) + '">Betala med Swish</a>'
-          : '') +
-        '<p style="text-align:center;font-size:14px;color:#93A39B;margin:14px 0 0;line-height:1.5">' +
-        'Kvittot har skickats till din mobil. Länken i SMS:et leder hit och fungerar tills du betalat.</p>' +
+        (d.free
+          ? '<div class="msg info">Fri laddning — ingen betalning. Siffran visar vad elen kostade.</div>'
+          : (d.receiptKey
+              ? '<a class="btn" style="display:block;text-align:center;text-decoration:none" href="k/' + encodeURIComponent(d.receiptKey) + '">Betala med Swish</a>'
+              : '')) +
+        (d.free ? '' :
+          '<p style="text-align:center;font-size:14px;color:#93A39B;margin:14px 0 0;line-height:1.5">' +
+          'Kvittot har skickats till din mobil. Länken i SMS:et leder hit och fungerar tills du betalat.</p>') +
         '<button class="btn ghost" id="againBtn">Klar</button>';
       var ab = document.getElementById('againBtn');
       if (ab) ab.addEventListener('click', function () {
@@ -3410,8 +3526,11 @@ button.btn + button.btn{margin-top:10px}
     // laddningen svarar servern att laddningen är gästens egen och skickar med
     // vägen till betalsidan. Utan nyckel: samma vy, men ingen betallänk.
     var sparad = recall();
-    var q = sparad && sparad.key ? '?k=' + encodeURIComponent(sparad.key) : '';
-    fetch('api/status' + q, { cache: 'no-store' })
+    var d = devGet();
+    var q = [];
+    if (sparad && sparad.key) q.push('k=' + encodeURIComponent(sparad.key));
+    if (d) q.push('d=' + encodeURIComponent(d));
+    fetch('api/status' + (q.length ? '?' + q.join('&') : ''), { cache: 'no-store' })
       .then(function (r) {
         if (!r.ok) throw new Error('Servern svarade ' + r.status);
         return r.json();
@@ -3477,9 +3596,29 @@ button.btn + button.btn{margin-top:10px}
         if (!saved.dismissed && receipt.status === 'COMPLETED') {
           state.view = 'done';
           state.session = receipt;
+          /* En fri laddning ar ingen utestaende rakning. Sammanstallningen far
+             visas en gang, sedan ska den ur vagen — annars motte familjen
+             gardagens kvitto i stallet for startsidan nasta gang de skulle
+             ladda. Sidan finns kvar pa sin egen adress for den som vill se den. */
+          /* En fri laddning ar ingen utestaende rakning och far inte mota
+             familjen som "gardagens kvitto" nasta gang de ska ladda. Men den
+             ska hinna lasas.
+             Ratt signal ar inte klockan utan kabeln: har nagon satt i kabeln
+             pa nytt sedan dess ar den laddningen over — da slapper vi fram
+             startsidan. En obetald rakning ligger daremot kvar, for den ar
+             fortfarande skuld. */
+          if (receipt.payment === 'FREE' && receipt.cableEpisode
+              && state.cableEpisode > receipt.cableEpisode) {
+            forget(); receipt = null; state.view = 'idle'; state.session = null;
+          }
         }
       })
-      .catch(function () { receipt = null; });
+      .catch(function (err) {
+        // Tyst svald forr. Ett fel har ar ett fel i appen och ska synas.
+        if (window.console && console.error) console.error('Fel vid kvittouppslag:', err);
+        reportClientError(err);
+        receipt = null;
+      });
   }
 
   /**
@@ -3530,7 +3669,8 @@ button.btn + button.btn{margin-top:10px}
   }
 
   function receiptBanner() {
-    if (!receipt || receipt.status !== 'COMPLETED') return '';
+    // Fri laddning har inget att betala och ska inte ligga och pasta motsatsen.
+    if (!receipt || receipt.status !== 'COMPLETED' || receipt.payment === 'FREE') return '';
     return '<div class="msg info" style="display:flex;justify-content:space-between;align-items:center;gap:12px">' +
       '<span>Du har en obetald laddning på ' + kr(receipt.costSek) + ' kr.</span>' +
       '<a href="#" id="openReceipt" style="color:#F3D082;white-space:nowrap;font-weight:600">Visa kvitto</a></div>';
@@ -3578,25 +3718,33 @@ button.btn + button.btn{margin-top:10px}
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
         if (!res.ok) { busyAction = null; setNotice('err', res.body.error || 'Fel kod.'); return; }
-        // Koden stämde. Nyckeln är förbrukad, så starten sker med en ny token
-        // som servern redan bundit till numret.
+        // Koden stämde. Servern skickar med en nyckel till telefonen så att den
+        // slipper göra om det här nästa gång — ett tryck räcker då.
+        if (res.body.device) devSave(res.body.device);
         return doStart(null, verifyToken);
       })
       .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
   }
 
-  function doStart(phone, token) {
-    busyAction = 'start'; setNotice(null, null);
+  function doStart(phone, token, device) {
+    busyAction = 'start'; setNotice(null, null); lastKey = ''; safeRender();
     fetch('api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(token ? { token: token } : { phone: phone })
+      body: JSON.stringify(device ? { device: device } : (token ? { token: token } : { phone: phone }))
     })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
         busyAction = null;
         verifyToken = null; verifyPhone = null;
-        if (!res.ok) { setNotice('err', res.body.error || 'Laddningen kunde inte startas.'); return; }
+        if (!res.ok) {
+          // Nyckeln duger inte längre — spärrad, okänd eller avstängd funktion.
+          // Glöm den, annars fastnar telefonen i ett läge som inte går att ta
+          // sig ur: knappen syns men fungerar aldrig.
+          if (res.body.forgetDevice) { devForget(); lastKey = ''; }
+          setNotice('err', res.body.error || 'Laddningen kunde inte startas.');
+          return;
+        }
         if (res.body.session && res.body.session.receiptKey) {
           remember({ key: res.body.session.receiptKey, dismissed: false });
         }
@@ -3962,11 +4110,53 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       + esc((x.whitelist||[]).join('\\n')) + '</textarea>'
       + '<div class="btns" style="margin-top:10px"><button class="b" data-act="savewl">Spara vitlista</button></div></div>';
 
+    h += '<div class="h">Fri laddning</div><div class="card">'
+      + '<div class="row"><span><span class="lab">Nummer som laddar utan att betala</span>'
+      + '<div class="hint">Ett per rad. Skriv som du vill — 070-123 45 67 och +46701234567 '
+      + 'raknas som samma nummer.<br>Laddningen registreras anda, med den verkliga elkostnaden, '
+      + 'sa att du ser vad hushallets egen laddning kostar. Det som uteblir ar avgiften for stolpen, '
+      + 'kravet pa betalning och kvitto-SMS:et.</div></span></div>'
+      + '<textarea class="ta" id="fritt" style="width:100%;min-height:70px;font-family:ui-monospace,Menlo,monospace;'
+      + 'font-size:13px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:5px;padding:8px">'
+      + esc((D.settings.freeNumbers||[]).join('\\n')) + '</textarea>'
+      + '<div class="btns" style="margin-top:10px"><button class="b" data-act="savefree">Spara fria nummer</button></div>'
+      + '<p class="note" style="margin:12px 0 0">Statusen slas upp vid varje start. Tar du bort ett '
+      + 'nummer harifran borjar det betala nasta gang, utan att nagon behover rora deras telefon. '
+      + 'En pagaende laddning behaller det den startade med.</p></div>';
+
+    h += '<div class="h">Ihagkomna telefoner</div><div class="card">'
+      + '<div class="row"><span><span class="lab">Kom ihag telefoner</span>'
+      + '<div class="hint">Den som en gang bekraftat sitt nummer slipper SMS nasta gang och startar '
+      + 'med ett tryck. Nyckeln sparas bara som hash — aldrig i klartext.</div></span>'
+      + '<span><button class="b" data-act="toggleremember">' + (D.settings.rememberDevices ? 'Pa' : 'Av') + '</button></span></div>';
+
+    if (!(D.devices||[]).length) {
+      h += '<p class="note" style="margin:12px 0 0">Ingen telefon ar ihagkommen an.</p>';
+    } else {
+      h += '<div class="tw"><table><tbody>';
+      (D.devices||[]).forEach(function(d){
+        h += '<tr><td>' + esc(d.name || d.phone)
+          + (d.free ? ' <span class="pill p-ok">fri</span>' : '')
+          + (d.revoked ? ' <span class="pill p-warn">sparrad</span>' : '')
+          + '<div class="hint">' + esc(d.phone) + ' &middot; anvand ' + ts(d.lastUsedAt) + '</div></td>'
+          + '<td style="text-align:right;white-space:nowrap">'
+          + '<button class="b" data-act="namedev" data-id="' + esc(d.id) + '">Namnge</button> '
+          + (d.revoked ? '' : '<button class="b danger" data-act="revokedev" data-id="' + esc(d.id) + '">Sparra</button>')
+          + '</td></tr>';
+      });
+      h += '</tbody></table></div>';
+    }
+    h += '</div>';
+
     h += '<div class="h">Verifiering</div><div class="card">'
       + '<div class="row"><span><span class="lab">Kräv verifiering av mobilnummer</span>'
       + '<div class="hint">Utan detta är numret bara ett textfält. Stäng bara av vid felsökning.</div></span>'
       + '<span><button class="b" data-act="toggleverify">' + (st.requireVerification ? 'På' : 'Av') + '</button></span></div>'
+      + inp('maxStartsPerHourPerIp','Startförsök per timme och plats',
+            'Skyddar mot att nagon hamrar pa stolpen utifran. Hela hushallet delar '
+            + 'IP-adress, och aven nekade forsok raknas.',st.maxStartsPerHourPerIp,'st')
       + row('Väntande koder', String(D.verify.pending))
+      + '<div class="btns" style="margin-top:10px"><button class="b gold" data-act="savesettings">Spara</button></div>'
       + '</div>';
 
     h += '<div class="h">Logg</div>';
@@ -4249,6 +4439,27 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       var list = t.value.split('\\n').map(function(x){ return x.trim(); }).filter(Boolean);
       api('api/admin/settings', { smsWhitelist: list }).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Vitlistan sparad.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'savefree') {
+      var tf = document.getElementById('fritt');
+      var fl = tf.value.split('\\n').map(function(x){ return x.trim(); }).filter(Boolean);
+      api('api/admin/settings', { freeNumbers: fl }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Fria nummer sparade.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'toggleremember') {
+      api('api/admin/settings', { rememberDevices: !D.settings.rememberDevices }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'revokedev') {
+      if (!confirm('Sparra den har telefonen? Den maste bekrafta sitt nummer med SMS igen.')) return;
+      api('api/admin/device/revoke', { id: b.dataset.id }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Telefonen sparrad.':(r.body.error||'Misslyckades.')); load();
+      });
+    } else if (act === 'namedev') {
+      var namn = prompt('Vad ska telefonen heta? Till exempel "Emils telefon".');
+      if (namn === null) return;
+      api('api/admin/device/name', { id: b.dataset.id, name: namn }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Misslyckades.')); load();
       });
     } else if (act === 'toggleverify') {
       api('api/admin/settings', { requireVerification: !D.settings.requireVerification }).then(function(r){
@@ -4573,6 +4784,149 @@ return { send, measure, normalize, status, loadCounters, recent: (n = 40) => log
 
 /* ========================================================================== */
 /* 14  Verifiering av mobilnummer                                             */
+/* ========================================================================== */
+/* 19  Ihagkomna telefoner                                                    */
+/* ========================================================================== */
+
+const devices = (function () {
+/**
+ * En telefon som en gang bekraftat sitt nummer slipper gora det igen.
+ *
+ * Nyckeln har oppnar ett las. Darfor tre regler:
+ *
+ *  1. SPARAS ALDRIG I KLARTEXT. Bara en hash av nyckeln hamnar pa disk, precis
+ *     som ett losenord. Kommer nagon over filen far de inte med sig nagot som
+ *     gar att anvanda mot stolpen.
+ *
+ *  2. NYCKELN BAR IDENTITET, INTE RATTIGHET. Den sager vilket NUMMER telefonen
+ *     tillhor — inget mer. Om numret laddar gratis avgors vid varje start mot
+ *     den aktuella listan. Tar du bort nagon ur den borjar de betala nasta
+ *     gang, utan att nagon behover rora deras telefon.
+ *
+ *  3. GAR ATT SPARRA. Varje telefon syns i adminfliken med nar den senast
+ *     anvandes, och en sparr galler omedelbart.
+ */
+
+const FILE = 'devices.json';
+const MAX = 50;
+
+let list = [];
+const writer = store.throttledWriter(FILE, 30 * 1000);
+
+function load() {
+  const raw = store.readJson(FILE, null);
+  list = Array.isArray(raw) ? raw : [];
+  if (list.length) log.info(`${list.length} ihagkomna telefoner inlasta.`);
+}
+
+function hash(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+function maskPhone(p) {
+  const s = String(p || '');
+  return s.length > 4 ? `${s.slice(0, 3)}…${s.slice(-2)}` : '…';
+}
+
+/** Ny nyckel till en telefon. Klartexten returneras EN gang och sparas aldrig. */
+function issue(phone) {
+  if (!config.settings().rememberDevices) return null;
+  if (!phone) return null;
+
+  const token = crypto.randomBytes(32).toString('base64url');
+  const post = {
+    id: crypto.randomUUID(),
+    hash: hash(token),
+    phone,
+    name: null,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: new Date().toISOString(),
+    revoked: false,
+  };
+
+  // Samma nummer far ha flera telefoner, men inte hur manga som helst.
+  const egna = list.filter((d) => d.phone === phone && !d.revoked);
+  if (egna.length >= 5) {
+    const aldst = egna.sort((a, b) => String(a.lastUsedAt).localeCompare(String(b.lastUsedAt)))[0];
+    aldst.revoked = true;
+    aldst.revokedAt = new Date().toISOString();
+    aldst.revokedReason = 'ersatt av en nyare telefon';
+  }
+
+  list.push(post);
+  while (list.length > MAX) list.shift();
+  writer.save(list, { immediate: true });
+  log.info(`Telefon ihagkommen for ${maskPhone(phone)}.`);
+  return token;
+}
+
+/** Vem ar det som knackar? Null om nyckeln ar okand eller sparrad. */
+function resolve(token) {
+  if (!token || !config.settings().rememberDevices) return null;
+  const h = hash(token);
+  const d = list.find((x) => x.hash === h);
+  if (!d || d.revoked) return null;
+
+  // Strypt skrivning: senast anvand behover inte till disk vid varje anrop.
+  d.lastUsedAt = new Date().toISOString();
+  writer.save(list);
+
+  return { id: d.id, phone: d.phone, free: config.isFreeNumber(d.phone), name: d.name };
+}
+
+/** For adminfliken. Aldrig nyckeln, aldrig hela numret. */
+function all() {
+  return list.slice().reverse().map((d) => ({
+    id: d.id,
+    phone: maskPhone(d.phone),
+    free: config.isFreeNumber(d.phone),
+    name: d.name,
+    createdAt: d.createdAt,
+    lastUsedAt: d.lastUsedAt,
+    revoked: Boolean(d.revoked),
+    revokedReason: d.revokedReason || null,
+  }));
+}
+
+function revoke(id) {
+  const d = list.find((x) => x.id === id);
+  if (!d) return { ok: false, error: 'Telefonen hittades inte.' };
+  d.revoked = true;
+  d.revokedAt = new Date().toISOString();
+  d.revokedReason = 'sparrad fran adminfliken';
+  writer.save(list, { immediate: true });
+  log.info(`Telefon sparrad: ${maskPhone(d.phone)}.`);
+  return { ok: true };
+}
+
+function rename(id, name) {
+  const d = list.find((x) => x.id === id);
+  if (!d) return { ok: false, error: 'Telefonen hittades inte.' };
+  d.name = String(name || '').trim().slice(0, 40) || null;
+  writer.save(list, { immediate: true });
+  return { ok: true };
+}
+
+/** Nar ett nummer plockas bort ur den fria listan ar inget att gora — fri
+ *  status slas upp vid varje start. Den har finns for det otacka fallet:
+ *  numret ska inte langre komma in alls. */
+function revokeByPhone(phone) {
+  let n = 0;
+  for (const d of list) {
+    if (d.phone === phone && !d.revoked) {
+      d.revoked = true; d.revokedAt = new Date().toISOString();
+      d.revokedReason = 'numret sparrat'; n += 1;
+    }
+  }
+  if (n) writer.save(list, { immediate: true });
+  return n;
+}
+
+function flush() { writer.flush(); }
+
+return { load, issue, resolve, all, revoke, rename, revokeByPhone, flush, maskPhone };
+})();
+
 /* ========================================================================== */
 
 const verify = (function () {
@@ -5152,11 +5506,13 @@ function historyBlock(rader, denna) {
   const andra = (rader || []).filter((s) => s.receiptKey !== denna);
   if (!andra.length) return '';
 
-  const obetalda = andra.filter((s) => s.payment !== 'CONFIRMED').length;
+  const obetalda = andra.filter((s) => s.payment !== 'CONFIRMED' && s.payment !== 'FREE').length;
   const rows = andra.map((s) => {
-    const status = s.payment === 'CONFIRMED' ? 'betald'
+    const status = s.payment === 'FREE' ? 'fri'
+      : s.payment === 'CONFIRMED' ? 'betald'
       : s.payment === 'GUEST_CLAIMS_PAID' ? 'markerad betald' : 'obetald';
-    const cls = s.payment === 'CONFIRMED' ? 'p-paid' : s.payment === 'GUEST_CLAIMS_PAID' ? 'p-claim' : 'p-open';
+    const cls = (s.payment === 'CONFIRMED' || s.payment === 'FREE') ? 'p-paid'
+      : s.payment === 'GUEST_CLAIMS_PAID' ? 'p-claim' : 'p-open';
     return `<a class="hrow" href="${esc(s.receiptKey)}">
       <span class="hwhen">${esc(kortDatum(s.startedAt))}<span class="hkwh">${kwh(s.energyKwh)} kWh</span></span>
       <span class="hsum">${kr(s.costSek)} kr<span class="pill ${cls}">${status}</span></span>
@@ -5178,6 +5534,9 @@ function kortDatum(iso) {
 }
 
 function render(session, swishData, place, tidigare) {
+  // Fri laddning: sammanställning, inte räkning. Ingen Swish, ingen knapp att
+  // markera som betald — det finns ingenting att betala.
+  const fri = session.free === true || session.payment === 'FREE';
   const paid = session.payment === 'CONFIRMED';
   const claimed = session.payment === 'GUEST_CLAIMS_PAID';
 
@@ -5246,21 +5605,21 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
 <div class="wrap">
   <div class="top">
     <span class="place">${esc(place)}</span>
-    <span class="pill ${paid ? 'p-paid' : claimed ? 'p-claim' : 'p-open'}">
-      ${paid ? 'Betald' : claimed ? 'Du har markerat betald' : 'Obetald'}
+    <span class="pill ${fri ? 'p-paid' : paid ? 'p-paid' : claimed ? 'p-claim' : 'p-open'}">
+      ${fri ? 'Fri laddning' : paid ? 'Betald' : claimed ? 'Du har markerat betald' : 'Obetald'}
     </span>
   </div>
 
   <div class="card">
-    <h1>Kvitto</h1>
+    <h1>${fri ? 'Din laddning' : 'Kvitto'}</h1>
     <p class="sub">Laddning ${esc(when(session.startedAt))}${
       session.endedAt ? `,<br>pågick i ${esc(duration(session.startedAt, session.endedAt))}` : ''
     }.</p>
 
     <div class="r"><span>Laddat</span><span>${kwh(session.energyKwh)} kWh</span></div>
     <div class="r"><span>Elkostnad</span><span>${kr(session.costEnergySek)} kr</span></div>
-    <div class="r"><span>Avgift laddstolpe</span><span>${kr(session.costServiceSek)} kr</span></div>
-    <div class="r total"><span>Att betala</span><span>${kr(session.costSek)} kr</span></div>
+    ${fri ? '' : `<div class="r"><span>Avgift laddstolpe</span><span>${kr(session.costServiceSek)} kr</span></div>`}
+    <div class="r total"><span>${fri ? 'Elen kostade' : 'Att betala'}</span><span>${kr(session.costSek)} kr</span></div>
 
     ${session.usedEstimatedPrice
       ? '<div class="msg">Delar av laddningen prissattes mot senast kända elpris eftersom elbörsen inte svarade.</div>'
@@ -5270,7 +5629,7 @@ h1{font-size:24px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-.02e
       ? `<div class="msg">${kwh(session.unpricedKwh)} kWh av det som laddats är inte prissatt — appen saknar elpris för den perioden helt. Energin står med ovan, men kostnaden för den ingår inte i summan.</div>`
       : ''}
 
-    ${paid ? '' : swishData ? `
+    ${fri ? '<div class="msg">Fri laddning — ingen betalning. Summan visar vad elen kostade.</div>' : paid ? '' : swishData ? `
     <div class="qrbox">
       <div class="qr">${swishData.svg}</div>
       <p class="qrcap">Skanna med Swish-appen,<br>eller tryck på knappen nedan.</p>
@@ -5341,7 +5700,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.7.1';
+const VERSION = '0.8.0';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -5461,6 +5820,17 @@ async function sendCommand(name, run, verify, { timeoutMs = 25000, pollMs = 4000
 async function startChargingSequence() {
   const isCharging = (st) => st.opMode === 3 || st.powerKw > 0.1;
 
+  /* Har det slutat vara meningsfullt att fortsätta?
+     Drar gästen ur kabeln medan sekvensen väntar in laddboxen — eller avslutas
+     sessionen av något annat skäl — finns det ingenting kvar att starta. Utan
+     den här kontrollen malde sekvensen vidare i upp till fyrtio sekunder mot en
+     tom stolpe, och under tiden var stolpen låst för nästa person. */
+  const avbrutet = () => {
+    if (!sessions.getActive()) return 'sessionen avslutades';
+    if (loop.getSnapshot().cableConnected === false) return 'kabeln drogs ur';
+    return null;
+  };
+
   // 1. Lås upp stolpen. Alltid — vi vet inte säkert i vilket läge den står,
   //    och att slå på en redan påslagen laddare är ofarligt.
   if (charger.setEnabled) {
@@ -5468,11 +5838,20 @@ async function startChargingSequence() {
     if (!on.ok) return { ok: false, error: `Laddaren kunde inte slås på: ${on.error}` };
   }
 
+  let brutet = avbrutet();
+  if (brutet) return { ok: false, error: `Starten avbröts: ${brutet}.`, aborted: true };
+
   // 2. Starta.
   let started = await sendCommand('starta laddning', () => charger.start(), isCharging,
     { timeoutMs: 20000, pollMs: 4000 });
   if (!started.ok) return started;
   if (started.verified) return started;
+
+  brutet = avbrutet();
+  if (brutet) {
+    log.info(`Startsekvensen avbryts: ${brutet}.`);
+    return { ok: false, error: `Starten avbröts: ${brutet}.`, aborted: true };
+  }
 
   // 3. Ingen ström än. Står boxen och väntar behövs ett återupptagningskommando.
   const st = loop.getSnapshot();
@@ -5738,21 +6117,30 @@ guest.post('/api/clienterror', async (req, res, ctx) => {
  * fyrtioåtta kvartspriser i det vore att skicka samma tabell om och om igen för
  * något gästen tittar på en gång. Den här hämtas när panelen fälls ut.
  */
-guest.get('/api/prices', (req, res) => {
+guest.get('/api/prices', (req, res, ctx) => {
+  // Samma regel som på startsidan: den som laddar fritt ser priset utan
+  // avgiften för stolpen. Kurvans FORM blir densamma — avgiften är ett fast
+  // påslag per kWh — så rådet om när man bör ladda är oförändrat.
+  const active = sessions.getActive();
+  const enhet = devices.resolve(ctx.query.get('d'));
+  const fri = active ? Boolean(active.free) : Boolean(enhet && enhet.free);
+
   const punkter = prices.forecast(12).map((p) => ({
     t: p.t,
     spot: round2(p.spotSek),
-    total: round2(p.totalSek),
+    total: round2(fri ? p.totalSek - p.serviceSek : p.totalSek),
   }));
   return sendJson(res, 200, {
     points: punkter,
     now: prices.currentPrice(),
+    free: fri,
     zone: config.ha().price_zone || 'SE3',
     serverTime: new Date().toISOString(),
   });
 });
 
 function round2(n) { return Math.round(Number(n || 0) * 1000) / 1000; }
+function round3(n) { return Math.round(Number(n || 0) * 10000) / 10000; }
 
 guest.get('/api/status', (req, res, ctx) => {
   loop.noteGuestPoll();
@@ -5763,6 +6151,11 @@ guest.get('/api/status', (req, res, ctx) => {
   // 'ok' | 'stale' | 'lost'. Ett enda misslyckat anrop släcker inte längre
   // sidan: vi visar det vi senast visste och skriver ut hur gammalt det är.
   const contact = loop.contact();
+
+  /* Känner vi igen telefonen? Nyckeln bär bara identitet — vilket nummer den
+     tillhör. Om numret laddar gratis slås upp här och nu, mot den aktuella
+     listan, så att en ändring i listan gäller från nästa start. */
+  const enhet = devices.resolve(ctx.query.get('d'));
 
   /* Är det gästens egen laddning?
      Telefonen visar upp kvittonyckeln den fick när laddningen startade. Bara
@@ -5794,11 +6187,22 @@ guest.get('/api/status', (req, res, ctx) => {
   const mode = config.ha().mode;
   if (mode === 'avlasning' && view === 'ready') view = 'readonly';
 
+  /* Priset som visas beror på vem som tittar.
+     Den som laddar fritt ska inte se avgiften för stolpen — den är din
+     ersättning för slitage och meningslös internt. Elkostnaden står kvar, för
+     det är den man behöver för att bedöma om det är rätt tid att ladda.
+     Under en pågående laddning avgör sessionens egen status, inte listan, så
+     att priset inte byter skepnad mitt i. */
+  const friVy = active ? Boolean(active.free) : Boolean(enhet && enhet.free);
+  const visatPris = (price && friVy)
+    ? { ...price, serviceSek: 0, totalSek: round3(price.totalSek - price.serviceSek) }
+    : price;
+
   sendJson(res, 200, {
     view,
     session,
     busySince,
-    price,
+    price: visatPris,
     mode,
     // Underlag för att räkna vidare mellan avläsningarna, så siffrorna tickar
     // jämnt i stället för att hoppa var tionde sekund. Det som visas mellan två
@@ -5808,6 +6212,13 @@ guest.get('/api/status', (req, res, ctx) => {
     starting: startState.running,
     startError: !active && startState.error ? startState.error : null,
     mine,
+    // Kabelns löpnummer just nu. Gästsidan använder det för att veta när en
+    // gammal sammanställning blivit inaktuell: har någon satt i kabeln på nytt
+    // är den laddningen historia.
+    cableEpisode: loop.getCableState().episode,
+    // Telefonen känns igen: ett tryck räcker för att starta.
+    known: enhet ? { phone: devices.maskPhone(enhet.phone), free: enhet.free, name: enhet.name } : null,
+    free: friVy,
     readAt: snap.readAt,
     contact: contact.state,
     ageSeconds: contact.ageSeconds,
@@ -5865,14 +6276,37 @@ guest.post('/api/verify/check', async (req, res, ctx) => {
   const out = verify.check(parsed.body.token, parsed.body.code);
   if (!out.ok) return sendJson(res, 400, { error: out.error });
 
-  return sendJson(res, 200, { ok: true, phone: out.phone });
+  /* Numret är nu bevisat. Telefonen får en egen nyckel så att den slipper göra
+     om det här nästa gång — ett tryck räcker då. Nyckeln lämnas ut en enda
+     gång; servern sparar bara en hash av den. */
+  const nyckel = devices.issue(out.phone);
+
+  return sendJson(res, 200, {
+    ok: true,
+    phone: out.phone,
+    device: nyckel,
+    free: config.isFreeNumber(out.phone),
+  });
 });
 
 guest.post('/api/start', async (req, res, ctx) => {
   loop.noteGuestPoll();
   // Spärren sätts först av allt, före varje await
+  /* Tak på hur länge en start får blockera.
+     Sekvensen har egna tidsgränser, men hänger den sig ändå vore alternativet
+     att stolpen är låst tills tillägget startas om. Två minuter är långt mer
+     än den värsta riktiga sekvensen — din box behövde 17 sekunder. */
+  const startFastnat = startState.running && Date.now() - startState.since > 2 * 60 * 1000;
+  if (startFastnat) {
+    log.warn('En startsekvens har hängt sig i över två minuter. Släpper spärren.');
+    startState.running = false;
+  }
   if (startInFlight || startState.running) {
-    return sendJson(res, 409, { error: 'En laddning håller på att startas. Försök igen om en stund.' });
+    const kvar = Math.max(1, Math.round((30 * 1000 - (Date.now() - startState.since)) / 1000));
+    return sendJson(res, 409, {
+      error: `En laddning håller på att startas. Försök igen om ${kvar} sekunder.`,
+      startingSince: startState.since,
+    });
   }
   if (sessions.getActive()) {
     return sendJson(res, 409, { error: 'Stolpen används just nu.' });
@@ -5885,7 +6319,7 @@ guest.post('/api/start', async (req, res, ctx) => {
   startInFlight = true;
 
   try {
-    const rl = limiter.hit(`start:${ctx.ip}`, 5, 60 * 60 * 1000);
+    const rl = limiter.hit(`start:${ctx.ip}`, config.settings().maxStartsPerHourPerIp || 15, 60 * 60 * 1000);
     if (!rl.allowed) {
       return sendJson(res, 429, { error: `För många försök. Vänta ${rl.retryAfterSec} sekunder.` });
     }
@@ -5896,7 +6330,20 @@ guest.post('/api/start', async (req, res, ctx) => {
     // Numret måste vara verifierat. Utan det är det bara ett textfält, och då
     // är spårbarheten — ett av två skäl att bygga appen — borta.
     let phone;
-    if (parsed.body.token) {
+    if (parsed.body.device) {
+      // En ihågkommen telefon. Numret bevisades en gång och nyckeln har burit
+      // det sedan dess. Går nyckeln inte att lösa upp — spärrad, okänd, eller
+      // funktionen avstängd — faller vi tillbaka på det vanliga besked som
+      // ber om verifiering, i stället för att avslöja vilket som gällde.
+      const d = devices.resolve(parsed.body.device);
+      if (!d) {
+        return sendJson(res, 401, {
+          error: 'Den här telefonen känns inte igen längre. Skriv ditt mobilnummer så får du en ny kod.',
+          forgetDevice: true,
+        });
+      }
+      phone = d.phone;
+    } else if (parsed.body.token) {
       const v = verify.consume(parsed.body.token, true);
       if (!v.ok) return sendJson(res, 400, { error: v.error });
       phone = v.phone;
@@ -5918,11 +6365,18 @@ guest.post('/api/start', async (req, res, ctx) => {
       startEnergyKwh: state.sessionEnergyKwh,
       simulated: Boolean(state.simulated),
       startToken: parsed.body.token || null,
+      free: config.isFreeNumber(phone),
     });
     if (!started.ok) return sendJson(res, 409, { error: started.error });
 
     log.info(`Gäst startade session #${started.session.number} från ${ctx.ip}.`);
-    startState = { running: true, error: null, since: Date.now() };
+    /* Sekvensen får sitt EGET tillståndsobjekt.
+       Förut skrevs `startState` över av nästa start, medan den föregående
+       sekvensen fortfarande höll på — och när den till slut blev klar
+       nollställde den nästa starts flagga i stället för sin egen. Två
+       laddningar som startas tätt kunde alltså trassla in sig i varandra. */
+    const mittStart = { running: true, error: null, since: Date.now() };
+    startState = mittStart;
 
     // Körs vidare utan att gästen får vänta. Medvetet inget await.
     (async () => {
@@ -5930,6 +6384,9 @@ guest.post('/api/start', async (req, res, ctx) => {
         const cmd = await startChargingSequence();
 
         if (!cmd.ok) {
+          // Avbruten för att kabeln drogs ur är inget fel att visa nästa gäst —
+          // sessionen är redan avslutad och stolpen står ledig.
+          if (cmd.aborted) { log.info(`Session #${started.session.number}: ${cmd.error}`); return; }
           // Kommandot gick inte fram alls. Låtsas aldrig att en laddning startat.
           log.error(`Session #${started.session.number} kunde inte startas: ${cmd.error}`);
           startState.error = cmd.error || 'Laddningen kunde inte startas.';
@@ -5952,7 +6409,7 @@ guest.post('/api/start', async (req, res, ctx) => {
         startState.error = 'Något gick fel när laddningen skulle startas.';
         sessions.finish('start misslyckades');
       } finally {
-        startState.running = false;
+        mittStart.running = false;
       }
     })();
 
@@ -6043,15 +6500,18 @@ guest.get('/s/:key', async (req, res, ctx) => {
     startEnergyKwh: state.sessionEnergyKwh,
     simulated: Boolean(state.simulated),
     startToken: ctx.params.key,
+    free: config.isFreeNumber(v.phone),
   });
   if (!started.ok) return say('Kunde inte starta', started.error, false);
 
   log.info(`Session #${started.session.number} startad via länk från ${ctx.ip}.`);
-  startState = { running: true, error: null, since: Date.now() };
+  const mittStart = { running: true, error: null, since: Date.now() };
+  startState = mittStart;
   (async () => {
     try {
       const cmd = await startChargingSequence();
       if (!cmd.ok) {
+        if (cmd.aborted) { log.info(`Session #${started.session.number}: ${cmd.error}`); return; }
         startState.error = cmd.error || 'Laddningen kunde inte startas.';
         sessions.finish('start misslyckades');
         return;
@@ -6062,7 +6522,7 @@ guest.get('/s/:key', async (req, res, ctx) => {
       startState.error = 'Något gick fel när laddningen skulle startas.';
       sessions.finish('start misslyckades');
     } finally {
-      startState.running = false;
+      mittStart.running = false;
     }
   })();
 
@@ -6108,6 +6568,10 @@ guest.post('/k/:key/betald', async (req, res, ctx) => {
   const rl = limiter.hit(`paid:${ctx.ip}`, 20, 3600 * 1000);
   if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök.' });
 
+  // En fri laddning har ingen betalning att markera, och skulle förlora sin
+  // status om någon ändå tryckte.
+  if (s.payment === 'FREE') return sendJson(res, 409, { error: 'Fri laddning — det finns inget att betala.' });
+
   // Gästen SÄGER att den betalat. Det är ett eget tillstånd, skilt från att du
   // bekräftat det i Swish — appen ska inte låtsas veta något den inte vet.
   sessions.setPayment(s.id, 'GUEST_CLAIMS_PAID');
@@ -6146,6 +6610,7 @@ admin.get('/api/admin/state', (req, res) => {
     contact: loop.contact(),
     lastTick: loop.getLastTickAt(),
     sms: sms.status(),
+    devices: devices.all(),
     smsLog: sms.recent(30),
     verify: verify.stats(),
     swishConfigured: Boolean((config.ha().swish_number || '').trim()),
@@ -6200,6 +6665,22 @@ admin.post('/api/admin/session/end', async (req, res) => {
     });
   }
   return sendJson(res, 200, { ok: true, session: sessions.publicView(done, { includeKey: true }) });
+});
+
+admin.post('/api/admin/device/revoke', async (req, res) => {
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+  const out = devices.revoke(parsed.body.id);
+  if (!out.ok) return sendJson(res, 404, out);
+  return sendJson(res, 200, { ok: true });
+});
+
+admin.post('/api/admin/device/name', async (req, res) => {
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+  const out = devices.rename(parsed.body.id, parsed.body.name);
+  if (!out.ok) return sendJson(res, 404, out);
+  return sendJson(res, 200, { ok: true });
 });
 
 admin.post('/api/admin/session/payment', async (req, res) => {
@@ -6324,6 +6805,7 @@ async function main() {
   sessions.load();
   prices.loadCache();
   sms.loadCounters();
+  devices.load();
 
   charger = chargerFactory.create(ha.mode, {
     username: ha.easee_username,
@@ -6370,6 +6852,7 @@ async function main() {
     log.info(`${signal} mottagen. Sparar och stänger av.`);
     loop.stop();
     sessions.flush();
+    devices.flush();
     guestServer.close();
     adminServer.close();
     setTimeout(() => process.exit(0), 400);
