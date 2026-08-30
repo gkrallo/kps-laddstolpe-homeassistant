@@ -1,5 +1,38 @@
 # Ändringslogg
 
+## 0.7.1 — steg 1 av tre
+
+Gästsidan går att lägga till på hemskärmen och beter sig då som en app: eget
+fönster utan adressfält, eget kort i appväxlaren, egen ikon och en startskärm i
+appens färger.
+
+**Det är inte bara utseende.** En iPhone raderar allt en vanlig webbsida sparat
+efter sju dagars overksamhet. Där ligger telefonens minne av *vilken laddning
+som är dess egen* — det som avgör om du får betallänken och om skärmen
+reagerar när du drar ur kabeln. Sidor som lagts till på hemskärmen är
+undantagna från den raderingen. Det här är alltså förutsättningen för att
+"kom ihåg mig" ska hålla på en iPhone, vilket kommer i steg 3.
+
+**Så här lägger man till den:**
+
+| | |
+|---|---|
+| **Android, Chrome** | Meny ⋮ → *Lägg till på startskärmen* |
+| **iPhone, Safari** | Dela-ikonen → *Lägg till på hemskärmen* |
+
+För den som laddar en enda gång ändras ingenting. De öppnar länken, gör sitt
+och är klara — manifestet är osynligt för dem.
+
+**Ingen service worker, medvetet.** Hela appen är ett enda dokument: HTML, CSS
+och all JavaScript i samma svar. Det finns alltså inget "skal" att spara skilt
+från logiken, och en cache skulle kunna servera en hel gammal app efter en
+uppdatering. Det är precis den sortens fel som är svårast att hitta. Priset är
+att Chrome inte självt föreslår installation — man får välja det i menyn.
+
+Ikonerna ligger inbakade i tillägget så att det förblir en enda fil. Bakgrunden
+är enfärgad i stället för tonad; en tonad yta komprimeras uselt och gjorde
+bilderna sju gånger större utan att synas på en hemskärm.
+
 ## 0.7.0
 
 **Elpriset närmaste timmarna.** En ny rad längst ned på startsidan, bredvid
