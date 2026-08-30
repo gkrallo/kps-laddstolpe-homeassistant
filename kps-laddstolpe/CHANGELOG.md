@@ -1,5 +1,67 @@
 # Ändringslogg
 
+## 0.7.0
+
+**Elpriset närmaste timmarna.** En ny rad längst ned på startsidan, bredvid
+*Hur räknas priset?*, som fälls ut till en kurva över de kommande tolv timmarna
+— eller så långt elbörsen lämnat priser.
+
+Två linjer, samma axel: **vårt pris** och **elbörsen**. Avståndet mellan dem är
+nätavgift, skatt och avgiften för stolpen, och det är hela poängen med att visa
+båda. Går elbörsen under noll — det händer — syns det som en linje under
+nollstrecket medan vårt pris ändå ligger över en krona. Ström är inte gratis för
+att börspriset är det.
+
+**Det är en trappa, inte en lutande linje.** Priset är konstant inom varje kvart
+och byter tvärt vid kvartsskiftet. En linje som lutar mellan punkterna hade
+påstått att priset glider däremellan, och då läser man av fel pris för nästan
+varje tidpunkt.
+
+**Dra fingret över kurvan** så visas priset för den kvarten, med elbörsens andel
+utskriven. Billigaste kvarten är utmärkt med en punkt och står i klartext under
+diagrammet.
+
+Färgerna är valda med räknehjälp, inte med ögat: guld och blått ligger 27 steg
+isär även för den som har svårt att skilja rött från grönt, och guldet är
+nedstämt för att hålla sig i det spann som är läsbart mot mörk bakgrund.
+Priserna hämtas först när panelen fälls ut — de skulle annars följt med i varje
+statushämtning, var femte sekund, för något man tittar på en gång.
+
+**"Swish och SMS-kvitto kopplas in i fas 5" är borta.** Raden satt kvar på
+kvittovyn sedan fas 2, i en app där båda funnits länge. Där står nu en
+**Betala med Swish**-knapp och beskedet att kvittot skickats till mobilen.
+
+## 0.6.2
+
+**Siffran gick runt i en cirkel i stället för framåt.** 29,45 · 29,46 · 29,47 ·
+29,45 · 29,46 · 29,47 · 29,45 — om och om igen.
+
+Skärmen räknar vidare mellan avläsningarna utifrån effekten, så talen ska ticka
+jämnt i stället för att hoppa var tionde sekund. Men effekten är ett
+ögonblicksvärde, och energin är effekten summerad över tid. De två går isär:
+effekten dippar mellan avläsningarna, lastbalanseringen griper in, och boxens
+egen energiräknare uppdateras i steg. Uppskattningen sprang alltså regelbundet
+förbi det uppmätta värdet — och när nästa riktiga avläsning kom hoppade talet
+tillbaka.
+
+Nu backar siffran aldrig. Ligger uppskattningen före mätvärdet står den still
+tills mätvärdet hunnit ikapp, i stället för att räkna baklänges. Energi som gått
+genom kabeln kommer inte tillbaka, och en siffra som sjunker får det att se ut
+som att appen räknar fel.
+
+**Och gissningen har fått ett tak.** Hörs inget från laddboxen på en och en halv
+minut slutar skärmen räkna vidare. Utan tak skulle en tappad förbindelse låta
+sidan uppfinna energi på obestämd tid, utifrån en effekt vi inte längre vet
+något om.
+
+*Det som visas mellan två avläsningar är fortfarande en uppskattning. Det som
+debiteras är alltid de riktiga mätvärdena — det har inte ändrats.*
+
+**Vyn byggdes dessutom om vid varje pollning.** Spärren som skulle hindra det
+var felskriven och gällde bara medan någon skrev i ett fält. Var femte sekund
+revs alltså hela kortet och byggdes upp igen — vilket bland annat slog igen
+*Vad kostar det just nu?* medan man läste det.
+
 ## 0.6.1
 
 Appen vet nu vems laddning det är.
