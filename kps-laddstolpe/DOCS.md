@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.9.1.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
+**Version 0.9.2.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
 med SMS, laddning som lever tills kabeln dras ur, priskurva, kvitto med
 Swish-QR, fri laddning för familjen, appen på hemskärmen och schemalagd start.
 
@@ -222,9 +222,18 @@ felmeddelandet vad som är fel — oftast att tjänstenamnet inte finns.
 
 ### Att prova det
 
-Simulatorn har tre knappar under **Laddbox** som gör ett schema provbart utan
-att man väntar sex timmar: *Schemat om 20 s*, *Schemat 3 tim försenat* och
-*Schemat missat helt*. Lägg ett schema från gästsidan och tryck på en av dem.
+Lägg ett schema från mobilen. Gå sedan till adminfliken → **Översikt**, där
+schemat står, och använd knapparna i schemakortet:
+
+| Knapp | Vad den provar |
+|---|---|
+| **Förfall om 20 s** | Att laddningen verkligen startar av sig själv. |
+| **Som 3 tim försenat** | Försovningen: laddar ändå, och säger till. |
+| **Som helt missat** | Bortom sextimmarsgränsen: ingen laddning, bara besked. |
+
+De **fungerar i alla lägen, även skarpt** — de rör bara löftets egen
+tidsstämpel, inget kommando går till laddboxen. Det är just i skarpt läge man
+vill se sin egen bil starta utan att sitta uppe till klockan två.
 
 ## Fri laddning
 

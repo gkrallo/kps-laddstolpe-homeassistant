@@ -1,5 +1,22 @@
 # Ändringslogg
 
+## 0.9.2
+
+**Notisfältet gick inte att lägga en rad i.** I 0.9.0 var det ett vanligt
+enradigt textfält — man kunde byta ut tjänsten som stod där, men bokstavligen
+inte lägga till en till. Det blev flerradigt i 0.9.1; nu står radantalet
+utskrivet på fältet så att man ser att det tar flera, och det går att dra ut.
+
+**Provknapparna för schemat fanns inte när de behövdes.** De låg bland
+simulatorknapparna, och hela den panelen ritas bara i simuleringsläge. Kör man
+skarpt — alltså mot sin egen bil, vilket är när man verkligen vill se en
+schemalagd start fungera — fanns de inte alls.
+
+De ligger nu i schemakortet på **Översikt**, där schemat står, och fungerar i
+alla lägen. De rör bara löftets egen tidsstämpel; inget kommando går till
+laddboxen. Boka en tid, tryck *Förfall om 20 s*, och se bilen starta av sig
+själv utan att sitta uppe till klockan två.
+
 ## 0.9.1
 
 **Flera notiser, inte en.** Fältet tar nu en tjänst per rad. Poängen är att de

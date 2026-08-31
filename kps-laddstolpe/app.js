@@ -253,9 +253,10 @@ const SETTINGS_DEFAULTS = {
      SMS nästa gång. Varje telefon syns och kan spärras i Laddbox-fliken. */
   rememberDevices: true,
 
-  /* Vilken HA-tjänst larm om schemalagd start går till.
-     persistent_notification.create hamnar i notisfältet i webbgränssnittet.
-     Vill du ha det i mobilen: skriv notify.mobile_app_<din telefon>. */
+  /* Vilka HA-tjänster larm om schemalagd start går till. En per rad.
+     persistent_notification.create hamnar under bjällran och ligger kvar tills
+     man tar bort den. notify.mobile_app_<telefon> ger en push. Ta gärna båda:
+     pushen väcker dig, den andra finns kvar på morgonen. */
   haNotifyService: 'persistent_notification.create',
 
   // SMS: simulerat | dryrun | whitelist | live
@@ -355,12 +356,16 @@ function updateSettings(patch) {
   }
 
   if ('haNotifyService' in patch) {
-    const t = String(patch.haNotifyService || '').trim();
-    // Tom sträng betyder "ingen HA-notis", och det ska gå att välja.
-    if (t && !/^[a-z0-9_]+\.[a-z0-9_]+$/.test(t)) {
-      return { ok: false, error: 'Skriv tjänsten som domän.tjänst, till exempel notify.mobile_app_kristian.' };
+    /* En eller flera tjänster, en per rad. Tomt betyder ingen HA-notis alls,
+       och det ska gå att välja. */
+    const rader = String(patch.haNotifyService || '')
+      .split(/[\n,]/).map((v) => v.trim()).filter(Boolean);
+    for (const t of rader) {
+      if (!/^[a-z0-9_]+\.[a-z0-9_]+$/.test(t)) {
+        return { ok: false, error: `"${t}" ser inte ut som en tjänst. Skriv domän.tjänst, till exempel notify.mobile_app_min_telefon.` };
+      }
     }
-    next.haNotifyService = t;
+    next.haNotifyService = rader.join('\n');
   }
 
   // Rimlighetsspärrar som skyddar mot fingerfel
@@ -4716,6 +4721,17 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + row('Nummer', D.schedule.phone)
         + row('Kabelns löpnummer', '#' + D.schedule.cableEpisode)
         + (D.schedule.attempts ? row('Startförsök', String(D.schedule.attempts)) : '')
+        /* Provknapparna hor hemma HAR, inte i simulatorn.
+           De rör bara löftets egen tidsstämpel — inte laddboxen — och det är i
+           skarpt läge man verkligen vill se sin egen bil starta av sig själv.
+           Låg de kvar bland simulatorknapparna fanns de inte när de behövdes. */
+        + '<p class="note" style="margin:12px 0 6px">Prova utan att vänta: flytta '
+        + 'starttiden så att löftet förfaller nu.</p>'
+        + '<div class="btns">'
+        + '<button class="b" data-act="schedtest" data-s="20">Förfall om 20 s</button>'
+        + '<button class="b" data-act="schedtest" data-s="-10800">Som 3 tim försenat</button>'
+        + '<button class="b" data-act="schedtest" data-s="-25200">Som helt missat</button>'
+        + '</div>'
         + '<div class="btns" style="margin-top:10px">'
         + '<button class="b danger" data-act="cancelsched">Avbryt schemat</button></div></div>';
     }
@@ -4856,13 +4872,24 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     h += '</div>';
 
     h += '<div class="h">Larm om schemalagd start</div><div class="card">'
-      + '<div class="row"><span><span class="lab">Notis i Home Assistant</span>'
-      + '<div class="hint">Skrivs som domän.tjänst. <span class="mono">persistent_notification.create</span> '
-      + 'hamnar i notisfältet; <span class="mono">notify.mobile_app_...</span> går till mobilen. '
+      + '<div class="row"><span><span class="lab">Notiser i Home Assistant</span>'
+      + '<div class="hint"><b>En per rad.</b> Skrivs som domän.tjänst.<br>'
+      + '<span class="mono">notify.mobile_app_...</span> ger en push i mobilen — namnet står under '
+      + 'Utvecklarverktyg → Åtgärder.<br>'
+      + '<span class="mono">persistent_notification.create</span> hamnar under bjällran och ligger '
+      + 'kvar tills du tar bort den.<br>'
+      + 'Ta gärna båda: pushen väcker dig, den andra finns kvar på morgonen. '
       + 'Lämna tomt för ingen notis.</div></span></div>'
-      + '<input id="hanotis" type="text" value="' + esc(D.settings.haNotifyService || '') + '" '
-      + 'style="width:100%;box-sizing:border-box;background:var(--bg);color:var(--ink);'
-      + 'border:1px solid var(--line);border-radius:5px;padding:8px;font-family:ui-monospace,Menlo,monospace">'
+      /* Rader, inte en rad. I 0.9.0 var det har ett <input type="text"> och da
+         gick det bokstavligen inte att lagga till en rad — man kunde bara byta
+         ut den som fanns. rows sats explicit sa att det syns pa faltet att det
+         tar flera. */
+      + '<textarea class="ta" id="hanotis" rows="3" spellcheck="false" '
+      + 'placeholder="notify.mobile_app_min_telefon&#10;persistent_notification.create" '
+      + 'style="width:100%;box-sizing:border-box;min-height:78px;resize:vertical;'
+      + 'background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:5px;'
+      + 'padding:8px;font-family:ui-monospace,Menlo,monospace;font-size:13px;line-height:1.5">'
+      + esc(D.settings.haNotifyService || '') + '</textarea>'
       + row('Behörighet', D.haNotify
         ? '<span class="pill p-ok">tillgänglig</span>'
         : '<span class="pill p-warn">saknas — starta om tillägget efter uppdateringen</span>')
@@ -4938,9 +4965,6 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<button class="b" data-act="sim" data-cmd="wake">Bilen drar ström igen</button>'
         + '<button class="b" data-act="sim" data-cmd="ff15">Spola fram 15 min</button>'
         + '<button class="b" data-act="sim" data-cmd="ff60">Spola fram 60 min</button>'
-        + '<button class="b" data-act="sim" data-cmd="schedsoon">Schemat om 20 s</button>'
-        + '<button class="b" data-act="sim" data-cmd="schedlate">Schemat 3 tim försenat</button>'
-        + '<button class="b" data-act="sim" data-cmd="schedmissed">Schemat missat helt</button>'
         + '<button class="b" data-act="sim" data-cmd="disable">Stäng av stolpen</button>'
         + '<button class="b danger" data-act="sim" data-cmd="stuck">Boxen vägrar stanna</button>'
         + '<button class="b" data-act="sim" data-cmd="unstuck">Boxen lyder igen</button>'
@@ -5153,6 +5177,10 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       api('api/admin/prices/refresh', {}).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Priser hämtade.':(r.body.error||'Misslyckades.')); load();
       });
+    } else if (act === 'schedtest') {
+      api('api/admin/schedule/test', { seconds: Number(b.dataset.s) }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Starttiden flyttad. Titta i loggen.':(r.body.error||'Misslyckades.')); load();
+      });
     } else if (act === 'cancelsched') {
       if (!confirm('Avbryt det vantande schemat? Den som lade det far ett besked.')) return;
       api('api/admin/schedule/cancel', {}).then(function(r){
@@ -5165,7 +5193,11 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       });
     } else if (act === 'testnotis') {
       api('api/admin/notify/test', {}).then(function(r){
-        flash(r.ok?'ok':'bad', r.ok?'Notis skickad. Titta i Home Assistant.':(r.body.error||'Misslyckades.'));
+        // Vilken tjanst som tog emot och vilken som inte gjorde det. Med bara
+        // "lyckades" vet man inte om pushen kom fram eller bara bjallran.
+        var d = (r.body && r.body.delar) || [];
+        var txt = d.map(function(x){ return x.tjanst + (x.ok ? ': kom fram' : ': ' + x.error); }).join(' · ');
+        flash(r.ok?'ok':'bad', txt || (r.body.error||'Misslyckades.'));
       });
     } else if (act === 'endsession') {
       api('api/admin/session/end', {}).then(function(r){
@@ -5559,14 +5591,22 @@ function haConfigured() {
   return Boolean(process.env.SUPERVISOR_TOKEN);
 }
 
-async function haNotis(title, message) {
-  const token = process.env.SUPERVISOR_TOKEN;
-  if (!token) return { ok: false, error: 'ingen SUPERVISOR_TOKEN — homeassistant_api saknas' };
+/** Tjänsterna som ska larmas, en per rad eller åtskilda med komma. */
+function tjanster() {
+  return String(config.settings().haNotifyService || '')
+    .split(/[\n,]/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
 
-  const tjanst = String(config.settings().haNotifyService || 'persistent_notification.create');
+/** Ett anrop till en tjänst. Felet formuleras så att det går att åtgärda. */
+async function anropa(tjanst, title, message) {
+  const token = process.env.SUPERVISOR_TOKEN;
+  if (!token) return { tjanst, ok: false, error: 'behörigheten homeassistant_api saknas — starta om tillägget' };
+
   const bit = tjanst.split('.');
   if (bit.length !== 2 || !bit[0] || !bit[1]) {
-    return { ok: false, error: `Ogiltig tjänst: ${tjanst}. Skriv den som domän.tjänst.` };
+    return { tjanst, ok: false, error: 'skriv den som domän.tjänst' };
   }
 
   try {
@@ -5579,11 +5619,44 @@ async function haNotis(title, message) {
       signal: ctl.signal,
     });
     clearTimeout(t);
-    if (!r.ok) return { ok: false, error: `HA svarade ${r.status}` };
-    return { ok: true };
+    if (r.status === 404) {
+      return { tjanst, ok: false, error: 'tjänsten finns inte i Home Assistant — kontrollera namnet under Utvecklarverktyg → Åtgärder' };
+    }
+    if (r.status === 401 || r.status === 403) {
+      return { tjanst, ok: false, error: `HA nekade anropet (${r.status})` };
+    }
+    if (!r.ok) return { tjanst, ok: false, error: `HA svarade ${r.status}` };
+    return { tjanst, ok: true };
   } catch (err) {
-    return { ok: false, error: err.name === 'AbortError' ? 'HA svarade inte i tid' : err.message };
+    return {
+      tjanst,
+      ok: false,
+      error: err.name === 'AbortError' ? 'HA svarade inte i tid' : err.message,
+    };
   }
+}
+
+/**
+ * Notis på alla vägar som är inställda.
+ *
+ * Flera med flit. En push i mobilen väcker dig men går att svepa bort i
+ * halvsömnen; en notis i sidopanelen ligger kvar tills du tar bort den. Till
+ * ett besked man absolut inte får missa vill man ha båda — det ena når fram,
+ * det andra finns kvar på morgonen.
+ *
+ * En tjänst som fallerar får inte tysta de andra. Därför anropas alla, och
+ * svaret säger hur det gick för var och en.
+ */
+async function haNotis(title, message) {
+  const lista = tjanster();
+  if (!lista.length) return { ok: false, error: 'ingen notistjänst inställd', delar: [] };
+
+  const delar = [];
+  for (const t of lista) delar.push(await anropa(t, title, message));
+
+  const lyckade = delar.filter((d) => d.ok);
+  if (lyckade.length) return { ok: true, delar };
+  return { ok: false, error: delar.map((d) => `${d.tjanst}: ${d.error}`).join(' · '), delar };
 }
 
 /**
@@ -5596,7 +5669,17 @@ async function larma({ kind, title, message, phone }) {
   log.warn(`Larm (${kind}): ${message}`);
 
   const ha = await haNotis(title, message);
-  if (!ha.ok && haConfigured()) log.warn(`HA-notisen gick inte fram: ${ha.error}`);
+  /* Loggas alltid, inte bara i adminflikens blänkare. Ett larm som inte gick
+     fram är exakt det man vill kunna slå upp i efterhand — "kom notisen?" är
+     första frågan morgonen efter. */
+  if (ha.ok) {
+    const bra = ha.delar.filter((d) => d.ok).map((d) => d.tjanst).join(', ');
+    const daligt = ha.delar.filter((d) => !d.ok);
+    log.info(`HA-notis skickad till ${bra}.`);
+    daligt.forEach((d) => log.warn(`HA-notis till ${d.tjanst} gick inte fram: ${d.error}`));
+  } else if (tjanster().length) {
+    log.warn(`Ingen HA-notis gick fram: ${ha.error}`);
+  }
 
   let sms_ = { ok: false, error: 'inget nummer' };
   if (phone) {
@@ -5612,7 +5695,7 @@ async function larma({ kind, title, message, phone }) {
   return { ha: ha.ok, sms: Boolean(sms_.ok) };
 }
 
-return { larma, haNotis, haConfigured };
+return { larma, haNotis, haConfigured, tjanster };
 })();
 
 /* ========================================================================== */
@@ -6568,7 +6651,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.9.0';
+const VERSION = '0.9.2';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -7761,14 +7844,42 @@ admin.post('/api/admin/schedule/cancel', async (req, res) => {
   return sendJson(res, 200, { ok: true });
 });
 
-/** Provknapp: går notisvägen fram? Bättre att veta nu än klockan 02:15. */
+/**
+ * Provknapp: låt löftet förfalla nu.
+ *
+ * Fungerar i ALLA lägen, inte bara simulering. Den rör bara schemats egen
+ * tidsstämpel — inget kommando går till laddboxen — och det är i skarpt läge
+ * man verkligen vill se sin egen bil starta av sig själv utan att sitta uppe
+ * till klockan två.
+ */
+admin.post('/api/admin/schedule/test', async (req, res) => {
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+
+  const sek = Number(parsed.body.seconds);
+  if (!Number.isFinite(sek)) return sendJson(res, 400, { error: 'Ogiltigt antal sekunder.' });
+
+  const out = schema.testFlytta(sek * 1000);
+  if (!out.ok) return sendJson(res, 409, { error: out.error });
+
+  await loop.tick();
+  return sendJson(res, 200, { ok: true });
+});
+
+/**
+ * Provknapp: går notisvägen fram? Bättre att veta nu än klockan 02:15.
+ *
+ * Svarar per tjänst. Med bara "lyckades" vet man inte om det var pushen i
+ * mobilen som kom fram eller bara notisen under bjällran — och det är just den
+ * skillnaden man vill kontrollera.
+ */
 admin.post('/api/admin/notify/test', async (req, res) => {
   const out = await larm.haNotis(
     'KPs Laddstolpe',
     'Testnotis. Kommer den här fram hittar även larm om schemalagd start hem.',
   );
-  if (!out.ok) return sendJson(res, 502, { error: out.error });
-  return sendJson(res, 200, { ok: true });
+  if (!out.ok) return sendJson(res, 502, { error: out.error, delar: out.delar || [] });
+  return sendJson(res, 200, { ok: true, delar: out.delar });
 });
 
 admin.post('/api/admin/session/payment', async (req, res) => {
@@ -7864,12 +7975,10 @@ admin.post('/api/admin/sim', async (req, res) => {
     case 'unstuck': out = charger.setStuck(false); break;
     case 'ff15': out = charger.fastForward(15); sessions.shiftStartBack(15); break;
     case 'ff60': out = charger.fastForward(60); sessions.shiftStartBack(60); break;
-    /* Utan de här går ett schema inte att prova. "Spola fram" flyttar
-       simulatorns klocka, inte väggklockan, så ett löfte om sex timmar hade
-       tagit sex timmar att pröva — och då provar man det inte, man hoppas. */
-    case 'schedsoon': out = schema.testFlytta(20 * 1000); break;        // om 20 sekunder
-    case 'schedlate': out = schema.testFlytta(-3 * 60 * 60 * 1000); break; // tre timmar för sent
-    case 'schedmissed': out = schema.testFlytta(-7 * 60 * 60 * 1000); break; // bortom tidsgränsen
+    /* Schemaknapparna låg här förut. De flyttades till Översikt, under det
+       väntande schemat, eftersom de inte har med den simulerade laddboxen att
+       göra — och eftersom det är i SKARPT läge man vill se sin egen bil starta
+       av sig själv. Här fanns de inte när de behövdes. */
     default: return sendJson(res, 400, { error: `Okänt kommando: ${cmd}` });
   }
   if (!out.ok) return sendJson(res, 409, { error: out.error });
