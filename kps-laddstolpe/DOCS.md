@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.9.0.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
+**Version 0.9.1.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
 med SMS, laddning som lever tills kabeln dras ur, priskurva, kvitto med
 Swish-QR, fri laddning för familjen, appen på hemskärmen och schemalagd start.
 
@@ -71,7 +71,7 @@ omedelbart skicka kommandon, utan att du behöver avinstallera något.
 | Låset på stolpen | på | Laddbox | Stänger av stolpen när ingen laddar. |
 | Kabellås under laddning | av | Laddbox | Av som standard — boxar med permanent kabellås sköter det själva. |
 | Kräv verifiering | på | SMS | Stäng bara av vid felsökning. |
-| Notis i Home Assistant | `persistent_notification.create` | SMS | Vart larm om schemalagd start går. Se *Schemalagd start* nedan. |
+| Notiser i Home Assistant | `persistent_notification.create` | SMS | Vart larm om schemalagd start går. En tjänst per rad. Se *Schemalagd start* nedan. |
 | Startförsök per timme och avsändare | 15 | SMS | Hela hushållet delar IP bakom hemmaroutern. |
 | Fria nummer | tom lista | SMS | Familjen. Se *Fri laddning* nedan. |
 | Kom ihåg telefoner | på | SMS | Se *Ihågkomna telefoner* nedan. |
@@ -197,22 +197,28 @@ värre än inget schema** — man sover och tror att bilen laddar.
 Alla larm går som **SMS till den som lade schemat**, och som **notis i Home
 Assistant** till dig.
 
-### Notisen i Home Assistant
+### Notiserna i Home Assistant
 
-Adminfliken → **SMS → Larm om schemalagd start**. Skriv tjänsten som
-`domän.tjänst`:
+Adminfliken → **SMS → Larm om schemalagd start**. **En tjänst per rad**, skriven
+som `domän.tjänst`:
 
 | Tjänst | Vad den gör |
 |---|---|
-| `persistent_notification.create` | Notisfältet i HA:s webbgränssnitt. Standard. |
-| `notify.mobile_app_...` | Push till mobilen via HA-appen. |
+| `notify.mobile_app_...` | Push till mobilen. Kräver Home Assistant-appen på telefonen; det exakta namnet står under **Utvecklarverktyg → Åtgärder**, sök på `notify`. |
+| `persistent_notification.create` | Hamnar under bjällran i sidopanelen och ligger kvar tills du tar bort den. |
 | tomt | Ingen notis. SMS:et går ändå. |
 
-Knappen **Skicka en testnotis** provar vägen. Gör det innan du litar på den —
-bättre att veta nu än 02:15.
+**Ta gärna båda.** De gör olika saker: pushen väcker dig men går att svepa bort
+i halvsömnen, den under bjällran finns kvar på morgonen. En tjänst som fallerar
+tystar inte de andra.
 
-Notisen kräver behörigheten `homeassistant_api`, som lades till i 0.9.0. Har du
-uppdaterat men raden **Behörighet** säger att den saknas: starta om tillägget.
+Knappen **Skicka en testnotis** provar varje väg för sig och säger vilken som
+kom fram. Gör det innan du litar på det — bättre att veta nu än 02:15.
+
+Notiserna kräver behörigheten `homeassistant_api`, som lades till i 0.9.0. Har
+du uppdaterat men raden **Behörighet** säger att den saknas: starta om
+tillägget. Står det *tillgänglig* men notisen ändå inte kommer fram, säger
+felmeddelandet vad som är fel — oftast att tjänstenamnet inte finns.
 
 ### Att prova det
 

@@ -1,5 +1,25 @@
 # Ändringslogg
 
+## 0.9.1
+
+**Flera notiser, inte en.** Fältet tar nu en tjänst per rad. Poängen är att de
+två sorterna gör olika saker: en push i mobilen väcker dig men går att svepa
+bort i halvsömnen, medan en notis under bjällran ligger kvar tills du tar bort
+den. Till ett besked man absolut inte får missa vill man ha båda — det ena når
+fram, det andra finns kvar på morgonen.
+
+En tjänst som fallerar tystar inte de andra. Alla anropas, och det räcker att
+en kommer fram.
+
+**Testknappen säger vilken som kom fram.** Förut bara "lyckades", vilket inte
+skiljer på om det var pushen eller bjällran som fungerade — och det är just den
+skillnaden man vill kontrollera.
+
+**Och felen är begripliga nu.** `404` säger *"tjänsten finns inte i Home
+Assistant — kontrollera namnet under Utvecklarverktyg → Åtgärder"* i stället för
+ett nummer. Allt loggas också, inte bara i adminflikens blänkare: *"kom
+notisen?"* är första frågan morgonen efter.
+
 ## 0.9.0 — schemalagd start, steg 1 av tre
 
 Nu går det att säga *"börja klockan 02:15"* och gå och lägga sig.
