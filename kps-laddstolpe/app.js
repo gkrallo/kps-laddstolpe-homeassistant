@@ -6,7 +6,7 @@
  *
  *  Hela tillägget ligger i den här enda filen. Det är ett medvetet val: du
  *  uppdaterar den genom att öppna filen på GitHub, markera allt, klistra in den
- *  nya versionen och spara. En fil att få rätt i stället för nitton.
+ *  nya versionen och spara. En fil att få rätt i stället för tjugoen.
  *
  *  Inga npm-beroenden. Bara Nodes inbyggda moduler, ingen React, inget
  *  byggsteg — tillägget byggs på sekunder på en Raspberry Pi.
@@ -20,18 +20,20 @@
  *    5  Elpriser                hämtning, cache, kvartsmatchning, prisformel
  *    6  Laddboxen               gemensamt gränssnitt + simulator
  *    7  Sessioner               kvartsvis kostnad, kvittonycklar, ägarskap
- *    8  Bakgrundsloopen         kabelns löpnummer, auto-avslut, tempo
- *    9  Webbservern             egen liten router, hastighetsbegränsare
- *   10  Gästsidan               HTML: ladda, priskurva, betala
- *   11  Adminfliken             HTML: bara innanför Home Assistant
- *   12  SMS                     46elks, lägen från simulerat till skarpt
- *   13  Ihågkomna telefoner     enhetsnycklar, hashade på disk
- *   14  Verifiering av mobilnummer
- *   15  QR-koder                ritade för hand, inga beroenden
- *   16  Swish                   betalsträngen och länken
- *   17  Kvittosidan             permanent länk per laddning
- *   18  Rutter och uppstart     två lyssnare med skilda rutt-tabeller
- *   19  Ikoner och manifest     appen på hemskärmen
+ *    8  Schemalagd start        löftet: disk, kabelns löpnummer, tidsgränser
+ *    9  Bakgrundsloopen         auto-avslut, tempo, vakthållning över löftet
+ *   10  Webbservern             egen liten router, hastighetsbegränsare
+ *   11  Gästsidan               HTML: ladda, priskurva, betala
+ *   12  Adminfliken             HTML: bara innanför Home Assistant
+ *   13  SMS                     46elks, lägen från simulerat till skarpt
+ *   14  Larm                    HA-notis och SMS när ett löfte brister
+ *   15  Ihågkomna telefoner     enhetsnycklar, hashade på disk
+ *   16  Verifiering av mobilnummer
+ *   17  QR-koder                ritade för hand, inga beroenden
+ *   18  Swish                   betalsträngen och länken
+ *   19  Kvittosidan             permanent länk per laddning
+ *   20  Rutter och uppstart     två lyssnare med skilda rutt-tabeller
+ *   21  Ikoner och manifest     appen på hemskärmen
  *
  * ==========================================================================*/
 
@@ -251,6 +253,11 @@ const SETTINGS_DEFAULTS = {
      SMS nästa gång. Varje telefon syns och kan spärras i Laddbox-fliken. */
   rememberDevices: true,
 
+  /* Vilken HA-tjänst larm om schemalagd start går till.
+     persistent_notification.create hamnar i notisfältet i webbgränssnittet.
+     Vill du ha det i mobilen: skriv notify.mobile_app_<din telefon>. */
+  haNotifyService: 'persistent_notification.create',
+
   // SMS: simulerat | dryrun | whitelist | live
   smsMode: 'simulerat',
   smsWhitelist: [],
@@ -345,6 +352,15 @@ function updateSettings(patch) {
 
   if ('rememberDevices' in patch) {
     next.rememberDevices = patch.rememberDevices === true || patch.rememberDevices === 'true';
+  }
+
+  if ('haNotifyService' in patch) {
+    const t = String(patch.haNotifyService || '').trim();
+    // Tom sträng betyder "ingen HA-notis", och det ska gå att välja.
+    if (t && !/^[a-z0-9_]+\.[a-z0-9_]+$/.test(t)) {
+      return { ok: false, error: 'Skriv tjänsten som domän.tjänst, till exempel notify.mobile_app_kristian.' };
+    }
+    next.haNotifyService = t;
   }
 
   // Rimlighetsspärrar som skyddar mot fingerfel
@@ -1631,7 +1647,10 @@ function nextNumber() {
   return (nums.length ? Math.max(...nums) : 1000) + 1;
 }
 
-function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken, free }) {
+function start({
+  phone, cableEpisode, startEnergyKwh, simulated, startToken, free,
+  scheduledFor = null, lateBySeconds = null,
+}) {
   if (active) return { ok: false, error: 'En laddning pågår redan.' };
 
   active = {
@@ -1656,6 +1675,12 @@ function start({ phone, cableEpisode, startEnergyKwh, simulated, startToken, fre
     // kvittot för alltid i stället för att bli en återvändsgränd när den
     // engångsanvänts.
     startToken: startToken || null,
+
+    /* Kom laddningen igång av sig själv? Då ska kvittot kunna säga det, och
+       säga om den blev sen. En dyr laddning man inte förstår är värre än en
+       dyr laddning man förstår. */
+    scheduledFor: scheduledFor || null,
+    lateBySeconds: lateBySeconds || null,
 
     startedAt: new Date().toISOString(),
     chargingEndedAt: null,   // när bilen slutade ta emot ström
@@ -1916,6 +1941,11 @@ function publicView(s, { includeKey = false } = {}) {
     chargingEndedAt: s.chargingEndedAt || null,
     finishReason: s.finishReason || null,
     cableEpisode: s.cableEpisode || null,
+    /* Kom laddningen igång av sig själv, och blev den sen?
+       Skärmen och kvittot ska kunna säga det. En dyr laddning man förstår är
+       något helt annat än en dyr laddning man inte förstår. */
+    scheduledFor: s.scheduledFor || null,
+    lateBySeconds: s.lateBySeconds || null,
     payment: s.payment,
     simulated: Boolean(s.simulated),
   };
@@ -1988,7 +2018,164 @@ return {
 })();
 
 /* ========================================================================== */
-/*  8  Bakgrundsloopen                                                       */
+/*  8  Schemalagd start                                                      */
+/* ========================================================================== */
+
+/** Klockslag ur en tidsstämpel, för läsbara besked. */
+function klockan(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+  } catch (err) { return String(iso); }
+}
+
+const schema = (function () {
+/**
+ * Ett löfte om att göra något om sex timmar.
+ *
+ * Det svåra här är inte att räkna ut när klockan är 02:15. Det svåra är att
+ * löftet ska hålla trots att allt mellan nu och då kan ändra sig: tillägget
+ * startas om, Pi:n bootar, kabeln dras ur, Easee tystnar, klockan hoppar.
+ *
+ * Tre regler bär hela modulen:
+ *
+ *  1. LÖFTET LIGGER PÅ DISK. Ett schema som bara finns i minnet är inget löfte.
+ *
+ *  2. KABELNS LÖPNUMMER ÄR IDENTITETEN. Schemat gäller den bil som stod
+ *     inkopplad när löftet gavs. Dras kabeln ur och sätts i igen kan det vara
+ *     en annan bil, och då är löftet ogiltigt — samma regel som startlänkarna
+ *     redan följer.
+ *
+ *  3. EN ABSOLUT TIDPUNKT, ALDRIG ETT KLOCKSLAG. "02:15" finns två gånger den
+ *     natt klockan ställs tillbaka och inte alls den natt den ställs fram, och
+ *     det är precis den timmen folk schemalägger in i.
+ *
+ * Och en fjärde som inte är teknisk: ett schema som tyst uteblir är värre än
+ * inget schema alls. Därför bär varje schema en lista över vilka larm som
+ * redan gått, så att beskedet kommer en gång — men kommer.
+ */
+
+const FILE = 'schedule.json';
+
+/* Hur sent ett löfte fortfarande är ett löfte.
+   Var Pi:n nere när klockan slog ska bilen laddas ändå — en tom bil på
+   morgonen är ett värre fel än en dyr laddning. Men någon gång är förseningen
+   inte en försening längre utan en helt annan dag. */
+const GRACE_MS = 6 * 60 * 60 * 1000;
+
+/* Hur långt fram man får lova. Ett dygn räcker för "i natt" och "i morgon
+   bitti", och hindrar en felskrivning från att reservera stolpen i en vecka. */
+const MAX_AHEAD_MS = 24 * 60 * 60 * 1000;
+const MIN_AHEAD_MS = 60 * 1000;
+
+let s = null;
+
+/* Skrivs direkt, inte strypt. Ett schema ändrar sig en handfull gånger under
+   sitt liv — det är inte det som sliter på SD-kortet, och ett löfte som ligger
+   och väntar på att skrivas är inget löfte. */
+function save() { store.writeJsonNow(FILE, s); }
+
+function load() {
+  const raw = store.readJson(FILE, null);
+  s = raw && raw.state === 'WAITING' ? raw : null;
+  if (!s) return;
+  const om = Math.round((Date.parse(s.plannedAt) - Date.now()) / 60000);
+  log.info(`Väntande schema: start ${s.plannedAt} (om ${om} min), kabelns löpnummer #${s.cableEpisode}.`);
+}
+
+function get() { return s; }
+
+function newKey() { return crypto.randomBytes(6).toString('base64url'); }
+
+/**
+ * Nytt löfte.
+ *
+ * Alla nej ligger här, inte utspridda i rutterna, så att det finns ett enda
+ * ställe att läsa för att veta när ett schema får finnas.
+ */
+function create({ phone, plannedAt, cableEpisode }) {
+  if (s) return { ok: false, error: 'Det finns redan ett schema för den här bilen.' };
+
+  const nar = Date.parse(plannedAt);
+  if (!Number.isFinite(nar)) return { ok: false, error: 'Ogiltig tidpunkt.' };
+
+  const om = nar - Date.now();
+  if (om < MIN_AHEAD_MS) return { ok: false, error: 'Tidpunkten har redan passerat. Välj en tid längre fram.' };
+  if (om > MAX_AHEAD_MS) return { ok: false, error: 'Du kan schemalägga som mest ett dygn framåt.' };
+
+  s = {
+    id: crypto.randomUUID(),
+    key: newKey(),
+    phone: phone || null,
+    plannedAt: new Date(nar).toISOString(),
+    createdAt: new Date().toISOString(),
+    cableEpisode: cableEpisode || null,
+    state: 'WAITING',
+    attempts: 0,           // startförsök när tiden väl kommit
+    firstTryAt: null,      // när vi började försöka
+    larm: [],              // vilka besked som redan gått
+  };
+  save();
+  log.info(`Schema skapat: start ${s.plannedAt} för ${sms.maskPhone(s.phone)}, kabel #${s.cableEpisode}.`);
+  return { ok: true, schema: s };
+}
+
+/** Löftet är infriat eller upphävt. Filen töms — ett schema i taget. */
+function clear(state, reason) {
+  if (!s) return null;
+  const gammalt = { ...s, state, endedAt: new Date().toISOString(), reason: reason || null };
+  s = null;
+  store.writeJsonNow(FILE, null);
+  return gammalt;
+}
+
+function noteAttempt() {
+  if (!s) return;
+  s.attempts += 1;
+  if (!s.firstTryAt) s.firstTryAt = new Date().toISOString();
+  save();
+}
+
+/** Har det här beskedet redan gått? Ett larm ska komma en gång, men komma. */
+function larmat(kind) { return Boolean(s && s.larm.includes(kind)); }
+function noteLarm(kind) { if (s && !s.larm.includes(kind)) { s.larm.push(kind); save(); } }
+
+/** Vad gästsidan får se. Nyckeln bara till den som äger löftet. */
+function publicView(x, { includeKey = false } = {}) {
+  if (!x) return null;
+  return {
+    plannedAt: x.plannedAt,
+    createdAt: x.createdAt,
+    starting: x.attempts > 0,
+    ...(includeKey ? { key: x.key } : {}),
+  };
+}
+
+/**
+ * Endast för simuleringsläget: flytta löftet så att det förfaller nu.
+ *
+ * Ett schema som ska hålla i sex timmar går inte att prova på riktigt om man
+ * måste vänta sex timmar. Då provas det inte — då hoppas man. Den här knappen
+ * är alltså inte en bekvämlighet utan förutsättningen för att löftet ska vara
+ * något annat än en förhoppning.
+ */
+function testFlytta(offsetMs) {
+  if (!s) return { ok: false, error: 'Inget schema att flytta.' };
+  s.plannedAt = new Date(Date.now() + offsetMs).toISOString();
+  s.attempts = 0;
+  s.firstTryAt = null;
+  save();
+  log.info(`Schemat flyttat till ${s.plannedAt} (prov).`);
+  return { ok: true };
+}
+
+return {
+  load, get, create, clear, noteAttempt, larmat, noteLarm, publicView, testFlytta,
+  GRACE_MS, MAX_AHEAD_MS,
+};
+})();
+
+/* ========================================================================== */
+/*  9  Bakgrundsloopen                                                       */
 /* ========================================================================== */
 
 const loop = (function () {
@@ -2139,6 +2326,11 @@ async function tick() {
     };
     trackCable(state);
 
+    // Vakthållningen över ett väntande löfte. Ligger före sessionsavsnittet
+    // eftersom den måste köras även när ingen laddning pågår — det är ju hela
+    // dess läge.
+    await watchSchedule(state);
+
     const active = sessions.getActive();
     if (!active) { disconnectStrikes = 0; zeroPowerSince = null; return; }
 
@@ -2161,6 +2353,170 @@ async function tick() {
     log.error(`Fel i bakgrundsloopen: ${err.stack || err.message}`);
   } finally {
     ticking = false;
+  }
+}
+
+/* Hur länge vi fortsätter försöka när tiden är inne men något strular.
+   Ett moln som hostar ska inte kosta en natts laddning. */
+const SCHEDULE_RETRY_MS = 30 * 60 * 1000;
+
+/* Hur sent ett besked om försening är värt att skicka. Under det här är
+   förseningen inte värd att väcka någon för. */
+const LATE_WARN_MS = 30 * 60 * 1000;
+
+/* Klockan får inte hoppa bakåt utan att vi märker det. En Pi utan RTC hämtar
+   tiden från nätet, och bootar den utan nät kan klockan vara var som helst. */
+let lastClock = Date.now();
+
+/**
+ * Vaktar löftet.
+ *
+ * Kontrolladdningen bevisar kedjan en gång, i det ögonblick löftet ges. Det
+ * som ändrar sig efteråt fångas här — och poängen är att beskedet ska komma i
+ * samma stund något brister, inte klockan 02:15. Faller kabeln ur 23:40 ska
+ * larmet komma 23:40, medan man är vaken och kan göra något åt det.
+ */
+async function watchSchedule(state) {
+  const sch = schema.get();
+  if (!sch) { lastClock = Date.now(); return; }
+
+  /* Klockan. Hoppar den bakåt mer än fem minuter mellan två varv har systemet
+     just fått en ny tid, och då kan ett schema både brinna av för tidigt och
+     aldrig alls. Vi rör ingenting det varvet. */
+  const nu = Date.now();
+  if (nu < lastClock - 5 * 60 * 1000) {
+    log.warn(`Systemklockan hoppade bakåt ${Math.round((lastClock - nu) / 60000)} min. `
+      + 'Rör inte schemat det här varvet.');
+    lastClock = nu;
+    return;
+  }
+  lastClock = nu;
+
+  // Någon laddar redan. Startade ägaren manuellt är löftet infriat på förhand;
+  // är det någon annan är det ändå ingenting kvar att göra.
+  if (sessions.getActive()) {
+    const bort = schema.clear('DONE', 'en laddning kom igång ändå');
+    log.info(`Schemat togs bort: en laddning pågår redan (${bort.reason}).`);
+    return;
+  }
+
+  /* Kabeln är löftets identitet.
+     Ur kabeln = bilen är borta. Nytt löpnummer = det kan vara en annan bil.
+     Båda gör löftet ogiltigt, och båda ska sägas till om direkt. */
+  if (!state.cableConnected) {
+    schema.noteLarm('kabel');
+    const bort = schema.clear('VOID', 'kabeln drogs ur');
+    await larm.larma({
+      kind: 'kabel',
+      title: 'Den schemalagda laddningen är avbruten',
+      message: `Kabeln drogs ur, så starten ${klockan(bort.plannedAt)} blir inte av. `
+        + 'Sätt i kabeln igen och lägg ett nytt schema.',
+      phone: bort.phone,
+    });
+    return;
+  }
+
+  if (cableState.episode !== sch.cableEpisode) {
+    const bort = schema.clear('VOID', 'kabeln har kopplats om');
+    await larm.larma({
+      kind: 'kabel',
+      title: 'Den schemalagda laddningen är avbruten',
+      message: `Kabeln har kopplats ur och i igen sedan schemat lades, så starten `
+        + `${klockan(bort.plannedAt)} blir inte av. Det kan vara en annan bil nu. `
+        + 'Lägg ett nytt schema från mobilen.',
+      phone: bort.phone,
+    });
+    return;
+  }
+
+  const nar = Date.parse(sch.plannedAt);
+  if (nu < nar) return;                     // inte dags än
+
+  const sent = nu - nar;
+
+  /* Försovning. Var Pi:n nere när klockan slog laddar vi ändå — en tom bil på
+     morgonen är ett värre fel än en dyr laddning. Men någon gång är
+     förseningen inte en försening längre utan en helt annan dag. */
+  if (sent > schema.GRACE_MS) {
+    const bort = schema.clear('VOID', 'för sent');
+    await larm.larma({
+      kind: 'forsent',
+      title: 'Den schemalagda laddningen blev aldrig av',
+      message: `Starten ${klockan(bort.plannedAt)} missades med `
+        + `${Math.round(sent / 3600000)} timmar, vilket är för länge för att köra igång nu. `
+        + 'Bilen är oladdad. Starta från mobilen om du vill ladda.',
+      phone: bort.phone,
+    });
+    return;
+  }
+
+  /* Vi ger inte upp på första försöket. Easee kan vara nere, bilen kan sova.
+     En halvtimmes envishet kostar ingenting och räddar natten. */
+  if (sch.firstTryAt && nu - Date.parse(sch.firstTryAt) > SCHEDULE_RETRY_MS) {
+    const bort = schema.clear('VOID', 'gick inte att starta');
+    await larm.larma({
+      kind: 'misslyckades',
+      title: 'Den schemalagda laddningen gick inte att starta',
+      message: `Vi försökte i en halvtimme från ${klockan(bort.plannedAt)} utan att bilen `
+        + 'började ladda. Vanligaste orsaken är bilens egen laddtimer. '
+        + 'Bilen är oladdad.',
+      phone: bort.phone,
+    });
+    return;
+  }
+
+  await fireSchedule(sch, state, sent);
+}
+
+/**
+ * Tiden är inne. Kör samma sekvens som en gäst hade fått.
+ *
+ * Sessionen skapas FÖRE kommandot, precis som i de andra startvägarna: skulle
+ * strömmen försvinna mitt i sekvensen ska laddningen ändå vara bokförd.
+ */
+async function fireSchedule(sch, state, sentMs) {
+  schema.noteAttempt();
+  log.info(`Schemalagd start: försök ${sch.attempts + 1}, ${Math.round(sentMs / 1000)} s efter utsatt tid.`);
+
+  const started = sessions.start({
+    phone: sch.phone,
+    cableEpisode: cableState.episode,
+    startEnergyKwh: state.sessionEnergyKwh,
+    simulated: Boolean(state.simulated),
+    startToken: null,
+    free: config.isFreeNumber(sch.phone),
+    scheduledFor: sch.plannedAt,
+    lateBySeconds: Math.round(sentMs / 1000),
+  });
+  if (!started.ok) {
+    log.warn(`Schemalagd start kunde inte skapa session: ${started.error}`);
+    return;
+  }
+
+  const cmd = await startChargingSequence();
+  if (!cmd.ok) {
+    // Sessionen tas bort igen, annars ligger den och blockerar nästa försök.
+    sessions.finish('schemalagd start misslyckades');
+    log.warn(`Schemalagd start misslyckades: ${cmd.error}. Försöker igen nästa varv.`);
+    return;
+  }
+
+  await applyCableLock(true);
+  const klar = schema.clear('DONE', 'startad enligt schema');
+  log.info(`Schemalagd laddning igång: session #${started.session.number}.`);
+
+  /* Besked bara om det blev rejält sent. Att komma igång på utsatt tid är
+     inget att väcka någon för, men tre timmar sent vill man veta om —
+     annars ser man bara en dyr laddning på kvittot och undrar. */
+  if (sentMs > LATE_WARN_MS) {
+    await larm.larma({
+      kind: 'sen',
+      title: 'Den schemalagda laddningen kom igång sent',
+      message: `Starten var satt till ${klockan(klar.plannedAt)} men kom igång först nu, `
+        + `${Math.round(sentMs / 60000)} minuter senare. Bilen laddar. `
+        + 'Priset kan ha blivit ett annat än det du valde.',
+      phone: klar.phone,
+    });
   }
 }
 
@@ -2360,6 +2716,11 @@ async function refreshPricesIfDue() {
  */
 function nextDelay() {
   if (isWatched()) return TICK_WATCHED_MS;
+  /* Ett löfte som strax ska infrias. Trettio sekunders takt betyder att
+     starten kan bli en halv minut sen — sällan viktigt, men billigt att slippa
+     när vi ändå vet att klockan snart slår. */
+  const sch = schema.get();
+  if (sch && Date.parse(sch.plannedAt) - Date.now() < 2 * 60 * 1000) return TICK_WATCHED_MS;
   if (sessions.getActive()) return TICK_BUSY_MS;
   if (snapshot.cableConnected) return TICK_BUSY_MS;
   if (failStreak > 0) return TICK_BUSY_MS;   // tappad kontakt: leta tillbaka den
@@ -2475,7 +2836,7 @@ return {
 })();
 
 /* ========================================================================== */
-/*  9  Webbservern                                                           */
+/* 10  Webbservern                                                           */
 /* ========================================================================== */
 
 const httpModule = (function () {
@@ -2706,7 +3067,7 @@ return {
 })();
 
 /* ========================================================================== */
-/* 10  Gästsidan                                                             */
+/* 11  Gästsidan                                                             */
 /* ========================================================================== */
 
 const guestPage = (function () {
@@ -2942,6 +3303,15 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
      Den ligger pa disk, inte bara i en variabel, for att den ska overleva att
      appen stangs. Trycker man pa lanken i SMS:et i stallet for att skriva
      koden ar det har enda spar sidan har av att laddningen ar dess egen. */
+  /* Nyckeln till ett vantande schema.
+     Telefonens enhetsnyckel racker oftast — agarskapet gar pa nummer sedan
+     0.8.3 — men den kan saknas, och da ar det har enda spar telefonen har av
+     att loftet ar dess eget. */
+  var SCH = 'kps.schedule';
+  function schemaSpara(k) { try { localStorage.setItem(SCH, k); } catch (e) {} }
+  function schemaHamta() { try { return localStorage.getItem(SCH) || null; } catch (e) { return null; } }
+  function schemaGlom() { try { localStorage.removeItem(SCH); } catch (e) {} }
+
   var PEND = 'kps.pending';
   var PEND_MAX_MS = 12 * 60 * 60 * 1000;
   function pendSave(token, phone) {
@@ -3161,6 +3531,149 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
     hit.addEventListener('pointercancel', slapp);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Schemalagd start                                                    */
+  /* ------------------------------------------------------------------ */
+
+  var senareOppen = false;   // overlever en ombyggnad av vyn
+
+  function tva(n) { return (n < 10 ? '0' : '') + n; }
+
+  function klockslag(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    return tva(d.getHours()) + ':' + tva(d.getMinutes());
+  }
+
+  /** "3 tim 12 min" eller "4 min". Tom strang nar tiden gatt. */
+  function nedrakning(iso) {
+    if (!iso) return '';
+    var ms = Date.parse(iso) - Date.now();
+    if (!isFinite(ms) || ms <= 0) return 'strax';
+    var min = Math.round(ms / 60000);
+    if (min < 60) return min + ' min';
+    return Math.floor(min / 60) + ' tim ' + (min % 60) + ' min';
+  }
+
+  /**
+   * Forslaget: billigaste kvarten framat.
+   *
+   * Kurvan fran 0.7.0 raknar redan ut den och skriver ut den i klartext. Har
+   * anvands samma siffra som knappens forval, sa att forslaget och
+   * motiveringen ar samma tal — inte tva olika bud.
+   */
+  function billigastFramat() {
+    if (!curveData || !curveData.points || !curveData.points.length) return null;
+    var nu = Date.now(), bast = null;
+    for (var i = 0; i < curveData.points.length; i++) {
+      var p = curveData.points[i];
+      if (Date.parse(p.t) <= nu) continue;
+      if (!bast || p.total < bast.total) bast = p;
+    }
+    return bast;
+  }
+
+  /** Halv timme framat, avrundat uppat till narmaste kvart. Alltid giltigt. */
+  function forslagTid() {
+    var b = billigastFramat();
+    if (b) return new Date(Date.parse(b.t));
+    var d = new Date(Date.now() + 30 * 60000);
+    d.setSeconds(0, 0);
+    d.setMinutes(Math.ceil(d.getMinutes() / 15) * 15);
+    return d;
+  }
+
+  function senareBlock() {
+    if (!senareOppen) {
+      return '<button class="btn ghost" id="senareBtn" style="margin-top:10px"'
+        + (busyAction ? ' disabled' : '') + '>Starta senare…</button>';
+    }
+    var f = forslagTid();
+    var b = billigastFramat();
+    return '<div class="card" style="margin-top:12px;padding:14px">'
+      + '<div class="field" style="margin:0"><label for="nartid">Börja klockan</label>'
+      + '<input id="nartid" type="time" step="900" value="' + tva(f.getHours()) + ':' + tva(f.getMinutes()) + '"></div>'
+      + (b
+        ? '<p class="sub" style="margin:10px 0 0">Billigast framåt är ' + klockslag(b.t)
+          + ' för ' + kr(b.total) + ' kr/kWh.</p>'
+        : '<p class="sub" style="margin:10px 0 0">Öppna prispanelen nedan så föreslår vi den billigaste tiden.</p>')
+      + '<p class="sub" style="margin:8px 0 0">Kabeln måste sitta kvar. Har bilen en egen '
+      + 'laddtimer behöver den vara avstängd.</p>'
+      + '<button class="btn" id="bokaBtn" style="margin-top:12px"' + (busyAction ? ' disabled' : '') + '>'
+      + (busyAction === 'boka' ? 'Bokar…' : 'Boka tiden') + '</button>'
+      + '<button class="btn ghost" id="stangSenare" style="margin-top:8px">Avbryt</button>'
+      + '</div>';
+  }
+
+  function hookSenare() {
+    var b = document.getElementById('senareBtn');
+    if (b) b.addEventListener('click', function () {
+      senareOppen = true;
+      // Priserna behovs for forslaget. De hamtas annars forst nar panelen oppnas.
+      if (!curveData) laddaKurva();
+      lastKey = ''; safeRender();
+    });
+    var st = document.getElementById('stangSenare');
+    if (st) st.addEventListener('click', function () { senareOppen = false; lastKey = ''; safeRender(); });
+    var bo = document.getElementById('bokaBtn');
+    if (bo) bo.addEventListener('click', doSchedule);
+  }
+
+  /**
+   * Klockslaget blir en absolut tidpunkt har, i telefonens egen tidszon.
+   *
+   * Har klockslaget redan passerat i dag menas i morgon — annars hade "boka
+   * 02:15" klockan 23 varit omojligt att uttrycka.
+   */
+  function doSchedule() {
+    var inp = document.getElementById('nartid');
+    var v = inp ? inp.value : '';
+    var m = /^(\\d{1,2}):(\\d{2})$/.exec(v || '');
+    if (!m) { setNotice('err', 'Välj en tid först.'); return; }
+
+    var d = new Date();
+    d.setSeconds(0, 0);
+    d.setHours(Number(m[1]), Number(m[2]));
+    if (d.getTime() - Date.now() < 60000) d.setDate(d.getDate() + 1);
+
+    busyAction = 'boka'; setNotice(null, null); lastKey = ''; safeRender();
+    fetch('api/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device: devGet(), plannedAt: d.toISOString() })
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        busyAction = null;
+        if (!res.ok) {
+          if (res.body.forgetDevice) devForget();
+          setNotice('err', res.body.error || 'Tiden kunde inte bokas.');
+          return;
+        }
+        senareOppen = false;
+        if (res.body.schedule && res.body.schedule.key) schemaSpara(res.body.schedule.key);
+        lastKey = ''; poll();
+      })
+      .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
+  }
+
+  function doCancelSchedule() {
+    busyAction = 'avbryt'; setNotice(null, null); lastKey = ''; safeRender();
+    fetch('api/schedule/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ s: schemaHamta(), d: devGet() })
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        busyAction = null;
+        if (!res.ok) { setNotice('err', res.body.error || 'Schemat kunde inte avbrytas.'); return; }
+        schemaGlom();
+        lastKey = ''; poll();
+      })
+      .catch(function () { busyAction = null; setNotice('err', 'Ingen kontakt med servern.'); });
+  }
+
   function priceBlock(p, compact) {
     if (!p) {
       // Panelen följer med även utan prisuppgift. Den som undrar varför priset
@@ -3374,14 +3887,19 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
         + escTel(s.known.phone) + '</span>';
       el.slot.innerHTML = noticeBlock() + staleBlock(s) + receiptBanner() +
         '<button class="btn" id="oneTapBtn"' + (busyAction ? ' disabled' : '') + '>'
-        + (busyAction ? 'Startar…' : 'Starta laddning') + '</button>' +
+        + (busyAction === 'start' ? 'Startar…' : 'Starta laddning') + '</button>' +
         (s.known.free
           ? '<div class="msg info">Din laddning är fri. Priset nedan är vad elen kostar — avgiften för stolpen tillkommer inte.</div>'
           : '') +
+        /* Schemalaggning kraver en igenkand telefon. Den som laddar en enda
+           gang ska mota exakt samma sida som forut — en extra knapp for nagot
+           de aldrig kommer att anvanda gor bara valet svarare. */
+        senareBlock() +
         '<p style="text-align:center;font-size:14.5px;margin:16px 0 0">' +
         '<button class="linkish" id="otherPhone" style="color:#BFD2C6">Inte du? Använd ett annat nummer</button></p>' +
         priceBlock(s.price, true);
 
+      hookSenare();
       var ot = document.getElementById('oneTapBtn');
       if (ot) ot.addEventListener('click', function () { doStart(null, null, devGet()); });
       var op = document.getElementById('otherPhone');
@@ -3411,6 +3929,43 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
         if (!phone) { setNotice('err', 'Skriv ditt mobilnummer först.'); return; }
         if (s.requireVerification) doSendCode(phone); else doStart(phone);
       });
+
+    } else if (s.view === 'scheduled') {
+      /* Stolpen ar varken ledig eller upptagen — den ar reserverad.
+         Agaren ser sin nedrakning och kan andra sig. En forbipasserande ser
+         att det inte ar fritt fram, men kan inte ta over: en reservation som
+         gar att ata upp ar ingen reservation. */
+      var sc = s.schedule || {};
+      var mitt = !!s.mittSchema;
+      el.icon.style.display = 'none';
+      el.title.textContent = mitt ? 'Laddningen börjar ' + klockslag(sc.plannedAt) : 'Stolpen är reserverad';
+      el.lead.textContent = mitt
+        ? 'Du kan låsa mobilen och gå. Vi håller reda på tiden.'
+        : 'En laddning är inbokad här och börjar ' + klockslag(sc.plannedAt) + '.';
+
+      el.slot.innerHTML = noticeBlock() + staleBlock(s) +
+        '<div class="runline">' + ICONS.bolt + 'Börjar om <span id="vNed">' + nedrakning(sc.plannedAt) + '</span></div>' +
+        (mitt
+          ? '<div class="msg info">Kabeln måste sitta kvar. Dras den ur avbryts schemat och du får ett SMS.</div>'
+            + '<div class="msg">Har bilen en egen laddtimer behöver den vara avstängd, annars '
+            + 'vägrar bilen ta emot ström när vi startar.</div>'
+          : '') +
+        priceBlock(s.price, true) +
+        (mitt
+          ? '<button class="btn" id="nowBtn" style="margin-top:14px"' + (busyAction ? ' disabled' : '') + '>'
+            + (busyAction === 'start' ? 'Startar…' : 'Starta nu i stället') + '</button>'
+            + '<button class="btn ghost" id="avbrytBtn" style="margin-top:10px"' + (busyAction ? ' disabled' : '') + '>'
+            + (busyAction === 'avbryt' ? 'Avbryter…' : 'Avbryt schemat') + '</button>'
+          : '');
+
+      var nu = document.getElementById('nowBtn');
+      if (nu) nu.addEventListener('click', function () {
+        var d = devGet();
+        if (d) doStart(null, null, d);
+        else setNotice('err', 'Den här telefonen känns inte igen. Avbryt schemat och starta om.');
+      });
+      var av = document.getElementById('avbrytBtn');
+      if (av) av.addEventListener('click', doCancelSchedule);
 
     } else if (s.view === 'charging') {
       var ses = s.session || {};
@@ -3590,9 +4145,11 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
     // vägen till betalsidan. Utan nyckel: samma vy, men ingen betallänk.
     var sparad = recall();
     var d = devGet();
+    var sk = schemaHamta();
     var q = [];
     if (sparad && sparad.key) q.push('k=' + encodeURIComponent(sparad.key));
     if (d) q.push('d=' + encodeURIComponent(d));
+    if (sk) q.push('s=' + encodeURIComponent(sk));
     fetch('api/status' + (q.length ? '?' + q.join('&') : ''), { cache: 'no-store' })
       .then(function (r) {
         if (!r.ok) throw new Error('Servern svarade ' + r.status);
@@ -3624,6 +4181,10 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
          under en pagaende laddning, alltsa precis nar det behovs. */
       var egen = recall();
       if ((data.session && !data.session.receiptKey) || !(egen && egen.key)) tryClaim();
+
+      // Schemat ar borta — infriat, avbrutet eller ogiltigt. Nyckeln till det
+      // har inget mer att oppna.
+      if (!data.schedule && schemaHamta()) schemaGlom();
 
       if (data.session) { receipt = null; safeRender(); tickSmooth(); return; }
 
@@ -3715,6 +4276,13 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
   var MAX_GISSNING_MS = 90 * 1000;
 
   function tickSmooth() {
+    // Nedrakningen mot ett vantande lofte. Utan den star siffran still mellan
+    // pollningarna och man undrar om sidan lever.
+    if (state && state.view === 'scheduled' && state.schedule) {
+      var ned = document.getElementById('vNed');
+      if (ned) ned.textContent = nedrakning(state.schedule.plannedAt);
+      return;
+    }
     if (!state || state.view !== 'charging' || !state.session) return;
     var ses = state.session;
     var kwEl = document.getElementById('vKw');
@@ -3942,7 +4510,7 @@ return { render };
 })();
 
 /* ========================================================================== */
-/* 11  Adminfliken                                                           */
+/* 12  Adminfliken                                                           */
 /* ========================================================================== */
 
 const adminPage = (function () {
@@ -4141,6 +4709,16 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     } else {
       h += '<div class="h">Pågående laddning</div><div class="card"><div class="note" style="margin:0">Ingen laddning pågår.</div></div>';
     }
+
+    if (D.schedule) {
+      h += '<div class="h">Väntande schema</div><div class="card">'
+        + row('Startar', new Date(D.schedule.plannedAt).toLocaleString('sv-SE'))
+        + row('Nummer', D.schedule.phone)
+        + row('Kabelns löpnummer', '#' + D.schedule.cableEpisode)
+        + (D.schedule.attempts ? row('Startförsök', String(D.schedule.attempts)) : '')
+        + '<div class="btns" style="margin-top:10px">'
+        + '<button class="b danger" data-act="cancelsched">Avbryt schemat</button></div></div>';
+    }
     return h;
   }
 
@@ -4277,6 +4855,23 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
     }
     h += '</div>';
 
+    h += '<div class="h">Larm om schemalagd start</div><div class="card">'
+      + '<div class="row"><span><span class="lab">Notis i Home Assistant</span>'
+      + '<div class="hint">Skrivs som domän.tjänst. <span class="mono">persistent_notification.create</span> '
+      + 'hamnar i notisfältet; <span class="mono">notify.mobile_app_...</span> går till mobilen. '
+      + 'Lämna tomt för ingen notis.</div></span></div>'
+      + '<input id="hanotis" type="text" value="' + esc(D.settings.haNotifyService || '') + '" '
+      + 'style="width:100%;box-sizing:border-box;background:var(--bg);color:var(--ink);'
+      + 'border:1px solid var(--line);border-radius:5px;padding:8px;font-family:ui-monospace,Menlo,monospace">'
+      + row('Behörighet', D.haNotify
+        ? '<span class="pill p-ok">tillgänglig</span>'
+        : '<span class="pill p-warn">saknas — starta om tillägget efter uppdateringen</span>')
+      + '<div class="btns" style="margin-top:10px">'
+      + '<button class="b gold" data-act="savehanotis">Spara</button>'
+      + '<button class="b" data-act="testnotis">Skicka en testnotis</button></div>'
+      + '<p class="note" style="margin:12px 0 0">Ett schema som tyst uteblir är värre än inget '
+      + 'schema. Den som lade det får alltid ett SMS; notisen är till för dig.</p></div>';
+
     h += '<div class="h">Verifiering</div><div class="card">'
       + '<div class="row"><span><span class="lab">Kräv verifiering av mobilnummer</span>'
       + '<div class="hint">Utan detta är numret bara ett textfält. Stäng bara av vid felsökning.</div></span>'
@@ -4343,6 +4938,9 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<button class="b" data-act="sim" data-cmd="wake">Bilen drar ström igen</button>'
         + '<button class="b" data-act="sim" data-cmd="ff15">Spola fram 15 min</button>'
         + '<button class="b" data-act="sim" data-cmd="ff60">Spola fram 60 min</button>'
+        + '<button class="b" data-act="sim" data-cmd="schedsoon">Schemat om 20 s</button>'
+        + '<button class="b" data-act="sim" data-cmd="schedlate">Schemat 3 tim försenat</button>'
+        + '<button class="b" data-act="sim" data-cmd="schedmissed">Schemat missat helt</button>'
         + '<button class="b" data-act="sim" data-cmd="disable">Stäng av stolpen</button>'
         + '<button class="b danger" data-act="sim" data-cmd="stuck">Boxen vägrar stanna</button>'
         + '<button class="b" data-act="sim" data-cmd="unstuck">Boxen lyder igen</button>'
@@ -4555,6 +5153,20 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       api('api/admin/prices/refresh', {}).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Priser hämtade.':(r.body.error||'Misslyckades.')); load();
       });
+    } else if (act === 'cancelsched') {
+      if (!confirm('Avbryt det vantande schemat? Den som lade det far ett besked.')) return;
+      api('api/admin/schedule/cancel', {}).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Schemat avbrutet.':(r.body.error||'Misslyckades.')); load();
+      });
+    } else if (act === 'savehanotis') {
+      var hn = document.getElementById('hanotis');
+      api('api/admin/settings', { haNotifyService: hn.value.trim() }).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Sparat.':(r.body.error||'Kunde inte spara.')); load();
+      });
+    } else if (act === 'testnotis') {
+      api('api/admin/notify/test', {}).then(function(r){
+        flash(r.ok?'ok':'bad', r.ok?'Notis skickad. Titta i Home Assistant.':(r.body.error||'Misslyckades.'));
+      });
     } else if (act === 'endsession') {
       api('api/admin/session/end', {}).then(function(r){
         flash(r.ok?'ok':'bad', r.ok?'Sessionen avslutad.':(r.body.error||'Misslyckades.')); load();
@@ -4657,7 +5269,7 @@ return { render };
 })();
 
 /* ========================================================================== */
-/* 12  SMS                                                                   */
+/* 13  SMS                                                                   */
 /* ========================================================================== */
 
 const sms = (function () {
@@ -4918,7 +5530,93 @@ return { send, measure, normalize, status, loadCounters, recent: (n = 40) => log
 })();
 
 /* ========================================================================== */
-/* 13  Ihågkomna telefoner                                                   */
+/* 14  Larm                                                                  */
+/* ========================================================================== */
+
+const larm = (function () {
+/**
+ * Besked när ett löfte brister.
+ *
+ * Ett schema som tyst uteblir är värre än inget schema: gästen sover och tror
+ * att bilen laddar. Därför två vägar, och de kompletterar varandra.
+ *
+ *  NOTIS I HOME ASSISTANT når dig, ägaren, gratis. Tillägget anropar HA:s eget
+ *  tjänste-API genom Supervisor. Det kräver `homeassistant_api: true` i
+ *  config.yaml — då sätter Supervisor en SUPERVISOR_TOKEN i miljön. Vilken
+ *  tjänst notisen går till är en inställning, så att den kan peka på din
+ *  mobilapp (notify.mobile_app_...) i stället för notisfältet.
+ *
+ *  SMS når gästen, som varken har HA eller sitter uppe. Det kostar pengar och
+ *  räknas mot samma tak som allt annat.
+ *
+ * Ingen av vägarna får kasta. Ett misslyckat larm ska aldrig kunna välta det
+ * den larmar om.
+ */
+
+const HA_URL = 'http://supervisor/core/api/services';
+
+function haConfigured() {
+  return Boolean(process.env.SUPERVISOR_TOKEN);
+}
+
+async function haNotis(title, message) {
+  const token = process.env.SUPERVISOR_TOKEN;
+  if (!token) return { ok: false, error: 'ingen SUPERVISOR_TOKEN — homeassistant_api saknas' };
+
+  const tjanst = String(config.settings().haNotifyService || 'persistent_notification.create');
+  const bit = tjanst.split('.');
+  if (bit.length !== 2 || !bit[0] || !bit[1]) {
+    return { ok: false, error: `Ogiltig tjänst: ${tjanst}. Skriv den som domän.tjänst.` };
+  }
+
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10000);
+    const r = await fetch(`${HA_URL}/${bit[0]}/${bit[1]}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, message }),
+      signal: ctl.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) return { ok: false, error: `HA svarade ${r.status}` };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.name === 'AbortError' ? 'HA svarade inte i tid' : err.message };
+  }
+}
+
+/**
+ * Larma på alla vägar som är öppna.
+ *
+ * `phone` är den som blir utan laddning. Är det din egen familj får de SMS
+ * ändå — det är inte en räkning, det är ett besked, och det är hela poängen.
+ */
+async function larma({ kind, title, message, phone }) {
+  log.warn(`Larm (${kind}): ${message}`);
+
+  const ha = await haNotis(title, message);
+  if (!ha.ok && haConfigured()) log.warn(`HA-notisen gick inte fram: ${ha.error}`);
+
+  let sms_ = { ok: false, error: 'inget nummer' };
+  if (phone) {
+    sms_ = await sms.send({
+      to: phone,
+      text: `${title}\n\n${message}`,
+      kind: 'schemalarm',
+      ip: 'system',
+    }).catch((err) => ({ ok: false, error: err.message }));
+    if (!sms_.ok) log.warn(`Larm-SMS gick inte fram: ${sms_.error}`);
+  }
+
+  return { ha: ha.ok, sms: Boolean(sms_.ok) };
+}
+
+return { larma, haNotis, haConfigured };
+})();
+
+/* ========================================================================== */
+/* 15  Ihågkomna telefoner                                                   */
 /* ========================================================================== */
 
 const devices = (function () {
@@ -5061,7 +5759,7 @@ return { load, issue, resolve, all, revoke, rename, revokeByPhone, flush, maskPh
 })();
 
 /* ========================================================================== */
-/* 14  Verifiering av mobilnummer                                            */
+/* 16  Verifiering av mobilnummer                                            */
 /* ========================================================================== */
 
 const verify = (function () {
@@ -5184,7 +5882,7 @@ return { begin, check, consume, stats, TTL_MS };
 })();
 
 /* ========================================================================== */
-/* 15  QR-koder                                                              */
+/* 17  QR-koder                                                              */
 /* ========================================================================== */
 
 const qr = (function () {
@@ -5541,7 +6239,7 @@ return { encode, svg };
 
 })();
 /* ========================================================================== */
-/* 16  Swish                                                                 */
+/* 18  Swish                                                                 */
 /* ========================================================================== */
 
 const swish = (function () {
@@ -5590,7 +6288,7 @@ return { payee, deepLink, qrPayload, qrSvg };
 })();
 
 /* ========================================================================== */
-/* 17  Kvittosidan                                                           */
+/* 19  Kvittosidan                                                           */
 /* ========================================================================== */
 
 const receiptPage = (function () {
@@ -5845,7 +6543,7 @@ return { render };
 })();
 
 /* ========================================================================== */
-/* 18  Rutter och uppstart                                                   */
+/* 20  Rutter och uppstart                                                   */
 /* ========================================================================== */
 
 /**
@@ -5870,7 +6568,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.8.3';
+const VERSION = '0.9.0';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -6168,7 +6866,7 @@ async function readStateForStart() {
 }
 
 /* ========================================================================== */
-/* 19  Ikoner och manifest                                                   */
+/* 21  Ikoner och manifest                                                   */
 /* ========================================================================== */
 
 /**
@@ -6367,6 +7065,17 @@ guest.get('/api/status', (req, res, ctx) => {
     view = 'ready';
   }
 
+  /* Ett väntande löfte.
+     Stolpen är varken ledig eller upptagen — den är reserverad. Den som lade
+     schemat ska se sin nedräkning och kunna ändra sig; en förbipasserande ska
+     se att det inte är fritt fram, men inte kunna ta över. */
+  const sch = schema.get();
+  const mittSchema = Boolean(sch && (
+    (ctx.query.get('s') && ctx.query.get('s') === sch.key)
+    || (enhet && enhet.phone && sch.phone && enhet.phone === sch.phone)
+  ));
+  if (sch && view === 'ready') view = 'scheduled';
+
   const mode = config.ha().mode;
   if (mode === 'avlasning' && view === 'ready') view = 'readonly';
 
@@ -6395,6 +7104,8 @@ guest.get('/api/status', (req, res, ctx) => {
     starting: startState.running,
     startError: !active && startState.error ? startState.error : null,
     mine,
+    schedule: schema.publicView(sch, { includeKey: mittSchema }),
+    mittSchema,
     // Kabelns löpnummer just nu. Gästsidan använder det för att veta när en
     // gammal sammanställning blivit inaktuell: har någon satt i kabeln på nytt
     // är den laddningen historia.
@@ -6514,6 +7225,103 @@ guest.post('/api/verify/claim', async (req, res, ctx) => {
   return sendJson(res, 200, { ok: true, receiptKey: s.receiptKey, device });
 });
 
+/**
+ * Vem är det som ber om något? Tre bevis, i fallande styrka.
+ *
+ * Låg i /api/start förut. Nu finns det två vägar in — starta nu och schemalägg
+ * — och samma bevis ska gälla för båda. Två kopior hade betytt att skärpningen
+ * i den ena glömdes bort i den andra.
+ */
+function resolveGuestPhone(body) {
+  if (body && body.device) {
+    /* En ihågkommen telefon. Numret bevisades en gång och nyckeln har burit
+       det sedan dess. Går nyckeln inte att lösa upp — spärrad, okänd, eller
+       funktionen avstängd — faller vi tillbaka på det vanliga beskedet som ber
+       om verifiering, i stället för att avslöja vilket som gällde. */
+    const d = devices.resolve(body.device);
+    if (!d) {
+      return {
+        ok: false,
+        status: 401,
+        forgetDevice: true,
+        error: 'Den här telefonen känns inte igen längre. Skriv ditt mobilnummer så får du en ny kod.',
+      };
+    }
+    return { ok: true, phone: d.phone };
+  }
+
+  if (body && body.token) {
+    const v = verify.consume(body.token, true);
+    if (!v.ok) return { ok: false, status: 400, error: v.error };
+    return { ok: true, phone: v.phone };
+  }
+
+  if (!config.settings().requireVerification) {
+    const p = normalizePhone(body && body.phone);
+    if (!p) return { ok: false, status: 400, error: 'Kontrollera mobilnumret. Skriv det som 070 123 45 67.' };
+    return { ok: true, phone: p };
+  }
+
+  return { ok: false, status: 400, error: 'Mobilnumret måste verifieras först.' };
+}
+
+/**
+ * Lägg ett löfte.
+ *
+ * Samma bevis som en start, samma kabelkontroll — men inget kommando skickas.
+ * Det enda som händer är att en rad hamnar på disk och att loopen får något
+ * att vakta.
+ */
+guest.post('/api/schedule', async (req, res, ctx) => {
+  loop.noteGuestPoll();
+
+  const rl = limiter.hit(`sched:${ctx.ip}`, config.settings().maxStartsPerHourPerIp, 60 * 60 * 1000);
+  if (!rl.allowed) return sendJson(res, 429, { error: 'För många försök. Vänta en stund.' });
+
+  if (sessions.getActive()) return sendJson(res, 409, { error: 'Stolpen används just nu.' });
+  if (schema.get()) return sendJson(res, 409, { error: 'Det finns redan ett schema för den här bilen.' });
+
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+
+  const state = await readStateForStart();
+  if (!state.ok) return sendJson(res, 503, { error: 'Ingen kontakt med laddstolpen just nu. Försök igen om en stund.' });
+  if (!state.cableConnected) return sendJson(res, 409, { error: 'Ingen kabel är ansluten till stolpen.' });
+
+  const vem = resolveGuestPhone(parsed.body);
+  if (!vem.ok) return sendJson(res, vem.status, { error: vem.error, ...(vem.forgetDevice ? { forgetDevice: true } : {}) });
+
+  const out = schema.create({
+    phone: vem.phone,
+    plannedAt: parsed.body.plannedAt,
+    cableEpisode: loop.getCableState().episode,
+  });
+  if (!out.ok) return sendJson(res, 400, { error: out.error });
+
+  log.info(`Schemalagd start begärd från ${ctx.ip}.`);
+  return sendJson(res, 200, { ok: true, schedule: schema.publicView(out.schema, { includeKey: true }) });
+});
+
+/** Ångra löftet. Samma ägarskapsfråga som allt annat: nyckeln eller numret. */
+guest.post('/api/schedule/cancel', async (req, res, ctx) => {
+  loop.noteGuestPoll();
+
+  const sch = schema.get();
+  if (!sch) return sendJson(res, 409, { error: 'Det finns inget schema att avbryta.' });
+
+  const parsed = await readJsonBody(req);
+  const nyckel = (parsed.ok && parsed.body && parsed.body.s) || ctx.query.get('s');
+  const enhet = devices.resolve((parsed.ok && parsed.body && parsed.body.d) || ctx.query.get('d'));
+  const agare = (nyckel && nyckel === sch.key)
+    || (enhet && enhet.phone && sch.phone && enhet.phone === sch.phone);
+  if (!agare) return sendJson(res, 403, { error: 'Bara den som lade schemat kan avbryta det.' });
+
+  schema.clear('VOID', 'avbrutet av gästen');
+  log.info('Schemat avbröts från mobilen.');
+  await loop.tick();
+  return sendJson(res, 200, { ok: true });
+});
+
 guest.post('/api/start', async (req, res, ctx) => {
   loop.noteGuestPoll();
   // Spärren sätts först av allt, före varje await
@@ -6554,29 +7362,25 @@ guest.post('/api/start', async (req, res, ctx) => {
 
     // Numret måste vara verifierat. Utan det är det bara ett textfält, och då
     // är spårbarheten — ett av två skäl att bygga appen — borta.
-    let phone;
-    if (parsed.body.device) {
-      // En ihågkommen telefon. Numret bevisades en gång och nyckeln har burit
-      // det sedan dess. Går nyckeln inte att lösa upp — spärrad, okänd, eller
-      // funktionen avstängd — faller vi tillbaka på det vanliga besked som
-      // ber om verifiering, i stället för att avslöja vilket som gällde.
-      const d = devices.resolve(parsed.body.device);
-      if (!d) {
-        return sendJson(res, 401, {
-          error: 'Den här telefonen känns inte igen längre. Skriv ditt mobilnummer så får du en ny kod.',
-          forgetDevice: true,
+    const vem = resolveGuestPhone(parsed.body);
+    if (!vem.ok) return sendJson(res, vem.status, { error: vem.error, ...(vem.forgetDevice ? { forgetDevice: true } : {}) });
+    const phone = vem.phone;
+
+    /* Stolpen är reserverad.
+       Den som lade schemat får starta direkt — det var hela poängen med att
+       kunna ångra sig. Någon annan får inte ta över: då hade en granne kunnat
+       äta upp reservationen och bilen stått oladdad på morgonen. Är kabeln ur
+       är schemat redan ogiltigt och stolpen ledig, så det här låser inget. */
+    const vantande = schema.get();
+    if (vantande) {
+      if (vantande.phone && vantande.phone === phone) {
+        schema.clear('DONE', 'gästen startade själv');
+        log.info('Schemat togs bort: gästen startade direkt i stället.');
+      } else {
+        return sendJson(res, 409, {
+          error: `Stolpen är reserverad för en laddning som börjar ${klockan(vantande.plannedAt)}.`,
         });
       }
-      phone = d.phone;
-    } else if (parsed.body.token) {
-      const v = verify.consume(parsed.body.token, true);
-      if (!v.ok) return sendJson(res, 400, { error: v.error });
-      phone = v.phone;
-    } else if (!config.settings().requireVerification) {
-      phone = normalizePhone(parsed.body.phone);
-      if (!phone) return sendJson(res, 400, { error: 'Kontrollera mobilnumret. Skriv det som 070 123 45 67.' });
-    } else {
-      return sendJson(res, 400, { error: 'Mobilnumret måste verifieras först.' });
     }
 
     const state = await readStateForStart();
@@ -6857,6 +7661,18 @@ admin.get('/api/admin/state', (req, res) => {
     lastTick: loop.getLastTickAt(),
     sms: sms.status(),
     devices: devices.all(),
+    haNotify: larm.haConfigured(),
+    schedule: (() => {
+      const sch = schema.get();
+      if (!sch) return null;
+      return {
+        plannedAt: sch.plannedAt,
+        createdAt: sch.createdAt,
+        phone: sms.maskPhone(sch.phone),
+        cableEpisode: sch.cableEpisode,
+        attempts: sch.attempts,
+      };
+    })(),
     smsLog: sms.recent(30),
     verify: verify.stats(),
     swishConfigured: Boolean((config.ha().swish_number || '').trim()),
@@ -6926,6 +7742,32 @@ admin.post('/api/admin/device/name', async (req, res) => {
   if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
   const out = devices.rename(parsed.body.id, parsed.body.name);
   if (!out.ok) return sendJson(res, 404, out);
+  return sendJson(res, 200, { ok: true });
+});
+
+admin.post('/api/admin/schedule/cancel', async (req, res) => {
+  const sch = schema.get();
+  if (!sch) return sendJson(res, 409, { error: 'Det finns inget schema att avbryta.' });
+
+  const bort = schema.clear('VOID', 'avbrutet från adminfliken');
+  await larm.larma({
+    kind: 'avbrutet',
+    title: 'Den schemalagda laddningen är avbruten',
+    message: `Starten ${klockan(bort.plannedAt)} är avbruten från laddstolpen. `
+      + 'Starta från mobilen om du vill ladda ändå.',
+    phone: bort.phone,
+  });
+  await loop.tick();
+  return sendJson(res, 200, { ok: true });
+});
+
+/** Provknapp: går notisvägen fram? Bättre att veta nu än klockan 02:15. */
+admin.post('/api/admin/notify/test', async (req, res) => {
+  const out = await larm.haNotis(
+    'KPs Laddstolpe',
+    'Testnotis. Kommer den här fram hittar även larm om schemalagd start hem.',
+  );
+  if (!out.ok) return sendJson(res, 502, { error: out.error });
   return sendJson(res, 200, { ok: true });
 });
 
@@ -7022,6 +7864,12 @@ admin.post('/api/admin/sim', async (req, res) => {
     case 'unstuck': out = charger.setStuck(false); break;
     case 'ff15': out = charger.fastForward(15); sessions.shiftStartBack(15); break;
     case 'ff60': out = charger.fastForward(60); sessions.shiftStartBack(60); break;
+    /* Utan de här går ett schema inte att prova. "Spola fram" flyttar
+       simulatorns klocka, inte väggklockan, så ett löfte om sex timmar hade
+       tagit sex timmar att pröva — och då provar man det inte, man hoppas. */
+    case 'schedsoon': out = schema.testFlytta(20 * 1000); break;        // om 20 sekunder
+    case 'schedlate': out = schema.testFlytta(-3 * 60 * 60 * 1000); break; // tre timmar för sent
+    case 'schedmissed': out = schema.testFlytta(-7 * 60 * 60 * 1000); break; // bortom tidsgränsen
     default: return sendJson(res, 400, { error: `Okänt kommando: ${cmd}` });
   }
   if (!out.ok) return sendJson(res, 409, { error: out.error });
@@ -7052,6 +7900,7 @@ async function main() {
   prices.loadCache();
   sms.loadCounters();
   devices.load();
+  schema.load();
 
   charger = chargerFactory.create(ha.mode, {
     username: ha.easee_username,

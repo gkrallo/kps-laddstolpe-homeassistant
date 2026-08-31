@@ -13,7 +13,7 @@ på Home Assistant i stället för i molnet.
 
 | Tillägg | Version | Status |
 |---|---|---|
-| [KPs Laddstolpe](./kps-laddstolpe) | 0.8.3 | Fri laddning, ihågkomna telefoner, priskurva |
+| [KPs Laddstolpe](./kps-laddstolpe) | 0.9.0 | Schemalagd start, fri laddning, ihågkomna telefoner, priskurva |
 
 Fullständig beskrivning i [DOCS.md](./kps-laddstolpe/DOCS.md), ändringar i
 [CHANGELOG.md](./kps-laddstolpe/CHANGELOG.md).
@@ -37,7 +37,7 @@ inställningar i Home Assistant.
 
 Hela tillägget ligger i **en enda fil**, `kps-laddstolpe/app.js`. Det är ett
 medvetet val: uppdatering sker genom att öppna filen, markera allt, klistra in
-den nya versionen och spara. Filen är indelad i nitton numrerade avsnitt med
+den nya versionen och spara. Filen är indelad i tjugoen numrerade avsnitt med
 tydliga rubriker.
 
 Inga npm-beroenden. Bara Nodes inbyggda moduler, inget React, inget byggsteg —
@@ -60,4 +60,8 @@ ingenting.
 | 7 | Parallelldrift och avveckling av molnversionen | |
 
 Utöver faserna: ägarskap per laddning, fri laddning för familjen, ihågkomna
-telefoner, priskurva och appen på hemskärmen.
+telefoner, priskurva, appen på hemskärmen och schemalagd start.
+
+Schemalagd start byggs i tre steg. Steg 1 — löftets skelett, med enkel
+tidsväljare — finns i 0.9.0. Kvar: kontrolladdningen som bevisar hela kedjan
+medan man står där, och reglaget på priskurvan.

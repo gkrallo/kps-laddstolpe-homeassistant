@@ -1,5 +1,63 @@
 # Ändringslogg
 
+## 0.9.0 — schemalagd start, steg 1 av tre
+
+Nu går det att säga *"börja klockan 02:15"* och gå och lägga sig.
+
+Det svåra här är inte att räkna ut när klockan är 02:15. Det svåra är att
+löftet ska hålla trots att allt däremellan kan ändra sig: tillägget startas om,
+Pi:n bootar, kabeln dras ur, Easee tystnar, klockan hoppar. **Ett schema som
+tyst uteblir är värre än inget schema alls** — gästen sover och tror att bilen
+laddar. Därför handlar det mesta nedan om vad som händer när något går fel.
+
+**Löftet ligger på disk.** Ett schema som bara finns i minnet är inget löfte.
+Det läses tillbaka vid uppstart.
+
+**Kabelns löpnummer är identiteten.** Schemat gäller den bil som stod inkopplad
+när löftet gavs. Dras kabeln ur, eller ur och i igen, är löftet ogiltigt — det
+kan vara en annan bil nu. Samma regel som startlänkarna redan följer.
+
+**Larmet kommer när något brister, inte klockan 02:15.** Loopen snurrar ändå,
+och vaktar kabeln, löpnumret, kontakten med Easee och att klockan är rimlig.
+Faller kabeln ur 23:40 kommer beskedet 23:40, medan du är vaken och kan göra
+något åt det.
+
+**Var Pi:n nere när klockan slog laddar vi ändå.** En tom bil på morgonen är ett
+värre fel än en dyr laddning. Sessionen märks som försenad, och blev det mer än
+en halvtimme sent får du veta det — annars ser du bara ett dyrt kvitto och
+undrar. Mer än sex timmar sent är däremot inte en försening längre utan en helt
+annan dag: då startar vi inte, men säger till.
+
+**Vi ger inte upp på första försöket.** Easee kan vara nere, bilen kan sova. En
+halvtimmes envishet kostar ingenting och räddar natten.
+
+**En absolut tidpunkt, aldrig ett klockslag.** "02:15" finns två gånger den natt
+klockan ställs tillbaka och inte alls den natt den ställs fram — och det är
+precis den timmen man schemalägger in i.
+
+**Stolpen är reserverad, inte ledig och inte upptagen.** Du som lade schemat ser
+din nedräkning och kan starta direkt eller avbryta. En förbipasserande ser att
+det är inbokat men kan inte ta över: en reservation som går att äta upp är ingen
+reservation. Är kabeln ur är schemat ändå ogiltigt, så ingen stolpe låses i
+onödan.
+
+**Två larmvägar.** SMS till den som lade schemat — den enda vägen som når någon
+som sover. Och en notis i Home Assistant till dig, som är gratis och kan pekas
+om till mobilappen under **SMS → Larm om schemalagd start**. Det finns en knapp
+för att skicka en testnotis; bättre att veta att vägen fungerar nu än 02:15.
+
+Notisen kräver den nya behörigheten `homeassistant_api` i config.yaml, som du
+godkänner när du uppdaterar. Samma behörighet behövs för HA-sensorerna i fas 6.
+
+**Och det går att prova utan att vänta sex timmar.** Tre nya knappar i
+simulatorn: *Schemat om 20 s*, *Schemat 3 tim försenat*, *Schemat missat helt*.
+Utan dem hade löftet inte gått att pröva på riktigt — och då hade det inte varit
+ett löfte utan en förhoppning.
+
+**Det som inte är byggt än:** kontrolladdningen, som ska bevisa hela kedjan
+medan du står där, och reglaget på priskurvan. Steg 2 och 3. Tills dess: en
+enkel tidsväljare, och schemaläggning kräver en telefon som redan är ihågkommen.
+
 ## 0.8.3
 
 **Din egen laddning kändes inte igen i hemskärmsappen.** Startade du via länken

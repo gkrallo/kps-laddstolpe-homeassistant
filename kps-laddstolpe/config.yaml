@@ -1,5 +1,5 @@
 name: KPs Laddstolpe
-version: "0.8.3"
+version: "0.9.0"
 slug: kps_laddstolpe
 description: Laddstolpe med spotprisdebitering, SMS-kvitto och Swish.
 url: https://github.com/gkrallo/kps-laddstolpe-homeassistant
@@ -31,6 +31,11 @@ watchdog: "tcp://[HOST]:[PORT:8443]"
 # Läsrätt till certifikaten som DuckDNS-tillägget skapar
 map:
   - ssl
+
+# Rätt att anropa Home Assistants tjänste-API genom Supervisor. Används för att
+# larma när en schemalagd start inte gick att genomföra — ett schema som tyst
+# uteblir är värre än inget schema.
+homeassistant_api: true
 
 options:
   ssl: true

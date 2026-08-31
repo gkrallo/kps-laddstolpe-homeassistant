@@ -2,9 +2,9 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.8.1.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
+**Version 0.9.0.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
 med SMS, laddning som lever tills kabeln dras ur, priskurva, kvitto med
-Swish-QR, fri laddning för familjen och appen på hemskärmen.
+Swish-QR, fri laddning för familjen, appen på hemskärmen och schemalagd start.
 
 ## Installation
 
@@ -71,6 +71,7 @@ omedelbart skicka kommandon, utan att du behöver avinstallera något.
 | Låset på stolpen | på | Laddbox | Stänger av stolpen när ingen laddar. |
 | Kabellås under laddning | av | Laddbox | Av som standard — boxar med permanent kabellås sköter det själva. |
 | Kräv verifiering | på | SMS | Stäng bara av vid felsökning. |
+| Notis i Home Assistant | `persistent_notification.create` | SMS | Vart larm om schemalagd start går. Se *Schemalagd start* nedan. |
 | Startförsök per timme och avsändare | 15 | SMS | Hela hushållet delar IP bakom hemmaroutern. |
 | Fria nummer | tom lista | SMS | Familjen. Se *Fri laddning* nedan. |
 | Kom ihåg telefoner | på | SMS | Se *Ihågkomna telefoner* nedan. |
@@ -155,6 +156,69 @@ Chrome och hemskärmsappen samma lager, så där räcker den första.
 Följden är att samma telefon kan stå två gånger i listan över ihågkomna
 telefoner, en gång per webbläsare. Det är avsiktligt: nycklarna går inte att
 flytta mellan lagren.
+
+## Schemalagd start
+
+Är telefonen ihågkommen står det **Starta senare…** under startknappen. Välj ett
+klockslag — förslaget är den billigaste kvarten framåt — och boka. Stolpen är
+sedan reserverad tills dess.
+
+Har klockslaget redan passerat i dag menas i morgon, så "02:15" fungerar när man
+står där klockan elva på kvällen.
+
+> Schemaläggning kräver att telefonen bekräftat sitt nummer minst en gång. Den
+> som laddar en enda gång möter exakt samma sida som förut.
+
+### Vad du ser under tiden
+
+| Vem | Vad |
+|---|---|
+| Du som bokade | *"Laddningen börjar 02:15"* med nedräkning, och knapparna *Starta nu i stället* och *Avbryt schemat*. |
+| En förbipasserande | *"Stolpen är reserverad"* och när den börjar. Inga knappar — en reservation som går att äta upp är ingen reservation. |
+
+### Vad som kan gå fel, och vad som händer då
+
+Det svåra är inte att räkna ut när klockan är 02:15. Det svåra är att löftet ska
+hålla trots att allt däremellan kan ändra sig. **Ett schema som tyst uteblir är
+värre än inget schema** — man sover och tror att bilen laddar.
+
+| Vad som händer | Vad appen gör |
+|---|---|
+| Tillägget startas om, Pi:n bootar | Schemat ligger på disk och läses tillbaka. |
+| Kabeln dras ur | Schemat är ogiltigt. **Larm direkt**, inte 02:15. |
+| Kabeln dras ur och i igen | Ogiltigt — det kan vara en annan bil nu. Larm. |
+| Pi:n var nere när klockan slog | Laddar ändå så fort den kommer upp. Blev det mer än en halvtimme sent får du veta det. |
+| Mer än sex timmar sent | Då är det inte en försening längre. Ingen laddning, men besked. |
+| Easee svarar inte | Nytt försök varje varv i en halvtimme innan vi ger upp. |
+| Bilen vägrar ta emot ström | Samma halvtimme, sedan larm. Vanligaste orsaken är **bilens egen laddtimer**. |
+| Klockan hoppar bakåt | Schemat rörs inte det varvet. En Pi utan nät vid boot kan ha vilken tid som helst. |
+| Någon annan vill ladda | Nekas så länge reservationen gäller. Du själv får starta direkt. |
+
+Alla larm går som **SMS till den som lade schemat**, och som **notis i Home
+Assistant** till dig.
+
+### Notisen i Home Assistant
+
+Adminfliken → **SMS → Larm om schemalagd start**. Skriv tjänsten som
+`domän.tjänst`:
+
+| Tjänst | Vad den gör |
+|---|---|
+| `persistent_notification.create` | Notisfältet i HA:s webbgränssnitt. Standard. |
+| `notify.mobile_app_...` | Push till mobilen via HA-appen. |
+| tomt | Ingen notis. SMS:et går ändå. |
+
+Knappen **Skicka en testnotis** provar vägen. Gör det innan du litar på den —
+bättre att veta nu än 02:15.
+
+Notisen kräver behörigheten `homeassistant_api`, som lades till i 0.9.0. Har du
+uppdaterat men raden **Behörighet** säger att den saknas: starta om tillägget.
+
+### Att prova det
+
+Simulatorn har tre knappar under **Laddbox** som gör ett schema provbart utan
+att man väntar sex timmar: *Schemat om 20 s*, *Schemat 3 tim försenat* och
+*Schemat missat helt*. Lägg ett schema från gästsidan och tryck på en av dem.
 
 ## Fri laddning
 
@@ -462,7 +526,7 @@ gästen.
 
 ## Så är koden upplagd
 
-Hela tillägget ligger i **en enda fil**, `app.js`, indelad i nitton numrerade
+Hela tillägget ligger i **en enda fil**, `app.js`, indelad i tjugoen numrerade
 avsnitt med tydliga rubriker. Inga npm-beroenden — bara Nodes inbyggda moduler,
 ingen React, inget byggsteg. Tillägget byggs på sekunder på en Raspberry Pi i
 stället för minuter.
