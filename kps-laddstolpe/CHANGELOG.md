@@ -1,5 +1,37 @@
 # Ändringslogg
 
+## 0.9.3
+
+Midnatt är ingen vägg.
+
+**"02:15" var tvetydigt.** Läst kvart över tio på kvällen kunde det betyda om
+fyra timmar eller om tjugoåtta. Appen räknade rätt hela tiden — en tid som
+redan passerat i dag har alltid betytt i morgon — men den sa det inte, och då
+vågar man inte lita på den. Nu står dygnet utskrivet: **i natt 02:15**, **i
+morgon 07:00**. I väljaren medan du vrider på klockan, i rubriken när du väntar,
+och i kurvans etikett.
+
+**Kurvan tystnade vid midnatt utan att säga varför.** Elbörsen släpper
+morgondagens priser vid 13-tiden. Före det vet vi ingenting om natten, och då
+tog kurvan bara slut — vilket ser ut som att priset upphör att finnas. Nu står
+det där: *"Kurvan slutar vid midnatt: elbörsen har inte släppt morgondagens
+priser än."*
+
+**Och förslaget kunde ge ett dåligt råd som såg ut som ett gott.** Föll priset
+hela vägen mot midnatt blev "billigast framåt" den sista kvarten vi kände till —
+23:45 — inte för att priset var lägst då utan för att kunskapen tog slut där.
+Ligger den billigaste kvarten sist i det vi vet står det nu utskrivet:
+*"det är den sista kvarten vi känner till — priset kan fortsätta nedåt efter
+det."*
+
+**Priserna hämtas om när det behövs.** Saknas morgondagen görs ett nytt försök
+när någon fäller ut kurvan, och den som står vid stolpen 12:55 och tittar igen
+13:05 ska inte mötas av samma avhuggna kurva. Med spärrar så att det inte kan
+bli en snurra.
+
+*Provet kör hela midnattsfallet i två lägen — med och utan morgondagens priser
+— och i svensk tid, så att ett tidszonsfel inte kan passera obemärkt.*
+
 ## 0.9.2
 
 **Notisfältet gick inte att lägga en rad i.** I 0.9.0 var det ett vanligt

@@ -3374,13 +3374,47 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
     if (d.open) laddaKurva();
   }
 
-  function laddaKurva() {
-    if (curveData) return ritaKurva();
+  var curveHamtad = 0;
+  var curveHamtar = false;
+
+  /**
+   * Priserna hamtas en gang — men inte for evigt.
+   *
+   * Tva skal att hamta om: kvartarna rullar vidare sa kurvan blir gammal, och
+   * saknades morgondagen forra gangen kan den ha slappts sedan dess. Den som
+   * star vid stolpen 12:55 och oppnar panelen igen 13:05 ska inte se samma
+   * avhuggna kurva.
+   *
+   * Bada skalen har en minsta tid emellan sig, och bara ett anrop far vara i
+   * luften. Utan det: ritningen kallar hit, hamtningen ritar om, ritningen
+   * kallar hit igen — en snurra som hamrar servern sa lange morgondagens
+   * priser saknas, alltsa precis nar man minst vill det.
+   */
+  function laddaKurva(tvinga) {
+    var alder = Date.now() - curveHamtad;
+    var gammal = alder > 10 * 60 * 1000;
+    var vantarPaImorgon = curveData && curveData.haveTomorrow === false && alder > 60 * 1000;
+    if (curveData && !tvinga && !gammal && !vantarPaImorgon) return ritaKurva();
+    if (curveHamtar) return;
+
+    curveHamtar = true;
     var dk = devGet();
     fetch('api/prices' + (dk ? '?d=' + encodeURIComponent(dk) : ''), { cache: 'no-store' })
       .then(function (r) { return r.json(); })
-      .then(function (data) { curveData = data; ritaKurva(); },
-            function () { kurvText('Priserna gick inte att hämta just nu.'); });
+      .then(function (data) {
+        curveHamtar = false;
+        var forsta = !curveData;
+        curveData = data;
+        curveHamtad = Date.now();
+        ritaKurva();
+        /* Bokningspanelen ritades innan priserna kom, sa den visste varken
+           vad som var billigast eller att morgondagen saknades. Rita om den
+           nu — men bara en gang, nar uppgifterna ar nya. */
+        if (forsta && senareOppen) { lastKey = ''; safeRender(); }
+      }, function () {
+        curveHamtar = false;
+        if (!curveData) kurvText('Priserna gick inte att hämta just nu.');
+      });
   }
 
   function kurvText(t) {
@@ -3490,8 +3524,16 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
       + '<span><i style="background:' + SERIE_SPOT + '"></i>Elbörsen</span>'
       + '</div>'
       + '<div class="curve">' + svg + '</div>'
-      + '<div class="readout" id="readout">Billigast ' + tvasiffrig(d1.getHours()) + ':' + tvasiffrig(d1.getMinutes())
+      + '<div class="readout" id="readout">Billigast ' + narText(pts[billigast].t)
       + ' — <b>' + kr(pts[billigast].total) + ' kr/kWh</b></div>'
+      /* Varfor kurvan tar slut dar den tar slut.
+         Forut tystnade den bara vid midnatt, och da ser det ut som att priset
+         upphor att finnas. Det ar skillnad pa "sa har ser dygnet ut" och "sa
+         langt vet vi" — och den skillnaden avgor om 23:45 ar ett gott rad. */
+      + (curveData && curveData.haveTomorrow === false
+        ? '<p class="curvenote" style="color:#D8B978">Kurvan slutar vid midnatt: elbörsen har '
+          + 'inte släppt morgondagens priser än. De brukar komma vid 13-tiden.</p>'
+        : '')
       + '<p class="curvenote">Dra fingret över kurvan för att se priset en viss tid. '
       + 'Priset gäller kvarten ut och byter tvärt vid kvartsskiftet — därför trappstegen.</p>';
 
@@ -3550,6 +3592,25 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
     return tva(d.getHours()) + ':' + tva(d.getMinutes());
   }
 
+  /**
+   * Klockslag med dygn, nar dygnet inte ar sjalvklart.
+   *
+   * "Laddningen borjar 02:15" ar tvetydigt nar man laser det kvart over tio pa
+   * kvallen — menas om fyra timmar eller om tjugoatta? Darfor sags dygnet ut
+   * sa fort det inte ar i dag.
+   */
+  function narText(iso) {
+    if (!iso) return '';
+    var d = new Date(iso), nu = new Date();
+    var kl = klockslag(iso);
+    var dygn = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+      - new Date(nu.getFullYear(), nu.getMonth(), nu.getDate());
+    var dagar = Math.round(dygn / 86400000);
+    if (dagar <= 0) return kl;
+    if (dagar === 1) return (d.getHours() < 6 ? 'i natt ' : 'i morgon ') + kl;
+    return 'om ' + dagar + ' dagar ' + kl;
+  }
+
   /** "3 tim 12 min" eller "4 min". Tom strang nar tiden gatt. */
   function nedrakning(iso) {
     if (!iso) return '';
@@ -3569,12 +3630,19 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
    */
   function billigastFramat() {
     if (!curveData || !curveData.points || !curveData.points.length) return null;
-    var nu = Date.now(), bast = null;
+    var nu = Date.now(), bast = null, sist = null;
     for (var i = 0; i < curveData.points.length; i++) {
       var p = curveData.points[i];
       if (Date.parse(p.t) <= nu) continue;
+      sist = p;
       if (!bast || p.total < bast.total) bast = p;
     }
+    if (!bast) return null;
+    /* Ligger billigaste kvarten SIST i det vi vet, ar det troligen inte
+       botten — det ar kanten pa var kunskap. Sa gick det for Kristian: kurvan
+       tog slut vid midnatt, priset foll hela vagen dit, och forslaget blev
+       23:45. Ett dagligt rad som ser ut som ett gott. */
+    bast.vidKanten = Boolean(sist && bast.t === sist.t);
     return bast;
   }
 
@@ -3595,13 +3663,28 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
     }
     var f = forslagTid();
     var b = billigastFramat();
+    var saknasImorgon = curveData && curveData.haveTomorrow === false;
     return '<div class="card" style="margin-top:12px;padding:14px">'
       + '<div class="field" style="margin:0"><label for="nartid">Börja klockan</label>'
       + '<input id="nartid" type="time" step="900" value="' + tva(f.getHours()) + ':' + tva(f.getMinutes()) + '"></div>'
+      /* Vilket dygn klockslaget hamnar pa, skrivet ut och uppdaterat medan man
+         valjer. Utan det ar "02:15" tvetydigt kvart over tio pa kvallen, och
+         man vagar inte lita pa att appen tanker ratt. */
+      + '<p class="sub" id="nardag" style="margin:8px 0 0">Startar <b>' + narText(f.toISOString()) + '</b></p>'
       + (b
-        ? '<p class="sub" style="margin:10px 0 0">Billigast framåt är ' + klockslag(b.t)
-          + ' för ' + kr(b.total) + ' kr/kWh.</p>'
-        : '<p class="sub" style="margin:10px 0 0">Öppna prispanelen nedan så föreslår vi den billigaste tiden.</p>')
+        ? '<p class="sub" style="margin:8px 0 0">Billigast framåt är ' + narText(b.t)
+          + ' för ' + kr(b.total) + ' kr/kWh.'
+          + (b.vidKanten
+            ? '<br><span style="color:#D8B978">Men det är den sista kvarten vi känner till — '
+              + 'priset kan fortsätta nedåt efter det.</span>'
+            : '')
+          + '</p>'
+        : '<p class="sub" style="margin:8px 0 0">Öppna prispanelen nedan så föreslår vi den billigaste tiden.</p>')
+      + (saknasImorgon
+        ? '<p class="sub" style="margin:8px 0 0;color:#D8B978">Morgondagens priser är inte '
+          + 'släppta än — de kommer vid 13-tiden. Du kan boka ändå; tider efter midnatt '
+          + 'gäller i morgon.</p>'
+        : '')
       + '<p class="sub" style="margin:8px 0 0">Kabeln måste sitta kvar. Har bilen en egen '
       + 'laddtimer behöver den vara avstängd.</p>'
       + '<button class="btn" id="bokaBtn" style="margin-top:12px"' + (busyAction ? ' disabled' : '') + '>'
@@ -3622,24 +3705,38 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
     if (st) st.addEventListener('click', function () { senareOppen = false; lastKey = ''; safeRender(); });
     var bo = document.getElementById('bokaBtn');
     if (bo) bo.addEventListener('click', doSchedule);
+
+    // Dygnet uppdateras medan man vrider pa klockan, sa man ser direkt att
+    // 02:15 betyder i natt och inte om ett dygn.
+    var ti = document.getElementById('nartid');
+    if (ti) ti.addEventListener('input', function () {
+      var d = valdTid();
+      var ut = document.getElementById('nardag');
+      if (d && ut) ut.innerHTML = 'Startar <b>' + narText(d.toISOString()) + '</b>';
+    });
   }
 
   /**
-   * Klockslaget blir en absolut tidpunkt har, i telefonens egen tidszon.
+   * Klockslaget i faltet som en absolut tidpunkt, i telefonens tidszon.
    *
-   * Har klockslaget redan passerat i dag menas i morgon — annars hade "boka
-   * 02:15" klockan 23 varit omojligt att uttrycka.
+   * Har klockslaget redan passerat i dag menas i morgon. Annars gick "boka
+   * 02:15" inte att uttrycka klockan elva pa kvallen — vilket ar precis nar
+   * man vill gora det.
    */
-  function doSchedule() {
+  function valdTid() {
     var inp = document.getElementById('nartid');
-    var v = inp ? inp.value : '';
-    var m = /^(\\d{1,2}):(\\d{2})$/.exec(v || '');
-    if (!m) { setNotice('err', 'Välj en tid först.'); return; }
-
+    var m = /^(\\d{1,2}):(\\d{2})$/.exec((inp && inp.value) || '');
+    if (!m) return null;
     var d = new Date();
     d.setSeconds(0, 0);
     d.setHours(Number(m[1]), Number(m[2]));
     if (d.getTime() - Date.now() < 60000) d.setDate(d.getDate() + 1);
+    return d;
+  }
+
+  function doSchedule() {
+    var d = valdTid();
+    if (!d) { setNotice('err', 'Välj en tid först.'); return; }
 
     busyAction = 'boka'; setNotice(null, null); lastKey = ''; safeRender();
     fetch('api/schedule', {
@@ -3943,10 +4040,10 @@ button.btn + button.btn,a.btn + button.btn,button.btn + a.btn,a.btn + a.btn{marg
       var sc = s.schedule || {};
       var mitt = !!s.mittSchema;
       el.icon.style.display = 'none';
-      el.title.textContent = mitt ? 'Laddningen börjar ' + klockslag(sc.plannedAt) : 'Stolpen är reserverad';
+      el.title.textContent = mitt ? 'Laddningen börjar ' + narText(sc.plannedAt) : 'Stolpen är reserverad';
       el.lead.textContent = mitt
         ? 'Du kan låsa mobilen och gå. Vi håller reda på tiden.'
-        : 'En laddning är inbokad här och börjar ' + klockslag(sc.plannedAt) + '.';
+        : 'En laddning är inbokad här och börjar ' + narText(sc.plannedAt) + '.';
 
       el.slot.innerHTML = noticeBlock() + staleBlock(s) +
         '<div class="runline">' + ICONS.bolt + 'Börjar om <span id="vNed">' + nedrakning(sc.plannedAt) + '</span></div>' +
@@ -6651,7 +6748,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.9.2';
+const VERSION = '0.9.3';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -7068,7 +7165,7 @@ guest.post('/api/clienterror', async (req, res, ctx) => {
  * fyrtioåtta kvartspriser i det vore att skicka samma tabell om och om igen för
  * något gästen tittar på en gång. Den här hämtas när panelen fälls ut.
  */
-guest.get('/api/prices', (req, res, ctx) => {
+guest.get('/api/prices', async (req, res, ctx) => {
   // Samma regel som på startsidan: den som laddar fritt ser priset utan
   // avgiften för stolpen. Kurvans FORM blir densamma — avgiften är ett fast
   // påslag per kWh — så rådet om när man bör ladda är oförändrat.
@@ -7076,15 +7173,31 @@ guest.get('/api/prices', (req, res, ctx) => {
   const enhet = devices.resolve(ctx.query.get('d'));
   const fri = active ? Boolean(active.free) : Boolean(enhet && enhet.free);
 
+  /* Saknas morgondagen? Försök hämta den nu.
+     Bakgrundsloopen försöker var femtonde minut ändå, men just när någon fäller
+     ut kurvan sent på kvällen är det precis morgondagens priser frågan gäller —
+     och då är det värt ett extra försök i stället för en kurva som tar slut vid
+     midnatt. prices.refresh har eget skydd mot att hamra. */
+  if (!prices.status().haveTomorrow) {
+    await prices.refresh().catch(() => {});
+  }
+
   const punkter = prices.forecast(12).map((p) => ({
     t: p.t,
     spot: round2(p.spotSek),
     total: round2(fri ? p.totalSek - p.serviceSek : p.totalSek),
   }));
+  const st = prices.status();
   return sendJson(res, 200, {
     points: punkter,
     now: prices.currentPrice(),
     free: fri,
+    /* Vet vi något om i morgon?
+       Utan det här kunde kurvan tystna vid midnatt utan att säga varför, och
+       "billigaste kvarten" bli 23:45 bara för att där tog kunskapen slut —
+       inte för att priset var lägst då. Det är ett dåligt råd som ser ut som
+       ett gott. */
+    haveTomorrow: st.haveTomorrow,
     zone: config.ha().price_zone || 'SE3',
     serverTime: new Date().toISOString(),
   });

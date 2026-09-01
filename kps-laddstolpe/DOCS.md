@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.9.2.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
+**Version 0.9.3.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
 med SMS, laddning som lever tills kabeln dras ur, priskurva, kvitto med
 Swish-QR, fri laddning för familjen, appen på hemskärmen och schemalagd start.
 
@@ -163,8 +163,10 @@ flytta mellan lagren.
 klockslag — förslaget är den billigaste kvarten framåt — och boka. Stolpen är
 sedan reserverad tills dess.
 
-Har klockslaget redan passerat i dag menas i morgon, så "02:15" fungerar när man
-står där klockan elva på kvällen.
+**Över midnatt fungerar.** Har klockslaget redan passerat i dag menas i morgon,
+så "02:15" går att boka när man står där klockan elva på kvällen. Vilket dygn
+det blir står utskrivet medan du väljer — *i natt 02:15*, *i morgon 07:00* — så
+du inte behöver lita på att appen tänker rätt.
 
 > Schemaläggning kräver att telefonen bekräftat sitt nummer minst en gång. Den
 > som laddar en enda gång möter exakt samma sida som förut.
@@ -306,6 +308,17 @@ kvarten. Billigaste kvarten är utmärkt med en punkt och står i klartext under
 diagrammet.
 
 Priserna hämtas först när panelen fälls ut.
+
+**Kurvan sträcker sig tolv timmar framåt, över midnatt.** Men elbörsen släpper
+morgondagens priser först vid 13-tiden. Före det slutar kurvan vid midnatt, och
+då står det utskrivet varför — annars ser det ut som att priset upphör att
+finnas. Ett nytt hämtningsförsök görs varje gång någon fäller ut panelen så
+länge morgondagen saknas.
+
+Samma sak påverkar förslaget till starttid: **ligger den billigaste kvarten sist
+i det vi känner till är det förmodligen inte botten, utan kanten av vår
+kunskap.** Då säger appen det, i stället för att låta ett dåligt råd se ut som
+ett gott.
 
 ## Betalningen
 
