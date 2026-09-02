@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.9.3.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
+**Version 0.9.4.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
 med SMS, laddning som lever tills kabeln dras ur, priskurva, kvitto med
 Swish-QR, fri laddning för familjen, appen på hemskärmen och schemalagd start.
 
@@ -449,12 +449,43 @@ snabbt bilen laddar:
 Skillnaden mellan *får dra* och *tilldelat just nu* är lastbalanseringen i en
 enda siffra.
 
+## Så läses laddboxen
+
+Sedan 0.9.4 läser appen **mätvärden**, inte den gamla statusadressen:
+
+```
+GET https://api.easee.com/state/{serienummer}/observations?ids=109,120,121,…
+```
+
+Easee tog bort `/chargers/{id}/state` den 1 september 2026. Alla 22 värden
+hämtas i **ett** anrop — den nya adressen har ett tak på 100 anrop per fem
+minuter, och ett anrop per värde hade ätit upp det direkt.
+
+Värden prövas första gången och kommer ihåg: dokumentationen pekar på
+`api.easee.com` medan inloggningen går mot `api.easee.cloud`, så appen provar i
+tur och ordning och skriver i loggen vilken som svarade.
+
+**Saknas driftläget i svaret blir det ett avläst fel, inte en tyst nolla.** En
+nolla hade sett ut som att boxen tappat molnet, och en pågående session hade
+legat kvar och räknat på gamla siffror. Rådatan loggas en gång så att felet går
+att rätta.
+
+Mätvärdena bär tidsstämplar. Är de äldre än en kvart står det i loggen — en box
+som tappat kontakten kan lämna ut gamla siffror som ser färska ut.
+
 ## Om du vill se rådata
 
-Adminfliken → **Diagnostik → Rå API-inspektör**. Knapparna visar Easees
-obearbetade svar för laddarstatus, detaljer, konfiguration, Equalizer och listan
-över dina laddboxar. Det är det snabbaste sättet att förstå varför boxen beter
-sig som den gör.
+Adminfliken → **Diagnostik → Rå API-inspektör**.
+
+| Knapp | Vad den visar |
+|---|---|
+| **Mätvärden** | Det appen faktiskt läser. Börja här. |
+| Detaljer / Konfiguration | Boxens fasta uppgifter och inställningar. |
+| Mina laddboxar | Allt kontot ser. Kommer din box tillbaka här är token, konto och id friska. |
+| Gamla statusadressen | Svarar 404 sedan 1 september 2026. Finns kvar för att man ska kunna se skillnaden mellan *borta* och *svarar konstigt*. |
+| Equalizer | Svarar 403. Dess värden kommer numera från laddboxens egna mätvärden. |
+
+Det är det snabbaste sättet att förstå varför boxen beter sig som den gör.
 
 ## Att prova utan att det kostar något
 
@@ -530,6 +561,15 @@ skarpt läge: titta i loggen och i Easee-rutan under **Laddbox**.
 **"Väntar N sekunder efter tidigare fel mot Easee."** Appen backar av med flit
 efter ett misslyckat anrop. Rätta orsaken, starta om tillägget, så nollställs
 väntetiden.
+
+**"Easee svarade 404 på …"** En adress hos Easee finns inte längre. Så gick det
+1 september 2026, när de tog bort den gamla statusadressen. Tryck **Mina
+laddboxar** i inspektören: kommer din box tillbaka där är kontot, token och
+id:t friska, och det är adressen som ändrats — inte du.
+
+**"Easees mätvärden kom i ett oväntat format."** Easee har ändrat formen på
+svaret. Loggen innehåller rådatan en gång, och **Mätvärden** i inspektören visar
+den orörd. Med den går det att rätta.
 
 **Sessionen avslutas direkt när jag startar.** Kontrollera under **Diagnostik**
 att `cableConnected` är `true`.

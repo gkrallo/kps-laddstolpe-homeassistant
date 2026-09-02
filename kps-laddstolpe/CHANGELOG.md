@@ -1,5 +1,59 @@
 # Ändringslogg
 
+## 0.9.4 — Easee tog bort adressen appen läste ifrån
+
+Den 2 september slutade stolpen svara. Loggen sa *"Easee svarade 404 på
+/chargers/EMHDRU5N/state"*, om och om igen — medan inloggningen fungerade och
+medan både Easee-appen och HA-integrationen mådde bra.
+
+**Easee hade tagit bort adressen dagen innan.** Deras dokumentation sa det rakt
+ut: *"marked for deprecation and will be removed on September 1 2026. Use the
+Get Observations endpoint."*
+
+Att de andra apparna fungerade är inget motargument — de läser via Easees
+strömmande gränssnitt och rörde aldrig den här adressen. Det var bara vi som
+gjorde det.
+
+**Appen läser nu mätvärden i stället.** En annan värd, en annan sökvägsrot, och
+numrerade värden i stället för ett färdigt objekt:
+
+```
+GET https://api.easee.com/state/{serienummer}/observations?ids=109,120,121,…
+```
+
+Alla 22 värden hämtas i **ett** anrop. Den nya adressen har ett tak på 100
+anrop per fem minuter — också det från 1 september — och ett anrop per värde
+hade ätit upp det på en kvart.
+
+**Värden prövas första gången och kommer ihåg.** Dokumentationen pekar på
+`api.easee.com`, men inloggningen går mot `api.easee.cloud` och fungerar. I
+stället för att gissa provar appen, kommer ihåg vilken som svarade, och skriver
+det i loggen.
+
+**Saknas driftläget blir det ett fel, inte en tyst nolla.** Har vi missförstått
+svarets form ska det märkas: en nolla hade sett ut som att boxen tappat molnet,
+en pågående session hade legat kvar och räknat på gamla siffror, och ingen hade
+förstått varför. Nu loggas rådatan en gång så den går att skicka vidare.
+
+**Och mätvärdena bär tidsstämplar**, så nu syns det om de är gamla. En box som
+tappat kontakten kan lämna ut timmesgamla siffror som ser färska ut. Är de äldre
+än en kvart står det i loggen.
+
+**Equalizerns egen adress svarar 403** och används inte längre. Dess värden —
+vad lastbalanseraren släpper fram per fas — kommer från laddboxens egna
+mätvärden, vilket är var de alltid egentligen kom ifrån.
+
+**Rå API-inspektören har en ny knapp: Mätvärden.** Den gamla statusadressen
+finns kvar som knapp med flit, så att man kan se skillnaden mellan *borta* och
+*svarar konstigt* nästa gång något ändras.
+
+*Easee publicerar inte hur svaret ser ut. Tolkningen är därför skriven tåligt —
+listan får ligga direkt i svaret eller under en nyckel, numret får heta `id`
+eller `observationId`, och värdena får komma som text med komma i. Ett nytt prov
+kör den riktiga koden ur app.js mot varje sådan form. Det bevisar inte att Easee
+svarar så; det bevisar att vi klarar oss oavsett vilken de valt — och att vi
+säger ifrån ordentligt om det är någon helt annan.*
+
 ## 0.9.3
 
 Midnatt är ingen vägg.

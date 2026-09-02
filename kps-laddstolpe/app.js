@@ -1137,6 +1137,95 @@ class SimulatedCharger {
 /* ------------------------------------------------------------------ */
 
 const EASEE = 'https://api.easee.cloud/api';
+
+/**
+ * Observationerna — laddboxens levande värden.
+ *
+ * Easee tog bort `/chargers/{id}/state` den 1 september 2026. Deras egen
+ * dokumentation sa det rakt ut: *"marked for deprecation and will be removed on
+ * September 1 2026. Use the Get Observations endpoint."* Dagen efter svarade den
+ * 404 hos oss, medan inloggningen fortsatte fungera — och medan Easee-appen och
+ * HA-integrationen mådde bra, för de läser via Easees strömmande gränssnitt och
+ * rörde aldrig den här adressen.
+ *
+ * Ersättaren ligger på en ANNAN VÄRD och en ANNAN SÖKVÄGSROT:
+ *
+ *     GET https://api.easee.com/state/{serienummer}/observations?ids=109,120,…
+ *
+ * Och den ger inte ett färdigt objekt utan en lista numrerade mätvärden. Alla
+ * hämtas i ETT anrop — adressen har ett tak på 100 anrop per fem minuter, också
+ * det från 1 september, och ett anrop per värde hade ätit upp det direkt.
+ */
+const EASEE_OBS_HOSTS = ['https://api.easee.com', 'https://api.easee.cloud'];
+
+/** Numret på varje mätvärde vi behöver. Namnen är Easees egna. */
+const OBS = {
+  lockCablePermanently: 30,
+  dynamicChargerCurrent: 48,
+  circuitPhaseL1: 73,
+  circuitPhaseL2: 74,
+  circuitPhaseL3: 75,
+  softwareRelease: 80,
+  reasonForNoCurrent: 96,
+  cableLocked: 103,
+  chargerOpMode: 109,
+  outputCurrent: 114,
+  deratingActive: 116,
+  errorCode: 119,
+  totalPower: 120,
+  sessionEnergy: 121,
+  lifetimeEnergy: 124,
+  wifiRssi: 132,
+  inCurrentT2: 182,
+  voltage: 190,
+  eqAvailableP1: 230,
+  eqAvailableP2: 231,
+  eqAvailableP3: 232,
+  connectedToCloud: 250,
+};
+
+const OBS_IDS = Object.values(OBS).sort((a, b) => a - b).join(',');
+
+/**
+ * Gör listan med mätvärden till ett uppslag: nummer -> värde.
+ *
+ * Formen på svaret står inte i Easees dokumentation, så den här funktionen är
+ * med flit tålig: listan kan ligga direkt i svaret eller under en nyckel,
+ * numret kan heta `id` eller `observationId`, och värdet kommer ofta som text
+ * även när det är ett tal. Hellre det än ett anrop som faller på en versal.
+ */
+function parseObservations(body) {
+  const rader = Array.isArray(body) ? body
+    : (body && Array.isArray(body.observations) ? body.observations
+      : (body && Array.isArray(body.data) ? body.data : null));
+  if (!rader) return null;
+
+  const ut = {};
+  let senast = null;
+  for (const r of rader) {
+    if (!r || typeof r !== 'object') continue;
+    const id = Number(r.id !== undefined ? r.id : (r.observationId !== undefined ? r.observationId : r.Id));
+    if (!Number.isFinite(id)) continue;
+    ut[id] = r.value !== undefined ? r.value : r.Value;
+    const t = Date.parse(r.timestamp || r.Timestamp || '');
+    if (Number.isFinite(t) && (senast === null || t > senast)) senast = t;
+  }
+  return { varden: ut, senast };
+}
+
+/** Ett mätvärde som tal. Text, komma och tomma svar tas om hand. */
+function obsNum(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(String(v).replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Ett mätvärde som ja/nej. Easee skickar än 1, än "true", än true. */
+function obsBool(v) {
+  if (v === true || v === 1) return true;
+  const s = String(v).toLowerCase();
+  return s === 'true' || s === '1';
+}
 const TOKEN_FILE = 'easee-token.json';
 
 // Tidsgränsen var 15 sekunder. Din box har behövt 17 bara på att återuppta en
@@ -1352,11 +1441,11 @@ class EaseeCharger {
   }
 
   /** Autentiserat anrop med ett omförsök om token hunnit dö. */
-  async _api(path, { method = 'GET', body = null, retry = true } = {}) {
+  async _api(path, { method = 'GET', body = null, retry = true, base = EASEE } = {}) {
     const auth = await this._ensureToken();
     if (!auth.ok) return { ok: false, error: auth.error, waiting: auth.waiting, retryInSeconds: auth.retryInSeconds };
 
-    const res = await this._fetch(`${EASEE}${path}`, {
+    const res = await this._fetch(`${base}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${this.token}`,
@@ -1371,7 +1460,7 @@ class EaseeCharger {
     if (res.status === 401 && retry) {
       log.info('[Easee] Token underkänd. Förnyar och försöker igen.');
       this.expiresAt = 0;
-      return this._api(path, { method, body, retry: false });
+      return this._api(path, { method, body, retry: false, base });
     }
     if (res.status === 429) {
       this._backoff('Easee svarade 429, för många anrop', { hard: true });
@@ -1386,7 +1475,39 @@ class EaseeCharger {
     }
 
     this.lastError = `Easee svarade ${res.status} på ${path}`;
-    return { ok: false, error: this.lastError };
+    return { ok: false, error: this.lastError, status: res.status };
+  }
+
+  /**
+   * Hämtar alla mätvärden i ett anrop.
+   *
+   * Värden prövas i tur och ordning första gången. Dokumentationen pekar på
+   * api.easee.com, men inloggningen går mot api.easee.cloud och fungerar — så
+   * i stället för att gissa vilken som gäller provar vi, kommer ihåg vilken som
+   * svarade, och skriver det i loggen. Det kostar ett extra anrop en gång.
+   */
+  async _observations(serial) {
+    const varden = this._obsHost ? [this._obsHost] : EASEE_OBS_HOSTS;
+    let sista = null;
+
+    for (const host of varden) {
+      const res = await this._api(
+        `/state/${encodeURIComponent(serial)}/observations?ids=${OBS_IDS}`,
+        { base: host },
+      );
+      if (res.ok) {
+        if (this._obsHost !== host) {
+          this._obsHost = host;
+          log.info(`[Easee] Mätvärden hämtas från ${host}.`);
+        }
+        return res;
+      }
+      sista = res;
+      // 429 och serverfel är inte "fel värd" — då är det ingen idé att prova
+      // nästa, och backoffen i _api har redan gjort sitt.
+      if (res.waiting || res.status === undefined || res.status >= 500) break;
+    }
+    return sista || { ok: false, error: 'Inget svar från Easee.' };
   }
 
   /* ---------------- gränssnittet ---------------- */
@@ -1396,7 +1517,7 @@ class EaseeCharger {
       return { ok: false, error: 'Laddbox-id saknas i tilläggets konfiguration.' };
     }
     const t0 = Date.now();
-    const res = await this._api(`/chargers/${encodeURIComponent(this.chargerId)}/state`);
+    const res = await this._observations(this.chargerId);
     if (!res.ok) {
       if (!res.waiting) this.lastReadMs = Date.now() - t0;
       return { ok: false, error: res.error, waiting: res.waiting, retryInSeconds: res.retryInSeconds };
@@ -1406,45 +1527,84 @@ class EaseeCharger {
       log.debug(`[Easee] Avläsningen tog ${(this.lastReadMs / 1000).toFixed(1)} sekunder.`);
     }
 
-    const d = res.data || {};
+    const tolkat = parseObservations(res.data);
+    const v = tolkat ? tolkat.varden : {};
+
+    /* Driftläget är hjärtat i allt appen gör. Saknas det har vi inte förstått
+       svaret, och då ska det bli ett AVLÄST FEL — inte en tyst nolla.
+       En nolla hade sett ut som "boxen tappat molnet", sessionen hade legat
+       kvar och räknat på ett gammalt värde, och ingen hade förstått varför.
+       Rådatan loggas en gång så den går att skicka vidare och rätta. */
+    if (v[OBS.chargerOpMode] === undefined) {
+      if (!this._obsFormWarned) {
+        this._obsFormWarned = true;
+        const rat = JSON.stringify(res.data || null);
+        log.error('[Easee] Mätvärdena kom i ett format appen inte känner igen. '
+          + `Driftläge (${OBS.chargerOpMode}) saknas i svaret. Rådata: `
+          + (rat.length > 1200 ? `${rat.slice(0, 1200)}… (avkortat)` : rat));
+      }
+      this.lastError = 'Easees mätvärden kom i ett oväntat format.';
+      return { ok: false, error: this.lastError };
+    }
+    this._obsFormWarned = false;
+
+    /* Hur gammalt är det vi läste? Mätvärdena bär egna tidsstämplar, och en
+       box som tappat kontakten kan lämna ut timmesgamla siffror som ser
+       färska ut. Vi avbryter inte på det — men det ska synas. */
+    const alderS = tolkat.senast ? Math.round((Date.now() - tolkat.senast) / 1000) : null;
+    if (alderS !== null && alderS > 900 && !this._staleWarned) {
+      this._staleWarned = true;
+      log.warn(`[Easee] Mätvärdena är ${Math.round(alderS / 60)} minuter gamla. `
+        + 'Boxen kan ha tappat kontakten med molnet.');
+    } else if (alderS !== null && alderS <= 900) {
+      this._staleWarned = false;
+    }
+
+    // cableFromState vill ha ett objekt av samma slag som den gamla
+    // statusadressen gav. Kabelns läge har aldrig kommit som eget värde —
+    // det har alltid härletts ur driftläget.
+    const d = { chargerOpMode: obsNum(v[OBS.chargerOpMode]) };
     const cable = cableFromState(d, this._lastCable);
     this._lastCable = cable;
 
     return {
       ok: true,
       cableConnected: cable,
-      opMode: Number(d.chargerOpMode) || 0,
-      powerKw: Number(d.totalPower) || 0,
-      sessionEnergyKwh: Number(d.sessionEnergy) || 0,
-      lifetimeEnergyKwh: Number(d.lifetimeEnergy) || 0,
-      locked: Boolean(d.cableLocked),
-      lockedPermanently: Boolean(d.lockCablePermanently),
+      opMode: obsNum(v[OBS.chargerOpMode]) || 0,
+      powerKw: obsNum(v[OBS.totalPower]) || 0,
+      sessionEnergyKwh: obsNum(v[OBS.sessionEnergy]) || 0,
+      lifetimeEnergyKwh: obsNum(v[OBS.lifetimeEnergy]) || 0,
+      locked: obsBool(v[OBS.cableLocked]),
+      lockedPermanently: obsBool(v[OBS.lockCablePermanently]),
 
       // Vad boxen FAR dra kontra vad den faktiskt tilldelats just nu.
       // Skillnaden mellan de tva ar lastbalanseringen i en enda siffra.
-      maxCurrent: Number(d.dynamicChargerCurrent) || 0,
-      allocatedCurrent: Number(d.outputCurrent) || 0,
+      maxCurrent: obsNum(v[OBS.dynamicChargerCurrent]) || 0,
+      allocatedCurrent: obsNum(v[OBS.outputCurrent]) || 0,
 
       phaseCurrents: {
-        l1: numOrNull(d.circuitTotalPhaseConductorCurrentL1),
-        l2: numOrNull(d.circuitTotalPhaseConductorCurrentL2),
-        l3: numOrNull(d.circuitTotalPhaseConductorCurrentL3),
-        n: numOrNull(d.inCurrentT2),
+        l1: obsNum(v[OBS.circuitPhaseL1]),
+        l2: obsNum(v[OBS.circuitPhaseL2]),
+        l3: obsNum(v[OBS.circuitPhaseL3]),
+        n: obsNum(v[OBS.inCurrentT2]),
       },
       eqAvailable: {
-        l1: numOrNull(d.eqAvailableCurrentP1),
-        l2: numOrNull(d.eqAvailableCurrentP2),
-        l3: numOrNull(d.eqAvailableCurrentP3),
+        l1: obsNum(v[OBS.eqAvailableP1]),
+        l2: obsNum(v[OBS.eqAvailableP2]),
+        l3: obsNum(v[OBS.eqAvailableP3]),
       },
-      voltage: numOrNull(d.voltage),
-      deratingActive: Boolean(d.deratingActive),
-      reasonForNoCurrent: numOrNull(d.reasonForNoCurrent),
-      errorCode: numOrNull(d.errorCode),
-      online: d.isOnline !== undefined ? Boolean(d.isOnline) : null,
-      cloud: d.connectedToCloud !== undefined ? Boolean(d.connectedToCloud) : null,
-      wifiRssi: numOrNull(d.wiFiRSSI),
-      firmware: numOrNull(d.chargerFirmware),
-      latestPulse: d.latestPulse || null,
+      voltage: obsNum(v[OBS.voltage]),
+      deratingActive: obsBool(v[OBS.deratingActive]),
+      reasonForNoCurrent: obsNum(v[OBS.reasonForNoCurrent]),
+      errorCode: obsNum(v[OBS.errorCode]),
+      /* "Online" fanns som eget fält förut. Det närmaste bland mätvärdena är
+         boxens egen uppgift om den har kontakt med molnet. */
+      online: v[OBS.connectedToCloud] !== undefined ? obsBool(v[OBS.connectedToCloud]) : null,
+      cloud: v[OBS.connectedToCloud] !== undefined ? obsBool(v[OBS.connectedToCloud]) : null,
+      wifiRssi: obsNum(v[OBS.wifiRssi]),
+      firmware: obsNum(v[OBS.softwareRelease]),
+      latestPulse: tolkat.senast ? new Date(tolkat.senast).toISOString() : null,
+      observationAgeSeconds: alderS,
 
       simulated: false,
     };
@@ -1526,10 +1686,17 @@ class EaseeCharger {
   async raw(what) {
     const id = encodeURIComponent(this.chargerId);
     const eq = encodeURIComponent(this.equalizerId);
-    if (what === 'state') return this._api(`/chargers/${id}/state`);
+    // Levande mätvärden, orörda. Den här är den viktiga: går något fel i
+    // tolkningen är det den här rådatan som visar varför.
+    if (what === 'observations') return this._observations(this.chargerId);
     if (what === 'details') return this._api(`/chargers/${id}/details`);
     if (what === 'config') return this._api(`/chargers/${id}/config`);
     if (what === 'chargers') return this._api('/accounts/chargers');
+    /* Den gamla statusadressen finns kvar som knapp med flit. Easee tog bort
+       den 1 september 2026 och den svarar 404 — men den dagen de eventuellt
+       tar bort något mer vill man kunna se skillnaden mellan "borta" och
+       "svarar konstigt", och då är en knapp som visar 404 mer värd än ingen. */
+    if (what === 'state') return this._api(`/chargers/${id}/state`);
     if (what === 'equalizer') {
       if (!this.equalizerId) return { ok: false, error: 'Inget equalizer-id angivet.' };
       return this._api(`/equalizers/${eq}/state`);
@@ -1577,12 +1744,6 @@ function round(n, d) {
  *   skarp       riktig Easee med kommandon
  */
 /** Skiljer ett verkligt nollvarde fran ett falt som saknas. */
-function numOrNull(v) {
-  if (v === null || v === undefined || v === '') return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
 function create(mode, opts) {
   if (mode === 'simulering') return new SimulatedCharger();
   return new EaseeCharger({ ...opts, readOnly: mode === 'avlasning' });
@@ -5213,12 +5374,18 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
 
     if (D.easee) {
       h += '<div class="h">Rå API-inspektör</div><div class="btns">'
-        + '<button class="b" data-act="raw" data-what="state">Laddarstatus</button>'
+        + '<button class="b gold" data-act="raw" data-what="observations">Mätvärden</button>'
         + '<button class="b" data-act="raw" data-what="details">Detaljer</button>'
         + '<button class="b" data-act="raw" data-what="config">Konfiguration</button>'
-        + '<button class="b" data-act="raw" data-what="equalizer">Equalizer</button>'
         + '<button class="b" data-act="raw" data-what="chargers">Mina laddboxar</button>'
-        + '</div><pre class="log" id="rawOut">Valj vad du vill se. Svaret visas har, orort.</pre>';
+        + '<button class="b" data-act="raw" data-what="state">Gamla statusadressen</button>'
+        + '<button class="b" data-act="raw" data-what="equalizer">Equalizer</button>'
+        + '</div><pre class="log" id="rawOut">Valj vad du vill se. Svaret visas har, orort.</pre>'
+        + '<p class="note"><b>Mätvärden</b> är den appen numera läser. Easee tog bort '
+        + '<span class="mono">/chargers/{id}/state</span> den 1 september 2026 — den knappen '
+        + 'finns kvar för att man ska kunna se skillnaden mellan "borta" och "svarar konstigt". '
+        + 'Equalizerns egen adress svarar 403; dess värden kommer numera från laddboxens '
+        + 'mätvärden i stället, vilket är var de alltid egentligen kom ifrån.</p>';
     }
 
     h += '<div class="h">Logg</div><pre class="log">' + esc(D.log.map(function(l){
@@ -6748,7 +6915,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.9.3';
+const VERSION = '0.9.4';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
