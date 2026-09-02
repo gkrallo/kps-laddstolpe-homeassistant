@@ -1,5 +1,60 @@
 # Ändringslogg
 
+## 0.9.5 — energin mäts rätt igen
+
+En nio minuter lång laddning bokfördes som **0 kWh och 0 kr**. Det var min miss
+i 0.9.4, och den är rättad.
+
+**Easees sessionsräknare duger inte längre.** Den gamla statusadressen gav
+räknaren färsk och med full upplösning vid varje anrop. Mätvärdet som ersatte
+den kommer i steg om ungefär en hel kilowattimme: vid 6 kW tar ett steg tio
+minuter. En kort laddning rör den alltså inte alls, och noll minus noll är noll.
+
+**Nu integreras effekten över tiden i stället, ankrad mot räknaren.** Varje gång
+räknaren faktiskt tar ett steg rättas summan upp mot den. Effektvärdet är
+korrekt när det kommer — det är bara räknaren som är grov.
+
+Tre spärrar gör det ärligt:
+
+- Integrationen går **bara medan boxen säger att den laddar** (driftläge 3). Det
+  läget ändras inom sekunder när något händer, till skillnad från energivärdena.
+- **Ett tak på fem minuter per steg.** Har tillägget sovit eller molnet tigit vet
+  vi inte att strömmen gick hela tiden, och då räknar vi hellre för lite.
+- **Summan backar aldrig**, och rättas bara uppåt mot räknaren.
+
+Efter en omstart börjar integrationen om från nu. Det som redan är uppmätt står
+kvar; vi hittar inte på energi för tiden vi var borta.
+
+Det bryter mot en regel jag skrivit in på flera ställen: att det som debiteras
+alltid är de uppmätta värdena, aldrig uppskattningen. Den regeln skrevs när det
+fanns ett uppmätt värde att välja. Valet står nu mellan en förankrad integration
+och att räkna hela kilowattimmar — och då är integrationen både noggrannare och
+ärligare. Sessionen märks, så att kvittot kan säga det.
+
+**Ett stopp som inte kan bekräftas låser dig inte längre ute.** Två saker som
+förut var samma sak är nu åtskilda: *boxen säger med färsk uppgift att den
+laddar vidare* — ett verkligt nej — och *boxen har inte sagt något alls sedan vi
+skickade kommandot* — tystnad. Varje mätvärde bär sin egen tidsstämpel, så
+skillnaden går att avgöra. Förut räknades tystnad som nej, sessionen hölls öppen
+och enda vägen ur var att starta om tillägget.
+
+**Och varje kommando lämnar nu ett spår.** Vid varje avläsning under väntan
+sparas läge, effekt och hur gammalt värdet var. Nästa gång ett stopp krånglar
+går det att se om boxen svarade eller om vi tittade för tidigt.
+
+**Ny tabell: Mätvärdenas takt.** Diagnostik visar varje värde, när det senast
+ändrades och hur gammalt det är. Låt den gå ett dygn så vet vi Easees verkliga
+intervall i stället för att resonera oss fram. Mätvärde 122, *energi per timme*,
+hämtas nu med — inte för att användas, utan för att jämföra med.
+
+**Simulatorn kan härma felet.** Knappen *Grovkornig räknare* låter
+sessionsräknaren rapportera bara hela kilowattimmar, precis som Easee. Utan den
+hade rättningen inte gått att prova — bara tros på.
+
+*Ett nytt prov laddar i drygt en minut i verklig tid med grov räknare och
+kontrollerar att beloppet stämmer mot effekt gånger tid. Före den här versionen
+blev samma prov noll.*
+
 ## 0.9.4 — Easee tog bort adressen appen läste ifrån
 
 Den 2 september slutade stolpen svara. Loggen sa *"Easee svarade 404 på

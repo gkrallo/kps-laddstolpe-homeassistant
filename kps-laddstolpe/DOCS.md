@@ -2,7 +2,7 @@
 
 Elbilsladdning med spotprisdebitering, körd som ett tillägg på Home Assistant.
 
-**Version 0.9.4.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
+**Version 0.9.5.** Hela gästflödet är på plats: låst stolpe, nummer bekräftat
 med SMS, laddning som lever tills kabeln dras ur, priskurva, kvitto med
 Swish-QR, fri laddning för familjen, appen på hemskärmen och schemalagd start.
 
@@ -472,6 +472,30 @@ att rätta.
 
 Mätvärdena bär tidsstämplar. Är de äldre än en kvart står det i loggen — en box
 som tappat kontakten kan lämna ut gamla siffror som ser färska ut.
+
+### Hur kilowattimmarna mäts
+
+**Easees sessionsräknare kommer i steg om ungefär en hel kilowattimme.** Vid
+6 kW tar ett steg tio minuter, så en kort laddning rör den inte alls. Den gamla
+statusadressen gav samma räknare färsk och med full upplösning; det gör
+mätvärdena inte.
+
+Därför integreras **effekten över tiden**, ankrad mot räknaren: varje gång den
+faktiskt tar ett steg rättas summan upp mot den. Effektvärdet är korrekt när det
+kommer — det är bara räknaren som är grov.
+
+| Spärr | Varför |
+|---|---|
+| Bara medan driftläget säger *laddar* | Ett gammalt effektvärde är sant så länge läget står kvar, och läget ändras inom sekunder. |
+| Tak fem minuter per steg | Har tillägget sovit vet vi inte att strömmen gick. Hellre räkna för lite. |
+| Summan backar aldrig | Energi som gått genom kabeln kommer inte tillbaka. |
+| Omstart nollställer klockan | Vi hittar inte på energi för tiden vi var borta. |
+
+Sessioner som mätts så är märkta, så att kvittot kan vara ärligt om det.
+
+Under **Diagnostik → Mätvärdenas takt** syns när varje värde senast ändrades.
+Står `sessionEnergy` still medan bilen laddar är det den här mekanismen som gör
+jobbet.
 
 ## Om du vill se rådata
 

@@ -966,7 +966,15 @@ class SimulatedCharger {
       cableConnected: this.cableConnected,
       opMode: this._opMode(),
       powerKw: round(this.powerKw, 2),
-      sessionEnergyKwh: round(this.sessionEnergyKwh, 3),
+      /* Grovkornig räknare — som Easees.
+         Sedan mätvärdena ersatte statusadressen kommer sessionsenergin i steg
+         om ungefär en hel kilowattimme. En nio minuter lång laddning på 6 kW
+         syns inte alls i den, och bokfördes som noll. Den här knappen gör
+         felet återskapbart, så att integrationen går att prova på riktigt i
+         stället för att tros på. */
+      sessionEnergyKwh: this.coarseMeter
+        ? Math.floor(this.sessionEnergyKwh)
+        : round(this.sessionEnergyKwh, 3),
       lifetimeEnergyKwh: round(this.lifetimeEnergyKwh, 2),
       locked: this.locked,
       lockedPermanently: false,
@@ -1022,6 +1030,13 @@ class SimulatedCharger {
   setStuck(on) {
     this.stuck = Boolean(on);
     log.info(`[Simulator] Boxen ${this.stuck ? 'vägrar nu stanna' : 'lyder igen'}.`);
+    return { ok: true };
+  }
+
+  /** Härmar Easees grovkorniga sessionsräknare: bara hela kilowattimmar. */
+  setCoarseMeter(on) {
+    this.coarseMeter = Boolean(on);
+    log.info(`[Simulator] Sessionsräknaren rapporterar nu ${this.coarseMeter ? 'bara hela kWh, som Easee' : 'full upplösning'}.`);
     return { ok: true };
   }
 
@@ -1174,6 +1189,12 @@ const OBS = {
   errorCode: 119,
   totalPower: 120,
   sessionEnergy: 121,
+  /* Ackumulerad energi innevarande timme. Vi använder den inte till något än —
+     den finns med för att MÄTA hur ofta Easee faktiskt skickar energivärden.
+     Sessionsräknaren visade sig stå still i tio minuter medan 6 kW flöt, och
+     utan en andra energikälla går det inte att avgöra om det är upplösningen
+     eller takten som är grov. Kostar ingenting: samma anrop. */
+  energyPerHour: 122,
   lifetimeEnergy: 124,
   wifiRssi: 132,
   inCurrentT2: 182,
@@ -1201,6 +1222,7 @@ function parseObservations(body) {
   if (!rader) return null;
 
   const ut = {};
+  const tider = {};
   let senast = null;
   for (const r of rader) {
     if (!r || typeof r !== 'object') continue;
@@ -1208,9 +1230,16 @@ function parseObservations(body) {
     if (!Number.isFinite(id)) continue;
     ut[id] = r.value !== undefined ? r.value : r.Value;
     const t = Date.parse(r.timestamp || r.Timestamp || '');
-    if (Number.isFinite(t) && (senast === null || t > senast)) senast = t;
+    if (Number.isFinite(t)) {
+      /* Varje värde bär sin EGEN tidsstämpel, och de går vitt isär: driftläget
+         kan vara timmar gammalt för att det inte ändrats, medan effekten är en
+         minut gammal. Att bara behålla den nyaste vore att kasta bort det som
+         gör skillnad — om vi hört något nytt om just det vi frågar om. */
+      tider[id] = t;
+      if (senast === null || t > senast) senast = t;
+    }
   }
-  return { varden: ut, senast };
+  return { varden: ut, tider, senast };
 }
 
 /** Ett mätvärde som tal. Text, komma och tomma svar tas om hand. */
@@ -1529,6 +1558,7 @@ class EaseeCharger {
 
     const tolkat = parseObservations(res.data);
     const v = tolkat ? tolkat.varden : {};
+    const tid = tolkat ? tolkat.tider : {};
 
     /* Driftläget är hjärtat i allt appen gör. Saknas det har vi inte förstått
        svaret, och då ska det bli ett AVLÄST FEL — inte en tyst nolla.
@@ -1605,6 +1635,24 @@ class EaseeCharger {
       firmware: obsNum(v[OBS.softwareRelease]),
       latestPulse: tolkat.senast ? new Date(tolkat.senast).toISOString() : null,
       observationAgeSeconds: alderS,
+
+      /* Nar varje enskilt varde senast andrades.
+         Det har ar skillnaden mellan "boxen sager att den laddar" och "vi har
+         inte hort nagot nytt sedan i eftermiddags". Verifieringen av ett
+         kommando behover veta det: ett oforandrat varde med gammal tidsstampel
+         ar inget svar, det ar tystnad. */
+      obsTimes: {
+        opMode: tid[OBS.chargerOpMode] || null,
+        power: tid[OBS.totalPower] || null,
+        sessionEnergy: tid[OBS.sessionEnergy] || null,
+        energyPerHour: tid[OBS.energyPerHour] || null,
+        lifetimeEnergy: tid[OBS.lifetimeEnergy] || null,
+      },
+      // Rå tabell för takt-mätningen i Diagnostik.
+      obsRaw: Object.entries(OBS).map(([namn, id]) => ({
+        namn, id, varde: v[id] === undefined ? null : v[id], t: tid[id] || null,
+      })),
+      energyPerHourKwh: obsNum(v[OBS.energyPerHour]),
 
       simulated: false,
     };
@@ -1793,6 +1841,11 @@ function load() {
     // första varvet efter uppdateringen, mitt i någons laddning.
     if (!Array.isArray(active.unpriced)) active.unpriced = [];
     if (typeof active.unpricedKwh !== 'number') active.unpricedKwh = 0;
+    /* Integrationen börjar om från nu.
+       Vi vet inte att strömmen gick medan tillägget var nere — och en session
+       som legat sedan i går skulle annars räkna upp energi den aldrig sett.
+       Det som redan är uppmätt står kvar; bara klockan nollställs. */
+    active.integratedAt = new Date().toISOString();
     log.info(`Återupptar pågående session ${active.id} (${active.energyKwh} kWh, ${active.costSek} kr).`);
   }
   log.info(`Historik: ${history.length} avslutade sessioner.`);
@@ -1854,6 +1907,14 @@ function start({
 
     startEnergyKwh: Number(startEnergyKwh) || 0,
     energyKwh: 0,
+
+    /* Energin integreras ur effekten och ankras mot laddboxens räknare.
+       `integratedAt` är klockan för förra steget; `energyIntegrated` säger att
+       åtminstone en del av summan kommer från integrationen och inte enbart
+       från räknaren, så att kvittot kan vara ärligt om det. */
+    integratedAt: new Date().toISOString(),
+    energyIntegrated: false,
+    energyAnchoredAt: null,
     costEnergySek: 0,
     costServiceSek: 0,
     costSek: 0,
@@ -1915,20 +1976,80 @@ function settleUnpriced() {
  * Ett varv i bakgrundsloopen. Lägger till energin sedan förra avläsningen och
  * prissätter just den mängden mot priset för den kvart vi befinner oss i.
  */
-function accumulate({ sessionEnergyKwh, powerKw, price }) {
+/* Hur långt vi vågar räkna på en enda avläsning.
+   Loopen läser var 30:e sekund under laddning, så ett normalt steg är 30 s.
+   Blir det mycket längre har något varit fel — tillägget sov, molnet teg — och
+   då vet vi inte att strömmen gick hela tiden. Hellre räkna för lite. */
+const MAX_INTEGRATION_STEG_MS = 5 * 60 * 1000;
+
+/**
+ * Energin.
+ *
+ * Fram till 0.9.4 lästes laddboxens egen sessionsräknare, färsk och med full
+ * upplösning, vid varje anrop. Den adressen finns inte längre. Mätvärdet som
+ * ersatte den kommer i steg om ungefär en hel kilowattimme: en nio minuter
+ * lång laddning på 6 kW gav 0,9 kWh — inget helt steg — och bokfördes som noll.
+ *
+ * Så nu MÄTS energin genom att effekten integreras över tiden, och räknaren
+ * används som ankare: varje gång den faktiskt tar ett steg rättas summan mot
+ * den. Effektvärdet är korrekt när det kommer; det är bara räknaren som är grov.
+ *
+ * Tre spärrar gör integrationen ärlig:
+ *
+ *  1. Bara medan boxen SÄGER att den laddar (driftläge 3). Ett gammalt
+ *     effektvärde är sant så länge läget står kvar — och läget ändras inom
+ *     sekunder när något händer.
+ *  2. Ett tak på hur långt ett enda steg får räkna.
+ *  3. Summan får aldrig backa, och rättas bara uppåt mot räknaren.
+ *
+ * Det bryter mot en tidigare regel i appen: att det som debiteras alltid är de
+ * uppmätta värdena, aldrig uppskattningen. Den regeln skrevs när det fanns ett
+ * uppmätt värde att välja. Nu står valet mellan en förankrad integration och
+ * att räkna hela kilowattimmar, och då är integrationen både noggrannare och
+ * ärligare — men sessionen märks så att kvittot kan säga det.
+ */
+function accumulate({ sessionEnergyKwh, powerKw, price, opMode }) {
   if (!active) return null;
 
   const raw = Number(sessionEnergyKwh);
-  let total = Number.isFinite(raw) ? raw - active.startEnergyKwh : active.energyKwh;
+  const kw = Number(powerKw) || 0;
+  const nu = Date.now();
 
   // Boxen har nollställt sin egen räknare mitt i sessionen
   if (Number.isFinite(raw) && raw + 0.001 < active.startEnergyKwh) {
-    log.warn(`Laddboxens sessionsräknare nollställdes. Justerar utgångsvärdet.`);
+    log.warn('Laddboxens sessionsräknare nollställdes. Justerar utgångsvärdet.');
     active.startEnergyKwh = 0;
-    total = raw;
   }
 
-  if (!Number.isFinite(total) || total < 0) total = active.energyKwh;
+  const mattTotal = Number.isFinite(raw) ? Math.max(0, raw - active.startEnergyKwh) : null;
+
+  /* 1. Integrera effekten sedan förra avläsningen. */
+  const laddar = opMode === undefined ? kw > 0.05 : (opMode === 3 && kw > 0.05);
+  const forra = active.integratedAt ? Date.parse(active.integratedAt) : null;
+  let steg = 0;
+  if (laddar && forra) {
+    const dtMs = Math.min(nu - forra, MAX_INTEGRATION_STEG_MS);
+    if (dtMs > 0) steg = kw * (dtMs / 3600000);
+    if (nu - forra > MAX_INTEGRATION_STEG_MS) {
+      log.warn(`Långt uppehåll mellan avläsningarna (${Math.round((nu - forra) / 60000)} min). `
+        + `Räknar bara ${MAX_INTEGRATION_STEG_MS / 60000} minuter av det, för att inte hitta på energi.`);
+    }
+  }
+  active.integratedAt = new Date(nu).toISOString();
+
+  let total = round(active.energyKwh + steg, 4);
+  if (steg > 0) active.energyIntegrated = true;
+
+  /* 2. Ankaret. Har räknaren tagit ett steg och ligger före oss, hoppa fram.
+        Ligger den efter rör vi ingenting — summan får aldrig backa. */
+  if (mattTotal !== null && mattTotal > total + 0.001) {
+    const rattning = mattTotal - total;
+    if (rattning > 0.02) {
+      log.debug(`Laddboxens räknare ligger ${rattning.toFixed(3)} kWh före vår integration. Rättar upp.`);
+    }
+    total = mattTotal;
+    active.energyAnchoredAt = new Date(nu).toISOString();
+  }
 
   const deltaKwh = Math.max(0, total - active.energyKwh);
 
@@ -2112,6 +2233,7 @@ function publicView(s, { includeKey = false } = {}) {
        något helt annat än en dyr laddning man inte förstår. */
     scheduledFor: s.scheduledFor || null,
     lateBySeconds: s.lateBySeconds || null,
+    energyIntegrated: Boolean(s.energyIntegrated),
     payment: s.payment,
     simulated: Boolean(s.simulated),
   };
@@ -2512,6 +2634,9 @@ async function tick() {
       sessionEnergyKwh: state.sessionEnergyKwh,
       powerKw: state.powerKw,
       price,
+      // Driftläget avgör om effekten får integreras. Ett gammalt effektvärde
+      // är sant så länge boxen säger att den fortfarande laddar.
+      opMode: state.opMode,
     });
 
     await handleChargingDone(state, active);
@@ -5224,6 +5349,8 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
         + '<button class="b" data-act="sim" data-cmd="ff15">Spola fram 15 min</button>'
         + '<button class="b" data-act="sim" data-cmd="ff60">Spola fram 60 min</button>'
         + '<button class="b" data-act="sim" data-cmd="disable">Stäng av stolpen</button>'
+        + '<button class="b" data-act="sim" data-cmd="coarse">Grovkornig räknare</button>'
+        + '<button class="b" data-act="sim" data-cmd="fine">Fin räknare</button>'
         + '<button class="b danger" data-act="sim" data-cmd="stuck">Boxen vägrar stanna</button>'
         + '<button class="b" data-act="sim" data-cmd="unstuck">Boxen lyder igen</button>'
         + '</div>'
@@ -5284,8 +5411,18 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
                     : c.verified === true ? '<span class="pill p-ok">bekräftat' + (c.seconds ? ' efter ' + c.seconds + ' s' : '') + '</span>'
                     : c.verified === false ? '<span class="pill p-warn">ej bekräftat</span>'
                     : '<span class="pill p-ok">skickat</span>';
+                  /* Sparet: vad boxen sa medan vi vantade, och hur gammalt det
+                     var. Utan det gar ett kruxigt stopp inte att utreda i
+                     efterhand — man ser bara att det inte bekraftades. */
+                  var spar = (c.spar || []).map(function (p) {
+                    if (p.fel) return p.s + 's fel: ' + esc(p.fel);
+                    return p.s + 's läge ' + p.lage + ' · ' + p.kw + ' kW'
+                      + (p.alder === null ? '' : ' · ' + p.alder + 's gammalt' + (p.farsk ? ' (nytt)' : ''));
+                  }).join('\\n');
                   return '<tr><td class="mono">' + hhmm(c.t) + '</td><td>' + esc(c.name) + '</td><td>' + pill
-                    + (c.error ? ' <span style="color:var(--mut)">' + esc(c.error) + '</span>' : '') + '</td></tr>';
+                    + (c.error ? ' <span style="color:var(--mut)">' + esc(c.error) + '</span>' : '')
+                    + (spar ? '<div class="mono" style="white-space:pre-wrap;color:var(--mut);font-size:11.5px;margin-top:4px">' + spar + '</div>' : '')
+                    + '</td></tr>';
                 }).join('')
               + '</tbody></table></div>'
             : '')
@@ -5357,6 +5494,37 @@ pre.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.
       + '</tbody></table></div>'
       + '<p class="note">Alla rader kommer från ett faktiskt svar. Fanns inget värde står det streck. '
       + 'Den gamla appen visade 28,4 grader som boxtemperatur — en hårdkodad siffra. Easee rapporterar ingen temperatur alls, så raden finns inte längre.</p>';
+
+    /* Nar varje matvarde senast andrades.
+       Det har ar instrumentet: kor det ett dygn och vi VET hur ofta Easee
+       skickar energi, i stallet for att resonera oss fram. Sessionsrakanren
+       stod still i tio minuter medan 6 kW flot — den raden ar den som avgor
+       om integrationen behovs eller kan tas bort igen. */
+    if (s.obsRaw && s.obsRaw.length) {
+      var nuMs = Date.now();
+      h += '<div class="h">Mätvärdenas takt</div><div class="tw"><table>'
+        + '<thead><tr><th>Mätvärde</th><th>Id</th><th>Värde</th><th>Senast ändrat</th><th>Ålder</th></tr></thead><tbody>';
+      s.obsRaw.slice().sort(function (a, b) { return (b.t || 0) - (a.t || 0); }).forEach(function (o) {
+        var alder = o.t ? Math.round((nuMs - o.t) / 1000) : null;
+        var txt = alder === null ? '<span style="color:var(--mut)">—</span>'
+          : alder < 90 ? alder + ' s'
+          : alder < 5400 ? Math.round(alder / 60) + ' min'
+          : alder < 172800 ? (alder / 3600).toFixed(1) + ' tim'
+          : Math.round(alder / 86400) + ' dygn';
+        // De tre som styr pengarna markeras, sa de gar att hitta direkt.
+        var viktig = ['chargerOpMode', 'totalPower', 'sessionEnergy', 'energyPerHour'].indexOf(o.namn) >= 0;
+        h += '<tr' + (viktig ? ' style="font-weight:600"' : '') + '>'
+          + '<td>' + esc(o.namn) + '</td><td class="mono">' + o.id + '</td>'
+          + '<td class="mono">' + esc(String(o.varde)) + '</td>'
+          + '<td class="mono">' + (o.t ? hhmm(new Date(o.t).toISOString()) : '—') + '</td>'
+          + '<td class="mono">' + txt + '</td></tr>';
+      });
+      h += '</tbody></table></div>'
+        + '<p class="note">Easee skickar varje värde när det ändras, inte när vi frågar. '
+        + 'Ett gammalt driftläge är inget problem — det betyder att läget stått still. '
+        + 'Men <b>sessionEnergy</b> ska röra sig medan bilen laddar, och gör den inte det '
+        + 'kommer energin i stället från effekten integrerad över tid.</p>';
+    }
 
     h += '<div class="h">Systemet</div><div class="card">'
       + row('Version', esc(D.version))
@@ -6915,7 +7083,7 @@ const chargerFactory = chargerModule;
 const { OP_MODE, NO_CURRENT_REASON } = chargerModule;
 const { Router, RateLimiter, makeHandler, sendJson, sendHtml, sendBinary, readJsonBody } = httpModule;
 
-const VERSION = '0.9.4';
+const VERSION = '0.9.5';
 const GUEST_PORT = 8443;
 const INGRESS_PORT = 8099;
 const STARTED_AT = Date.now();
@@ -6983,7 +7151,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * kostar några extra avläsningar, men kommandon är sällsynta och ett felaktigt
  * antagande här blir ett felaktigt kvitto.
  */
-async function sendCommand(name, run, verify, { timeoutMs = 25000, pollMs = 4000 } = {}) {
+/**
+ * Skickar ett kommando och väntar in laddboxen.
+ *
+ * Det svåra sedan mätvärdena ersatte statusadressen är att skilja två helt
+ * olika saker åt:
+ *
+ *   NEJ      — boxen har sagt något nytt, och det säger att den laddar vidare.
+ *   TYSTNAD  — boxen har inte sagt något alls sedan vi skickade kommandot.
+ *
+ * Förut var de samma sak, och tystnad räknades som nej. Det gjorde att ett
+ * lyckat stopp kunde rapporteras som misslyckat, sessionen hållas öppen, och
+ * enda vägen ur vara att starta om tillägget.
+ *
+ * Varje mätvärde bär sin egen tidsstämpel, så skillnaden går att avgöra: har
+ * driftläget inte ändrats sedan FÖRE kommandot har vi inget svar ännu.
+ *
+ *   verified === true   bekräftat
+ *   verified === false  boxen sa nej, med färsk uppgift
+ *   verified === null   inget svar än — inte ett fel
+ */
+async function sendCommand(name, run, verify, { timeoutMs = 25000, pollMs = 4000, freshness = null } = {}) {
   const started = Date.now();
   const res = await run();
 
@@ -6999,18 +7187,46 @@ async function sendCommand(name, run, verify, { timeoutMs = 25000, pollMs = 4000
     return { ok: true, verified: null };
   }
 
+  /* Spåret. Vid varje avläsning: vad boxen sa, och hur gammalt det var.
+     Utan det går det inte att i efterhand avgöra om ett krångligt stopp
+     berodde på boxen eller på att vi tittade för tidigt. */
+  const spar = [];
+  let horde = false;
+
   while (Date.now() - started < timeoutMs) {
     await sleep(pollMs);
     const st = await charger.readState();
-    if (st.ok && verify(st)) {
+    if (!st.ok) { spar.push({ s: Math.round((Date.now() - started) / 1000), fel: st.error }); continue; }
+
+    const stamp = freshness ? freshness(st) : null;
+    const farskt = stamp === null ? true : stamp > started - 2000;
+    if (farskt) horde = true;
+
+    spar.push({
+      s: Math.round((Date.now() - started) / 1000),
+      lage: st.opMode,
+      kw: Math.round((st.powerKw || 0) * 100) / 100,
+      alder: stamp ? Math.round((Date.now() - stamp) / 1000) : null,
+      farsk: farskt,
+    });
+
+    if (verify(st)) {
       const secs = Math.round((Date.now() - started) / 1000);
-      if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: true, seconds: secs });
+      if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: true, seconds: secs, spar });
       log.info(`Kommando "${name}" bekräftat av laddboxen efter ${secs} s.`);
       return { ok: true, verified: true, state: st };
     }
   }
 
-  if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: false, error: 'ingen bekräftelse i tid' });
+  if (!horde) {
+    // Tystnad. Kommandot togs emot; boxen har bara inte hunnit berätta något.
+    if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: null, error: 'inget nytt från boxen', spar });
+    log.info(`Kommando "${name}" togs emot. Laddboxen har inte rapporterat något nytt inom `
+      + `${timeoutMs / 1000} s — vi fortsätter följa den i bakgrunden.`);
+    return { ok: true, verified: null, error: 'Laddboxen har inte hunnit svara.' };
+  }
+
+  if (charger.noteCommand) charger.noteCommand({ name, ok: true, verified: false, error: 'ingen bekräftelse i tid', spar });
   log.warn(`Kommando "${name}" togs emot men laddboxen ändrade inte tillstånd inom ${timeoutMs / 1000} s.`);
   return { ok: true, verified: false, error: 'Laddboxen bekräftade inte kommandot i tid.' };
 }
@@ -7058,7 +7274,7 @@ async function startChargingSequence() {
 
   // 2. Starta.
   let started = await sendCommand('starta laddning', () => charger.start(), isCharging,
-    { timeoutMs: 20000, pollMs: 4000 });
+    { timeoutMs: 20000, pollMs: 4000, freshness: lagetsAlder });
   if (!started.ok) return started;
   if (started.verified) return started;
 
@@ -7073,7 +7289,7 @@ async function startChargingSequence() {
   if (charger.resume && (st.opMode === 2 || st.opMode === 4 || st.opMode === 6 || st.opMode === 7)) {
     log.info(`Laddboxen står i läge ${st.opMode}. Skickar återupptagning.`);
     const resumed = await sendCommand('återuppta laddning', () => charger.resume(), isCharging,
-      { timeoutMs: 20000, pollMs: 4000 });
+      { timeoutMs: 20000, pollMs: 4000, freshness: lagetsAlder });
     if (resumed.ok && resumed.verified) return resumed;
   }
 
@@ -7087,12 +7303,19 @@ async function startChargingSequence() {
  * gå via appen. Det är samma lås som originalappen satte, och utan det står
  * stolpen öppen för vem som helst mellan laddningarna.
  */
-async function stopChargingSequence() {
-  let stopped = await sendCommand('stoppa laddning', () => charger.stop(), (st) => st.opMode !== 3);
+/** När driftläget senast sa något. Tystnad ska inte läsas som ett nej. */
+const lagetsAlder = (st) => (st.obsTimes && st.obsTimes.opMode) || null;
 
+async function stopChargingSequence() {
+  let stopped = await sendCommand('stoppa laddning', () => charger.stop(),
+    (st) => st.opMode !== 3, { freshness: lagetsAlder });
+
+  // Bara ett riktigt nej förtjänar ett omförsök. Har boxen inte sagt något
+  // hjälper det inte att skicka samma kommando igen — då ska vi vänta.
   if (stopped.ok && stopped.verified === false) {
     log.warn('Laddboxen laddar fortfarande. Försöker stoppa en gång till.');
-    stopped = await sendCommand('stoppa laddning, andra försöket', () => charger.stop(), (st) => st.opMode !== 3);
+    stopped = await sendCommand('stoppa laddning, andra försöket', () => charger.stop(),
+      (st) => st.opMode !== 3, { freshness: lagetsAlder });
   }
   return stopped;
 }
@@ -8253,6 +8476,8 @@ admin.post('/api/admin/sim', async (req, res) => {
     case 'disable': out = await charger.setEnabled(false); break;
     case 'stuck': out = charger.setStuck(true); break;
     case 'unstuck': out = charger.setStuck(false); break;
+    case 'coarse': out = charger.setCoarseMeter(true); break;
+    case 'fine': out = charger.setCoarseMeter(false); break;
     case 'ff15': out = charger.fastForward(15); sessions.shiftStartBack(15); break;
     case 'ff60': out = charger.fastForward(60); sessions.shiftStartBack(60); break;
     /* Schemaknapparna låg här förut. De flyttades till Översikt, under det

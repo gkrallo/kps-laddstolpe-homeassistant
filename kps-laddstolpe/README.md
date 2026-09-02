@@ -13,7 +13,7 @@ på Home Assistant i stället för i molnet.
 
 | Tillägg | Version | Status |
 |---|---|---|
-| [KPs Laddstolpe](./kps-laddstolpe) | 0.9.4 | Schemalagd start, fri laddning, ihågkomna telefoner, priskurva |
+| [KPs Laddstolpe](./kps-laddstolpe) | 0.9.5 | Schemalagd start, fri laddning, ihågkomna telefoner, priskurva |
 
 Fullständig beskrivning i [DOCS.md](./kps-laddstolpe/DOCS.md), ändringar i
 [CHANGELOG.md](./kps-laddstolpe/CHANGELOG.md).
